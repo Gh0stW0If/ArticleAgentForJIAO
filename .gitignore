@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------
+# 冻结版本：只提交「agent 本体」（源码 / 脚本 / 文档 / 配置）
+# 数据、密钥、产物、缓存一律不入库
+# ---------------------------------------------------------------
+
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 私有配置（含 API key，绝不入库）
+runtime/
+**/*.local.json
+.env
+.env.*
+!.env.example
+
+# 语料与数据（期刊 PDF、金标准 xlsx、医生提供的资料；版权与体积原因不入库）
+Datas/
+
+# 生成产物与缓存
+build/
+dist/
+.vite/
+test-results/
+playwright-report/
+coverage/
+
+# 会话 / 工具状态
+.dsh/
+.dsh-diagnose/
+design/
+
+# 桌面打包中间件
+apps/desktop/release/
+apps/desktop/out/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+__MACOSX/
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+pnpm-debug.log*
+*.tmp
+*.bak
+*~

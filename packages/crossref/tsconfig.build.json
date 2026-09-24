@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "allowImportingTsExtensions": false,
+    // 源码里既有 './x.js' 也有 './x.ts' 两种写法（测试用 .ts 才能被 vitest 直接解析）。
+    // 编译时把 .ts 后缀改写成 .js，两种写法都能产出可运行的 ESM。
+    "rewriteRelativeImportExtensions": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "paths": {},
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/__tests__/**"]
+}

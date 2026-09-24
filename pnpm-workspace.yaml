@@ -1,0 +1,19 @@
+packages:
+  - 'packages/*'
+  - 'apps/*'
+
+# pnpm 默认不跑依赖的安装脚本（供应链安全）。这里显式放行必要的几个：
+#   esbuild             —— vitest/vite 依赖的原生二进制，不放行会在测试启动时才报错
+#   electron            —— 安装脚本负责下载 Electron 运行时（走 ELECTRON_MIRROR 镜像）
+#   electron-winstaller —— electron-builder 的可选依赖（Squirrel 目标用）；不跑也不影响 portable
+allowBuilds:
+  esbuild: true
+  electron: true
+  electron-winstaller: true
+
+# ⚠️ electron-builder 26.15.3 在下载图标工具集时会读 `@electron/get` 的
+# `ElectronDownloadCacheMode` 枚举；而它自己的依赖树里解析到的是 3.0.0（没有该导出），
+# 于是抛 `Cannot read properties of undefined (reading 'ReadWrite')`（实测）。
+# 钉到 5.x 修掉这个版本错配——比手工改 node_modules 可复现。
+overrides:
+  '@electron/get': ^5.1.0

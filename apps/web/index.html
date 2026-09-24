@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Article Agent · PDF 证据框选与字段抽取</title>
+    <style>
+      /*
+       * 浅色主题（对齐设计参考图）：白卡片 + #edf0f4 画布 + 琥珀主色。
+       * 令牌见 src/theme.ts —— 这里只放"全局兜底"，组件内一律用令牌。
+       */
+      :root { color-scheme: light; }
+      * { box-sizing: border-box; }
+      html, body, #root { height: 100%; }
+      body {
+        margin: 0;
+        font: 13px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+        background: #edf0f4;
+        color: #323b4a;
+        -webkit-font-smoothing: antialiased;
+      }
+      button, select, input, textarea { font: inherit; color: inherit; }
+      button { transition: background .12s ease, border-color .12s ease; }
+      ::-webkit-scrollbar { width: 10px; height: 10px; }
+      ::-webkit-scrollbar-thumb { background: #cbd2da; border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
+      ::-webkit-scrollbar-thumb:hover { background: #aab3bf; background-clip: content-box; }
+      ::-webkit-scrollbar-track { background: transparent; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

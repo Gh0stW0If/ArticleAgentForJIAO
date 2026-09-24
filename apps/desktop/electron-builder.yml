@@ -1,0 +1,85 @@
+# electron-builder 配置：把 Web 界面打包成单文件 exe（portable）。
+#
+# 关键取舍：
+#   1. asar: false —— 服务会以子进程方式跑 `tools/llm_run.mjs` 之类的脚本，
+#      而子进程读不了 asar 虚拟文件系统；解包成普通目录最省事（portable exe 本来就是自解压运行）。
+#   2. files 只带"壳需要的东西"：Electron 主进程、前端 dist、本地服务、tools 与各包的 dist。
+#      不带 Datas / build / runtime —— 那些属于**工作区**（用户数据）。
+#      **但必须带一份 `node_modules/@aa`**（见第 4 条）。
+#   3. portable 目标产出单个 exe（不写注册表、不建开始菜单），对应"打包成一个 exe"。
+#   4. ⚠️ 各包的 dist 之间用**裸包名**互相 import（`import { warn } from '@aa/core'`），
+#      所以 exe 里必须有能被 Node 解析到的 `node_modules/@aa/*`。
+#      早先的配置只搬了 `packages/<pkg>/dist`、没搬 node_modules，结果打包版一跑抽取就报
+#      `ERR_MODULE_NOT_FOUND: Cannot find package '@aa/core'`（实测，GUI 的「抽取」按钮全废）。
+#      现在由 `node tools/desktop_stage_modules.mjs` 生成 `build/desktop-stage/node_modules`，
+#      里面每个 `@aa/*` 只放 package.json + dist（这几个包没有第三方依赖，不需要搬 pnpm 依赖树）。
+#
+# ⚠️ 路径基准是「项目目录」（= apps/desktop），不是本文件所在目录。
+
+appId: com.articleagent.desktop
+productName: Article Agent
+copyright: Article Agent
+
+# ⚠️ 必须写**精确版本**：electron-builder 要按具体版本下载平台二进制，
+# 而 package.json 里写的是 `^44.3.0` 这种范围，它无法自行解析（实测报错）。
+electronVersion: 44.3.0
+
+# ⚠️ 直接复用 node_modules 里**已下载好的** Electron 运行时目录。
+# 不这么写它会自己去镜像下载，而 26.x 的下载路径在本环境会抛
+# `Cannot read properties of undefined (reading 'ReadWrite')`（实测）。
+# 指定 electronDist 后走"直接拷贝"，既绕开该问题、也省一次 200MB 下载。
+electronDist: ../../node_modules/electron/dist
+
+directories:
+  output: ../../build/desktop
+  buildResources: ../../build
+
+win:
+  target:
+    - target: portable
+      arch: [x64]
+  icon: ../../build/icon.png
+  artifactName: ArticleAgent-${version}-portable.exe
+
+portable:
+  artifactName: ArticleAgent-${version}-portable.exe
+  unpackDirName: article-agent
+
+# 本机自用，暂不签名（有证书时再补）
+forceCodeSigning: false
+
+asar: false
+files:
+  - main.mjs
+  - package.json
+  - from: ../web/dist
+    to: apps/web/dist
+  # ⚠️ 单个文件要用 `from: 目录 + filter` 的方式带进去：
+  # `from: ../web/server.mjs` + `to: apps/web/server.mjs`（把 to 写成文件路径）
+  # 会被当成目录处理、结果文件根本没被复制（实测打出来的 exe 里缺 server.mjs，
+  # 启动即报"找不到服务文件"）。
+  - from: ../web
+    to: apps/web
+    filter:
+      - server.mjs
+  - from: ../../tools
+    to: tools
+    filter:
+      - '**/*.mjs'
+  - from: ../../packages/core/dist
+    to: packages/core/dist
+  - from: ../../packages/ingest/dist
+    to: packages/ingest/dist
+  - from: ../../packages/skills/dist
+    to: packages/skills/dist
+  - from: ../../packages/crossref/dist
+    to: packages/crossref/dist
+  # ⚠️ 新增（2026-09-18）：`article-meta` 现在会 `import '@aa/europepmc'`。
+  # 漏了这条，重打包后一跑抽取就 ERR_MODULE_NOT_FOUND。
+  - from: ../../packages/europepmc/dist
+    to: packages/europepmc/dist
+  # 让裸包名 `@aa/*` 能解析（由 tools/desktop_stage_modules.mjs 生成，**打包前必须先跑它**）
+  - from: ../../build/desktop-stage/node_modules
+    to: node_modules
+
+compression: normal

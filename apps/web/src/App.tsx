@@ -1,0 +1,712 @@
+/**
+ * @aa/web — 主界面
+ *
+ * 布局：
+ *   顶栏      左：年份 / 研究 / 导入文章 / 解析 / 抽取    右：设置（API 配置）
+ *   左 = PDF **连续滚动**查看 + 框选（浏览模式：查看命中的解析块；标注模式：框选即产出证据）
+ *   右 = 三张选项卡（Sheet1 / Sheet2 / Sheet3），字段按**原始表格列序**排布，可编辑/确认/回滚
+ *
+ * 数据流：
+ *   GET  /api/fields                       → 字段视图（流水线值 + 人工覆盖层合并；含 sheets 布局）
+ *   POST /api/annotation                   → 写入人工标注（confirm / override / add）
+ *   DELETE /api/annotation?fieldPath=…     → 单字段回滚
+ *   POST /api/import                       → 导入 PDF（写入 build/imports，不动 Datas/）
+ *   POST /api/parse | /api/extract         → 后台任务（MinerU 解析 / LLM 抽取）
+ *   GET  /api/jobs                         → 任务状态与日志尾部
+ *
+ * 「人工修改」的存储原则：绝不改写流水线产物，只写独立的覆盖层
+ * （见 packages/core/src/annotation.ts），因此随时可对比"原始 vs 人工"。
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import * as pdfjs from 'pdfjs-dist';
+import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { PdfViewer, type Selection, type SelectMode } from './PdfViewer.tsx';
+import { ExtractionPanel } from './ExtractionPanel.tsx';
+import { SettingsPanel } from './SettingsPanel.tsx';
+import { T, R, tint, ghostBtn, primaryBtn, input as inputS } from './theme.ts';
+import type { Bbox } from './geometry.ts';
+import type { FieldView, JobInfo, MiniDoc, SheetsPayload, StudyEntry } from './types.ts';
+
+pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+
+const YEARS = ['2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025'];
+
+interface Highlight { page: number; bbox: Bbox; label: string; color?: string; human?: boolean }
+
+/** 证据类型（与 @aa/core 的 Evidence.kind 对齐）。 */
+type EvKind = 'text' | 'table' | 'figure' | 'caption' | 'footnote' | 'external';
+
+interface UiEvidence { kind: EvKind; page: number; bbox: Bbox | null; quote: string; blockId?: string }
+
+const EMPTY_SHEETS: SheetsPayload = {
+  layoutSource: null,
+  headerOf: {},
+  order: { sheet1: { article: [], comparison: [] }, sheet2: [], sheet3: { top: [], timepoint: { baseline: [], endOfTreatment: [], followUpEnd: [] } } },
+  sheet1: { title: 'Sheet1', article: [], comparisons: [], external: [] },
+  sheet2: { title: 'Sheet2', fields: [] },
+  sheet3: { title: 'Sheet3', rows: [], candidates: [], nextOutcomeIndex: 0 },
+};
+
+/** MinerU 块类型 → 证据类型。 */
+function evKindOf(blockType: string | undefined): EvKind {
+  if (blockType === 'table') return 'table';
+  if (blockType === 'image' || blockType === 'figure') return 'figure';
+  if (blockType === 'title') return 'text';
+  return 'text';
+}
+
+export default function App() {
+  const [year, setYear] = useState('2015');
+  const [studies, setStudies] = useState<StudyEntry[]>([]);
+  const [study, setStudy] = useState('');
+  const [doc, setDoc] = useState<MiniDoc | null>(null);
+  const [sheets, setSheets] = useState<SheetsPayload>(EMPTY_SHEETS);
+  const [annStats, setAnnStats] = useState({ total: 0, added: 0, overridden: 0, confirmed: 0 });
+  const [page, setPage] = useState(1);
+  const [focusPage, setFocusPage] = useState<number | undefined>(undefined);
+  const [focusToken, setFocusToken] = useState(0);
+  const [scale, setScale] = useState(1.1);
+  const [showBlocks, setShowBlocks] = useState(false);
+  const [mode, setMode] = useState<SelectMode>('browse');
+  const [markingField, setMarkingField] = useState<string | null>(null);
+  const [selection, setSelection] = useState<Selection | null>(null);
+  const [highlights, setHighlights] = useState<Highlight[]>([]);
+  const [status, setStatus] = useState('就绪');
+  /**
+   * 独立于 status 的**通知**（导入完成、纳入完成这类"结果性"消息）。
+   *
+   * 为什么不能只用 status：切换研究会触发 minidoc/字段重新加载，那些流程会 setStatus
+   * （"加载 …"→"11 块 / 11 页"），把刚写进去的"已导入…"瞬间冲掉——实测用户根本看不到
+   * 导入是否成功（e2e 也是这么发现的）。结果性消息必须有独立、不会被覆盖的位置。
+   */
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [jobs, setJobs] = useState<JobInfo[]>([]);
+  const [showJobLog, setShowJobLog] = useState(false);
+  const pdfRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
+  const [pdf, setPdf] = useState<pdfjs.PDFDocumentProxy | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  /* ------------------------------ 研究列表 ------------------------------ */
+  const loadStudies = useCallback(async (y: string, keep?: string) => {
+    setStatus(`加载 ${y} 研究列表…`);
+    try {
+      const d = await (await fetch(`/api/studies?year=${y}`)).json();
+      const list: StudyEntry[] = d.studies ?? [];
+      setStudies(list);
+      const next = keep && list.some((s) => s.studyId === keep) ? keep : (list[0]?.studyId ?? '');
+      setStudy(next);
+      setStatus(list.length ? `${y}: ${list.length} 篇` : `${y} 下没有 PDF`);
+      return next;
+    } catch (e) {
+      setStatus(`研究列表加载失败: ${(e as Error).message}`);
+      return '';
+    }
+  }, []);
+
+  useEffect(() => { void loadStudies(year); }, [year, loadStudies]);
+
+  /* ------------------------------ 字段视图 ------------------------------ */
+  const loadFields = useCallback(async (y: string, s: string) => {
+    if (!s) return;
+    try {
+      const r = await fetch(`/api/fields?year=${y}&study=${encodeURIComponent(s)}`);
+      const d = await r.json();
+      if (!r.ok) { setStatus(`字段加载失败: ${d.error}`); return; }
+      setSheets(d.sheets ?? EMPTY_SHEETS);
+      setAnnStats(d.stats ?? { total: 0, added: 0, overridden: 0, confirmed: 0 });
+      if (d.warning) setStatus(d.warning);
+    } catch (e) {
+      setStatus(`字段加载失败: ${(e as Error).message}`);
+    }
+  }, []);
+
+  /* --------------------------- MiniDoc + 字段 --------------------------- */
+  useEffect(() => {
+    if (!study) { setDoc(null); setSheets(EMPTY_SHEETS); return; }
+    let cancelled = false;
+    setStatus(`加载 ${study} …`);
+
+    fetch(`/api/minidoc?year=${year}&study=${encodeURIComponent(study)}`)
+      .then(async (r) => {
+        if (!r.ok) throw new Error((await r.json()).error ?? r.statusText);
+        return r.json() as Promise<MiniDoc>;
+      })
+      .then((md) => {
+        if (cancelled) return;
+        setDoc(md);
+        setPage(1);
+        setSelection(null);
+        setHighlights([]);
+        setMarkingField(null);
+        setMode('browse');
+        setStatus(`${md.studyId}: ${md.stats.blocks} 块 / ${md.stats.pages} 页`);
+      })
+      .catch((e) => { if (!cancelled) setStatus(`解析文档加载失败: ${e.message}`); });
+
+    void loadFields(year, study);
+    return () => { cancelled = true; };
+  }, [year, study, loadFields]);
+
+  /* ------------------------------ PDF ------------------------------ */
+  useEffect(() => {
+    if (!study) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const prev = pdfRef.current;
+        const p = await pdfjs.getDocument({
+          url: `/api/pdf?year=${year}&study=${encodeURIComponent(study)}`,
+        }).promise;
+        if (cancelled) { void p.destroy(); return; }
+        pdfRef.current = p;
+        setPdf(p);
+        // 旧文档延后销毁：等 React 提交新文档后再释放，否则会打断旧页渲染，闪现"渲染失败"
+        if (prev) setTimeout(() => { void prev.destroy(); }, 0);
+      } catch (e) {
+        if (!cancelled) setStatus(`PDF 加载失败: ${(e as Error).message}`);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [year, study]);
+
+  /* ------------------------------ 后台任务 ------------------------------ */
+  const refreshJobs = useCallback(async () => {
+    try {
+      const d = await (await fetch('/api/jobs')).json();
+      setJobs(d.jobs ?? []);
+      return (d.jobs ?? []) as JobInfo[];
+    } catch { return []; }
+  }, []);
+
+  const runningJob = jobs.find((j) => j.state === 'running' && j.year === year && j.study === study);
+
+  useEffect(() => {
+    if (!runningJob) return;
+    const t = setInterval(async () => {
+      const list = await refreshJobs();
+      const done = list.find((j) => j.id === runningJob.id && j.state !== 'running');
+      if (done) {
+        if (done.state === 'done') {
+          if (done.kind === 'extract') await loadFields(year, study);
+          setStatus(`${done.kind === 'parse' ? 'MinerU 解析' : 'LLM 抽取'}完成（${done.id}）`);
+        } else {
+          setStatus(`${done.kind} 失败（exit ${done.exitCode}）——展开任务日志查看`);
+        }
+      }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [runningJob, refreshJobs, loadFields, year, study]);
+
+  const startJob = useCallback(async (kind: 'parse' | 'extract') => {
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/${kind}?year=${year}&study=${encodeURIComponent(study)}`, { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) { setStatus(`${kind} 启动失败：${d.error}`); return; }
+      setStatus(`${kind === 'parse' ? 'MinerU 解析' : 'LLM 抽取'}已启动：${d.job.id}`);
+      setShowJobLog(true);
+      await refreshJobs();
+    } catch (e) {
+      setStatus(`启动失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [year, study, refreshJobs]);
+
+  /* ------------------------------ 导入文章 ------------------------------ */
+  const onPickFile = useCallback(async (file: File) => {
+    setBusy(true);
+    setStatus(`导入 ${file.name}…`);
+    try {
+      const buf = await file.arrayBuffer();
+      const r = await fetch(`/api/import?year=${year}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/pdf', 'x-file-name': encodeURIComponent(file.name) },
+        body: buf,
+      });
+      const d = await r.json();
+      if (!r.ok) { setStatus(`导入失败：${d.error}`); return; }
+      /*
+       * ⚠️ 先刷新列表、再写状态：`loadStudies` 自己会 setStatus("2015: 7 篇")，
+       * 顺序反了会把"已导入…"这条关键反馈冲掉（实测 e2e 就是这样发现界面没提示的）。
+       */
+      await loadStudies(year, d.studyId);
+      setNotice(`已导入 ${file.name} → ${d.studyId}（${Math.round(d.bytes / 1024)} KB）；可点「解析」跑 MinerU`);
+    } catch (e) {
+      setStatus(`导入失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [year, loadStudies]);
+
+  /* ------------------------------ 字段索引 ------------------------------ */
+  const allFields = useMemo(() => {
+    const out: FieldView[] = [
+      ...sheets.sheet1.article, ...sheets.sheet1.external,
+      ...sheets.sheet1.comparisons.flatMap((g) => g.fields),
+      ...sheets.sheet2.fields,
+      ...sheets.sheet3.rows.flatMap((r) => r.fields),
+      ...sheets.sheet3.candidates,
+    ];
+    return out;
+  }, [sheets]);
+
+  const findField = useCallback((fieldPath: string): FieldView | null =>
+    allFields.find((f) => f.fieldPath === fieldPath) ?? null, [allFields]);
+
+  /** 现有证据（改值时沿用，避免"改个错别字就丢证据"）。 */
+  const currentEvidence = useCallback((fieldPath: string): UiEvidence[] => {
+    const cur = findField(fieldPath);
+    return (cur?.evidence ?? []).map((e) => ({
+      kind: (e.kind ?? 'text') as EvKind,
+      page: e.page,
+      bbox: e.bbox,
+      quote: e.quote,
+    }));
+  }, [findField]);
+
+  /* ------------------------------ 标注写入 ------------------------------ */
+
+  const postAnnotation = useCallback(async (
+    entry: {
+      fieldPath: string;
+      action: 'confirm' | 'override' | 'add';
+      value: { raw: string; evidence?: UiEvidence[]; provenance: 'human'; confidence: number };
+      note?: string;
+    },
+  ): Promise<boolean> => {
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/annotation?year=${year}&study=${encodeURIComponent(study)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ entry }),
+      });
+      const d = await r.json();
+      if (!r.ok) { setStatus(`保存失败: ${d.error}`); return false; }
+      await loadFields(year, study);
+      return true;
+    } catch (e) {
+      setStatus(`保存失败: ${(e as Error).message}`);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }, [year, study, loadFields]);
+
+  /**
+   * 人工改值。
+   *
+   * action 的判定以"最终值是否等于原值"为准，而不是以"用户是否点了编辑"为准：
+   *   add / override / confirm —— 见 docs/07-web-frontend.md §6。
+   */
+  const onEdit = useCallback(async (fieldPath: string, raw: string, note?: string) => {
+    const cur = findField(fieldPath);
+    if (!cur) { setStatus(`字段未找到: ${fieldPath}`); return; }
+    const evidence = currentEvidence(fieldPath);
+    const noteChanged = (note ?? '') !== (cur.note ?? '');
+    const originalRaw = cur.overridden ? (cur.llmRaw ?? cur.raw) : cur.raw;
+
+    let action: 'confirm' | 'override' | 'add';
+    if (!cur.inGold) action = 'add';
+    else if (raw !== originalRaw) action = 'override';
+    else action = 'confirm';
+
+    if (raw === cur.raw && !noteChanged && cur.decidedBy === 'human') { setStatus('值未变化'); return; }
+
+    const ok = await postAnnotation({
+      fieldPath,
+      action,
+      value: { raw, evidence, provenance: 'human', confidence: 1 },
+      ...(note ? { note } : {}),
+    });
+    if (ok) setStatus(`${action === 'add' ? '已补录' : action === 'override' ? '已修改' : '已确认'} ${fieldPath}`);
+  }, [findField, currentEvidence, postAnnotation]);
+
+  const onConfirm = useCallback(async (fieldPath: string) => {
+    const cur = findField(fieldPath);
+    if (!cur) return;
+    const ok = await postAnnotation({
+      fieldPath,
+      action: 'confirm',
+      value: { raw: cur.raw, evidence: currentEvidence(fieldPath), provenance: 'human', confidence: 1 },
+    });
+    if (ok) setStatus(`已确认 ${fieldPath}`);
+  }, [findField, currentEvidence, postAnnotation]);
+
+  const onAdd = useCallback(async (fieldPath: string, raw: string) => {
+    const ok = await postAnnotation({
+      fieldPath,
+      action: 'add',
+      value: { raw, evidence: [], provenance: 'human', confidence: 1 },
+      note: '人工补录',
+    });
+    if (ok) setStatus(`已补录 ${fieldPath}`);
+  }, [postAnnotation]);
+
+  const onRevert = useCallback(async (fieldPath: string) => {
+    if (findField(fieldPath)?.decidedBy !== 'human') { setStatus('该字段没有人工标注'); return; }
+    setBusy(true);
+    try {
+      const r = await fetch(
+        `/api/annotation?year=${year}&study=${encodeURIComponent(study)}&fieldPath=${encodeURIComponent(fieldPath)}`,
+        { method: 'DELETE' },
+      );
+      const d = await r.json();
+      if (!r.ok) { setStatus(`回滚失败: ${d.error}`); return; }
+      await loadFields(year, study);
+      setStatus(d.removed ? `已回滚 ${fieldPath}` : `${fieldPath} 无人工标注`);
+    } catch (e) {
+      setStatus(`回滚失败: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [year, study, findField, loadFields]);
+
+  /**
+   * 「纳入抽取」：把「待人工确认纳入」的候选结局提升为正式的 Sheet3 行。
+   *
+   * 落库方式就是普通的 `add` 标注，但写在下标 = 当前行数的新行上
+   * （`outcomes.<N>.outcome.name` / `.instrument`）——因此无需新契约，
+   * 服务端一看到覆盖层里出现更大的下标就会把该行渲染出来，随后可继续编辑/框选证据。
+   */
+  const onInclude = useCallback(async (f: FieldView) => {
+    const meta = f.candidate;
+    if (!meta) { setStatus('该候选缺少名称/工具，无法纳入'); return; }
+    const idx = sheets.sheet3.nextOutcomeIndex;
+    const ev = currentEvidence(f.fieldPath);
+    const note = '从「待人工确认纳入」纳入抽取';
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/annotation?year=${year}&study=${encodeURIComponent(study)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          entries: [
+            { fieldPath: `outcomes.${idx}.outcome.name`, action: 'add', value: { raw: meta.name || '（未命名）', evidence: ev, provenance: 'human', confidence: 1 }, note },
+            { fieldPath: `outcomes.${idx}.outcome.instrument`, action: 'add', value: { raw: meta.instrument || 'NR', evidence: ev, provenance: 'human', confidence: 1 }, note },
+          ],
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) { setStatus(`纳入失败：${d.error}`); return; }
+      await loadFields(year, study);
+      setNotice(`已纳入为 Sheet3 结局 ${idx + 1}：${meta.name || meta.instrument}（可继续编辑/框选证据）`);
+    } catch (e) {
+      setStatus(`纳入失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [sheets.sheet3.nextOutcomeIndex, year, study, currentEvidence, loadFields]);
+
+  /* ------------------------------ 框选 ------------------------------ */
+
+  const attachEvidence = useCallback(async (fieldPath: string, sel: Selection) => {
+    const cur = findField(fieldPath);
+    if (!cur) { setStatus(`字段未找到: ${fieldPath}`); return; }
+    const top = sel.hits[0];
+    const ev: UiEvidence = {
+      kind: evKindOf(top?.block.type),
+      page: sel.page,
+      bbox: sel.bbox,
+      quote: sel.quote || '(人工框选，未命中解析文本)',
+      ...(top ? { blockId: `b${top.block.index}` } : {}),
+    };
+    const action: 'confirm' | 'override' | 'add' = !cur.inGold ? 'add' : cur.overridden ? 'override' : 'confirm';
+    const ok = await postAnnotation({
+      fieldPath,
+      action,
+      value: { raw: cur.raw, evidence: [ev], provenance: 'human', confidence: 1 },
+      note: '人工框选指定证据',
+    });
+    setMarkingField(null);
+    setMode('browse');
+    if (ok) {
+      setHighlights([{ page: sel.page, bbox: sel.bbox, label: `${fieldPath} 的证据`, color: '#a855f7', human: true }]);
+      setStatus(`已为 ${fieldPath} 写入证据（p${sel.page}，${sel.hits.length} 个命中块）`);
+    }
+  }, [findField, postAnnotation]);
+
+  const onSelect = useCallback((sel: Selection | null) => {
+    setSelection(sel);
+    if (!sel) {
+      if (markingField) { setMarkingField(null); setMode('browse'); }
+      return;
+    }
+    if (sel.mode === 'mark' && markingField) { void attachEvidence(markingField, sel); return; }
+    setHighlights([{ page: sel.page, bbox: sel.bbox, label: '框选', color: '#22d3ee' }]);
+  }, [markingField, attachEvidence]);
+
+  const onStartMark = useCallback((fieldPath: string) => {
+    setMarkingField(fieldPath);
+    setMode('mark');
+    setStatus(`标注模式：在左侧 PDF 拖框，作为 ${fieldPath} 的证据`);
+  }, []);
+
+  const onAttachEvidence = useCallback((fieldPath: string) => {
+    if (!selection) { setStatus('请先在 PDF 上框选'); return; }
+    void attachEvidence(fieldPath, selection);
+  }, [selection, attachEvidence]);
+
+  /** 点字段 → 滚到证据所在页并高亮（右侧不再显示证据原文）。 */
+  const onFocusEvidence = useCallback((pg: number, bbox: Bbox) => {
+    setFocusPage(pg);
+    setFocusToken((t) => t + 1);
+    setHighlights([{ page: pg, bbox, label: '证据', color: '#ff9500' }]);
+    setStatus(`已定位到 p${pg}`);
+  }, []);
+
+  const onLocate = useCallback(async (fieldPath: string, raw: string) => {
+    const q = raw.trim();
+    if (q.length < 2) { setStatus('值太短，无法定位'); return; }
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/locate?year=${year}&study=${encodeURIComponent(study)}&q=${encodeURIComponent(q)}`);
+      const d = await r.json();
+      if (!r.ok) { setStatus(`未定位到「${q.slice(0, 40)}」：${d.error ?? ''}`); return; }
+      setFocusPage(d.page);
+      setFocusToken((t) => t + 1);
+      setHighlights([{ page: d.page, bbox: d.bbox, label: `${fieldPath} 自动定位`, color: d.exact ? '#ff9500' : '#eab308' }]);
+      setStatus(`已定位 ${fieldPath} → p${d.page}（${d.exact ? '精确' : '近似'}匹配，${d.blockType}）；确认后用「框选证据」写盘`);
+    } catch (e) {
+      setStatus(`定位失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [year, study]);
+
+  const totalPages = doc?.pages.length ?? 0;
+  const currentStudy = studies.find((s) => s.studyId === study);
+
+  return (
+    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: T.canvas }}>
+      {/* ============ 左：PDF ============ */}
+      <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        {/* 顶栏第 1 行：品牌 + 文章选择 + 导入/解析/抽取（左上角菜单） */}
+        <header style={{
+          display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap',
+          padding: '9px 14px', background: T.bg, borderBottom: `1px solid ${T.border}`,
+        }}>
+          <span style={{
+            width: 26, height: 26, borderRadius: 8, background: T.ink, color: T.amberBright,
+            display: 'grid', placeItems: 'center', fontWeight: 700, fontSize: 13,
+          }}>A</span>
+          <strong style={{ color: T.ink, fontSize: 14, letterSpacing: .2 }}>Article Agent</strong>
+          <span style={{ width: 1, height: 18, background: T.border }} />
+          <select value={year} onChange={(e) => setYear(e.target.value)} style={inputS({ width: 78 })}>
+            {YEARS.map((y) => <option key={y} value={y}>{y}</option>)}
+          </select>
+          <select
+            value={study} onChange={(e) => setStudy(e.target.value)}
+            style={inputS({ maxWidth: 240 })} data-testid="study-select"
+          >
+            {studies.map((s) => (
+              <option key={s.studyId} value={s.studyId}>
+                {s.studyId}{s.imported ? '（导入）' : ''} · {s.file}
+              </option>
+            ))}
+          </select>
+
+          <input
+            ref={fileRef} type="file" accept="application/pdf" style={{ display: 'none' }}
+            data-testid="import-input"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void onPickFile(f);
+              e.target.value = '';
+            }}
+          />
+          <button onClick={() => fileRef.current?.click()} style={primaryBtn()} disabled={busy} data-testid="import-btn">
+            导入文章
+          </button>
+          <button
+            onClick={() => void startJob('parse')} style={ghostBtn(T.blue)}
+            disabled={busy || Boolean(runningJob)} data-testid="parse-btn"
+            title="用 MinerU 解析该 PDF（写入 build/mineru）"
+          >解析</button>
+          <button
+            onClick={() => void startJob('extract')} style={ghostBtn(T.indigo)}
+            disabled={busy || Boolean(runningJob)} data-testid="extract-btn"
+            title="对该文章跑 LLM 抽取（tools/llm_run.mjs --only）"
+          >抽取</button>
+
+          {/* 右上角：设置 */}
+          <button
+            onClick={() => setSettingsOpen(true)}
+            style={{ ...ghostBtn(T.amber), marginLeft: 'auto', padding: '5px 11px', fontSize: 12 }}
+            data-testid="settings-btn"
+          >设置</button>
+        </header>
+
+        {/* 顶栏第 2 行：查看工具 */}
+        <div style={{
+          display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap',
+          padding: '7px 14px', background: T.bg, borderBottom: `1px solid ${T.border}`,
+        }}>
+          <span style={{ color: T.text, fontSize: 12, fontVariantNumeric: 'tabular-nums' }}>
+            第 {page} / {totalPages} 页
+          </span>
+          <span style={{ display: 'flex', gap: 6, alignItems: 'center', color: T.faint, fontSize: 11 }}>
+            缩放
+            <input
+              type="range" min={0.6} max={2.4} step={0.1} value={scale}
+              onChange={(e) => setScale(Number(e.target.value))} style={{ width: 90, accentColor: T.amber }}
+              title={`缩放 ${scale.toFixed(1)}×`}
+            />
+            {Math.round(scale * 100)}%
+          </span>
+          <label style={{
+            display: 'flex', gap: 5, alignItems: 'center', color: T.muted, fontSize: 11,
+            padding: '3px 9px', borderRadius: R.pill,
+            background: showBlocks ? T.amberTint : T.panel,
+            border: `1px solid ${showBlocks ? tint(T.amber, '40') : T.border}`,
+          }}>
+            <input type="checkbox" checked={showBlocks} onChange={(e) => setShowBlocks(e.target.checked)} style={{ accentColor: T.amber }} />
+            解析块
+          </label>
+          <button
+            onClick={() => { setMode(mode === 'mark' ? 'browse' : 'mark'); setMarkingField(null); }}
+            style={mode === 'mark' ? ghostBtn(T.amber) : ghostBtn(T.cyan)}
+          >
+            {mode === 'mark' ? '标注模式（框选=证据）' : '浏览模式'}
+          </button>
+          <span style={{ marginLeft: 'auto', color: T.faint, fontSize: 11 }}>
+            {busy ? '处理中… ' : ''}{status}
+          </span>
+        </div>
+
+        {/* 任务条（有任务时替换状态文字的位置，避免两行都显示状态） */}
+        {(runningJob || jobs.length > 0) && (
+          <div style={{
+            padding: '5px 14px', background: T.panel, borderBottom: `1px solid ${T.border}`,
+            fontSize: 11, color: T.muted, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap',
+          }}>
+            {runningJob
+              ? <span style={{ color: T.blue }}>
+                  {runningJob.kind === 'parse' ? 'MinerU 解析' : 'LLM 抽取'}进行中（{runningJob.id}）…
+                  已 {Math.round((Date.now() - Date.parse(runningJob.startedAt)) / 1000)}s
+                </span>
+              : <span>最近任务：{jobs[0]?.id} {jobs[0]?.state}</span>}
+            <button onClick={() => setShowJobLog((v) => !v)} style={ghostBtn()}>
+              {showJobLog ? '收起日志' : '展开日志'}
+            </button>
+            <button onClick={() => void loadFields(year, study)} style={ghostBtn()}>刷新字段</button>
+          </div>
+        )}
+
+        {notice && (
+          <div
+            data-testid="notice"
+            style={{
+              padding: '6px 14px', borderBottom: `1px solid ${tint(T.emerald, '40')}`, fontSize: 12,
+              background: tint(T.emerald, '14'), color: '#05674a',
+              display: 'flex', gap: 10, alignItems: 'center',
+            }}
+          >
+            <span style={{ flex: 1 }}>{notice}</span>
+            <button onClick={() => setNotice(null)} style={ghostBtn(T.emerald)}>知道了</button>
+          </div>
+        )}
+
+        {showJobLog && jobs.length > 0 && (
+          <pre style={{
+            margin: 0, padding: '7px 14px', maxHeight: 140, overflow: 'auto',
+            background: T.panel, color: T.muted, fontSize: 10.5,
+            borderBottom: `1px solid ${T.border}`,
+          }}>{jobs[0]!.logTail.join('\n')}</pre>
+        )}
+
+        <main style={{ flex: 1, overflow: 'hidden', background: T.canvas }}>
+          {doc && pdf
+            ? (
+              <PdfViewer
+                pdf={pdf}
+                doc={doc}
+                scale={scale}
+                highlights={highlights}
+                showBlocks={showBlocks}
+                mode={mode}
+                focusPage={focusPage}
+                focusToken={focusToken}
+                onSelect={onSelect}
+                onPageChange={setPage}
+              />
+            )
+            : <div style={{ color: T.muted, padding: 20 }}>{status}</div>}
+        </main>
+
+        {/* 框选信息条（左边底部：核对解析质量用） */}
+        {selection && (
+          <div style={{
+            borderTop: `1px solid ${T.border}`, background: T.bg, padding: '7px 14px',
+            fontSize: 11, maxHeight: 132, overflow: 'auto', flexShrink: 0,
+          }}>
+            <div style={{ color: T.muted, marginBottom: 4 }}>
+              p{selection.page} · bbox [{selection.bbox.map((v) => Math.round(v)).join(', ')}] · 命中 {selection.hits.length} 块
+              {selection.mode === 'mark'
+                ? <span style={{ color: T.amber }}> · 标注框选（已/待写入字段证据）</span>
+                : <span style={{ color: T.cyan }}> · 点右侧字段的「用当前框选作证据」即可写入</span>}
+            </div>
+            {selection.hits.length === 0
+              ? <div style={{ color: T.faint }}>未命中解析块（该区域可能是图表或扫描层，quote 将标记为人工框选）</div>
+              : selection.hits.map((h, i) => (
+                <div key={h.block.index} style={{ color: T.faint, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {i + 1}. <span style={{ color: T.blue }}>#{h.block.index}</span> {h.block.type}
+                  {' '}<span style={{ color: T.faint }}>{Math.round(h.ratio * 100)}%</span>{' '}
+                  <span style={{ color: T.muted }}>{h.block.text.slice(0, 100) || '（无文本）'}</span>
+                </div>
+              ))}
+          </div>
+        )}
+      </div>
+
+      {/* ============ 右：字段详情（三张选项卡） ============ */}
+      <aside style={{
+        width: 520, flexShrink: 0, borderLeft: `1px solid ${T.border}`,
+        background: T.panel, display: 'flex', flexDirection: 'column',
+      }}>
+        <div style={{
+          padding: '11px 14px', background: T.bg, borderBottom: `1px solid ${T.border}`,
+          display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8,
+        }}>
+          <span style={{ color: T.ink, fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            抽取字段{currentStudy?.imported ? '（导入件）' : ''}
+          </span>
+          <span style={{ fontSize: 11, color: T.faint, whiteSpace: 'nowrap' }}>
+            人工 {annStats.total}
+            {annStats.overridden > 0 && <span style={{ color: T.amber }}> · 修改 {annStats.overridden}</span>}
+            {annStats.confirmed > 0 && <span style={{ color: T.emerald }}> · 确认 {annStats.confirmed}</span>}
+          </span>
+        </div>
+        <div style={{ flex: 1, overflow: 'hidden' }}>
+          <ExtractionPanel
+            sheets={sheets}
+            markingFieldPath={markingField}
+            hasSelection={Boolean(selection)}
+            busy={busy}
+            onFocusEvidence={onFocusEvidence}
+            onEdit={onEdit}
+            onConfirm={onConfirm}
+            onRevert={onRevert}
+            onStartMark={onStartMark}
+            onAttachEvidence={onAttachEvidence}
+            onAdd={onAdd}
+            onLocate={onLocate}
+            onInclude={onInclude}
+          />
+        </div>
+      </aside>
+
+      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+    </div>
+  );
+}
+
+
+const tb = (color: string): React.CSSProperties => ({
+  fontSize: 11, padding: '3px 8px', borderRadius: 3, cursor: 'pointer',
+  background: `${color}1a`, color, border: `1px solid ${color}66`,
+});

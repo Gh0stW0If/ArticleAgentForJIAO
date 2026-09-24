@@ -1,0 +1,13 @@
+{
+  "name": "@aa/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Article Agent 桌面端（Electron 壳 + 本地服务）",
+  "author": "Article Agent",
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win portable --config electron-builder.yml"
+  }
+}
