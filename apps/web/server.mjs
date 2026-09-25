@@ -43,6 +43,7 @@ import { readReviewTables, planImport, studyPairs, readSignature } from '../../t
 import { verifySignature } from '../../tools/export_review.mjs';
 import { labelOutcomeField } from '../../tools/outcome-field-map.mjs';
 import { RETIRED_KEYS } from '../../tools/canonical-field-map.mjs';
+import { isOutcomeCandidate, outcomeSimilarity } from '../../tools/lib/align.mjs';
 
 const ROOT = resolve(process.env.AA_ROOT ?? process.cwd());
 const PORT = Number(process.env.AA_PORT ?? 43130);
@@ -94,6 +95,15 @@ const DIRS = {
    * 导入件放在 `build/imports/`，侧车 `.meta.json` 记录原始文件名、大小与 sha256。
    */
   imports: join(ROOT, 'build', 'imports'),
+  /**
+   * 结局行的**人工裁定**记录（202609 覆盖率口径的配套）。
+   *
+   * 覆盖率口径下，流水线抽了、金标准没要的结局行**不判错**，改为"交人工裁定"。
+   * 裁定结果（保留 / 丢弃）按核对人分开存，和标注覆盖层同一个思路：
+   *   - 不覆盖原始产物，随时可对比"机器抽的 vs 人留的"
+   *   - 多人独立裁定，**分歧不替人裁决**（保留并标出）
+   */
+  adjudications: join(ROOT, 'build', 'adjudications'),
   /** 本地私有配置（API key 等）——只在本机读写，永不回显明文 */
   runtime: join(ROOT, 'runtime'),
 };
@@ -203,6 +213,190 @@ function deleteAnnotation(year, study, reviewer, fieldPath) {
   if (!ov.entries.length) rmSync(p, { force: true });
   else writeFileSync(p, JSON.stringify({ ...ov, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
   return { ok: true, removed };
+}
+
+/* ------------------------------ 结局行人工裁定 ------------------------------ */
+/*
+ * 覆盖率口径下，流水线抽了、金标准没要的结局行**不判错**，改为"交人工裁定"
+ * （多抽的可以裁掉，漏抽的才是硬伤）。裁定结果按核对人分开存，
+ * 与标注覆盖层同一个思路：不动原始产物、多人独立、**分歧不替人裁决**。
+ */
+
+const adjudicationDir = (year) => join(DIRS.adjudications, year);
+const adjudicationPath = (year, study, reviewer) =>
+  join(adjudicationDir(year), `${studyKey(study)}.${reviewer}.json`);
+
+/** 读一份裁定文件（损坏时返回 null，不让整个接口失败）。 */
+function readAdjudicationFile(path) {
+  if (!existsSync(path)) return null;
+  try {
+    const d = JSON.parse(readFileSync(path, 'utf8'));
+    if (!d || typeof d.rows !== 'object' || d.rows === null) return null;
+    return d;
+  } catch {
+    return null;
+  }
+}
+
+/** 某篇研究的**全部**核对人裁定记录。 */
+function listAdjudications(year, study) {
+  const key = studyKey(study);
+  const dir = adjudicationDir(year);
+  if (!existsSync(dir)) return [];
+  const out = [];
+  for (const f of readdirSync(dir)) {
+    if (!f.startsWith(`${key}.`) || !f.endsWith('.json')) continue;
+    const reviewer = f.slice(key.length + 1, -'.json'.length);
+    if (!reviewer) continue;
+    const d = readAdjudicationFile(join(dir, f));
+    // 文件名是权威来源（与标注覆盖层同样的处理）
+    if (d) out.push({ ...d, reviewer: d.reviewer ?? reviewer });
+  }
+  return out;
+}
+
+/**
+ * 逐行裁定的合并状态：
+ *   agreed   全部核对人一致 → 生效
+ *   single   只有一位表过态 → 生效（与标注覆盖层的口径一致）
+ *   disputed 有分歧        → **不生效**，按"保留"处理并标出：删数据是不可逆的，
+ *                            宁可留着让人再裁一次，也不替人删
+ *   none     无人裁定       → 未裁定（导出时保留并标出）
+ */
+function adjudicationIndex(year, study) {
+  const gather = new Map();
+  for (const doc of listAdjudications(year, study)) {
+    for (const [k, v] of Object.entries(doc.rows ?? {})) {
+      const i = Number(k);
+      if (!Number.isInteger(i) || i < 0) continue;
+      if (v?.decision !== 'keep' && v?.decision !== 'drop') continue;
+      if (!gather.has(i)) gather.set(i, []);
+      gather.get(i).push({ reviewer: doc.reviewer, decision: v.decision, ...(v.note ? { note: v.note } : {}) });
+    }
+  }
+  const out = new Map();
+  for (const [i, opinions] of gather) {
+    const ds = [...new Set(opinions.map((o) => o.decision))];
+    const status = ds.length > 1 ? 'disputed' : opinions.length === 1 ? 'single' : 'agreed';
+    out.set(i, {
+      status,
+      effective: status === 'disputed' ? 'keep' : ds[0],
+      opinions,
+    });
+  }
+  return out;
+}
+
+/** 写一条裁定。`decision = null` 表示撤销这条记录（回到"未裁定"）。 */
+function setAdjudication(year, study, reviewer, rowIndex, decision, note) {
+  const r = safeReviewer(reviewer);
+  if (!r) return { ok: false, error: `核对人标识非法：${JSON.stringify(reviewer)}` };
+  const i = Number(rowIndex);
+  if (!Number.isInteger(i) || i < 0) return { ok: false, error: `结局行下标非法：${JSON.stringify(rowIndex)}` };
+  if (decision !== null && decision !== 'keep' && decision !== 'drop') {
+    return { ok: false, error: `裁定只能是 keep / drop / null，收到 ${JSON.stringify(decision)}` };
+  }
+  const p = adjudicationPath(year, study, r);
+  const doc = readAdjudicationFile(p) ?? { study: studyKey(study), year, reviewer: r, rows: {} };
+  if (decision === null) delete doc.rows[String(i)];
+  else {
+    doc.rows[String(i)] = {
+      decision,
+      ...(note ? { note: String(note).slice(0, 300) } : {}),
+      at: new Date().toISOString(),
+    };
+  }
+  if (!Object.keys(doc.rows).length) {
+    // 撤空即删文件，避免留下一堆空壳影响"谁裁过"的判断
+    if (existsSync(p)) rmSync(p, { force: true });
+    return { ok: true, cleared: true };
+  }
+  mkdirSync(adjudicationDir(year), { recursive: true });
+  writeFileSync(p, JSON.stringify({ ...doc, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
+  return { ok: true, path: p.replace(`${ROOT}${sep}`, '') };
+}
+
+/** 数一个对象里有多少个字段值（形如 `{ raw, ... }`）——与评测的 countFieldLeaves 同义。 */
+function countLeaves(node) {
+  let n = 0;
+  const walk = (o) => {
+    if (o === null || typeof o !== 'object') return;
+    if (Array.isArray(o)) { o.forEach(walk); return; }
+    if (typeof o.raw === 'string') { n++; return; }
+    Object.values(o).forEach(walk);
+  };
+  walk(node);
+  return n;
+}
+
+/**
+ * 「金标准没要」的产物结局行 = 人工裁定队列。
+ *
+ * 判据**与评测同一实现**（`tools/lib/align.mjs` 的 `isOutcomeCandidate`）：
+ * 某个产物结局行如果对**任何**一条金标准结局行都不是候选，它就是金标准没要的。
+ * 两边各写一份判据必然会漂移，所以共用。
+ */
+function deferredOutcomeRows(year, study) {
+  const norm = studyKey(study);
+  const extractionFile = join(DIRS.extraction, year, `${norm}.json`);
+  const goldFile = join(DIRS.gold, `${year}.json`);
+  if (!existsSync(extractionFile)) return { rows: [], warning: `未找到 build/extraction/${year}/${norm}.json` };
+  if (!existsSync(goldFile)) return { rows: [], warning: `未找到 build/gold/${year}.json` };
+
+  const doc = JSON.parse(readFileSync(extractionFile, 'utf8'));
+  const gold = JSON.parse(readFileSync(goldFile, 'utf8'));
+  const goldOuts = (gold.articles ?? []).find((a) => a.article_id === norm)?.outcomes ?? [];
+  const preds = doc.outcomes ?? [];
+  const idx = adjudicationIndex(year, study);
+
+  const rows = [];
+  for (let i = 0; i < preds.length; i++) {
+    const p = preds[i];
+    if (goldOuts.some((g) => isOutcomeCandidate(g, p))) continue;   // 金标准要它 → 不是待裁行
+    const a = idx.get(i);
+    const evSrc = p.outcome?.name?.evidence ?? p.outcome?.instrument?.evidence ?? [];
+    /*
+     * 附上"最接近的金标准行"。
+     *
+     * 为什么需要：候选边是**窄**的（construct/subconstruct 不能凭空造边），
+     * 于是像金标准「BI score change」↔产物「activities of daily living /
+     * BI: Barthel Index」这种明显同一个结局、但文本分只有 0.33 的对，
+     * 也可能被判成"没有对应"。规则负责**缩小队列**，最终判断交给人 ——
+     * 所以必须把最接近的那条摆出来给人看，而不是给一个是/否。
+     */
+    let closest = null;
+    for (const g of goldOuts) {
+      const s = outcomeSimilarity(g, p);
+      if (!closest || s.score > closest.score) {
+        closest = {
+          name: g.outcome?.name?.raw ?? '',
+          instrument: g.outcome?.instrument?.raw ?? '',
+          textScore: Number(s.textScore.toFixed(3)),
+          corr: s.corr,
+          score: Number(s.score.toFixed(3)),
+        };
+      }
+    }
+    rows.push({
+      index: i,
+      studyId: p.studyId ?? null,
+      name: p.outcome?.name?.raw ?? '',
+      instrument: p.outcome?.instrument?.raw ?? '',
+      leaves: countLeaves(p),
+      evidence: evSrc.slice(0, 1).map((e) => ({ page: e.page, bbox: e.bbox ?? null, quote: e.quote ?? '', kind: e.kind })),
+      closest,
+      status: a?.status ?? 'none',
+      effective: a?.effective ?? 'keep',
+      opinions: a?.opinions ?? [],
+    });
+  }
+  const counts = { keep: 0, drop: 0, disputed: 0, none: 0 };
+  for (const r of rows) {
+    if (r.status === 'disputed') counts.disputed++;
+    else if (r.status === 'none') counts.none++;
+    else counts[r.effective]++;
+  }
+  return { rows, counts, goldRows: goldOuts.length, totalRows: preds.length };
 }
 
 /**
@@ -1046,6 +1240,11 @@ async function buildFromExtraction(year, study, norm, doc) {
 
   /* ---- 三张 Sheet 的选项卡视图（按原始表格列序） ---- */
   const layout = await loadSheetLayout(year);
+  /*
+   * 待人工裁定的结局行（覆盖率口径的配套）：
+   * 流水线抽了、**金标准没要**的行不判错，列出来让人决定留不留。
+   */
+  const deferred = deferredOutcomeRows(year, study);
   const sheets = {
     layoutSource: layout.source ? layout.source.replace(`${ROOT}${sep}`, '') : null,
     headerOf: layout.headerOf,
@@ -1067,6 +1266,9 @@ async function buildFromExtraction(year, study, norm, doc) {
       candidates: candidateFields,
       /** 下一个可用的结局行下标（「纳入抽取」写入这里） */
       nextOutcomeIndex: outcomeRowCount,
+      deferred: deferred.rows,
+      deferredCounts: deferred.counts ?? { keep: 0, drop: 0, disputed: 0, none: 0 },
+      ...(deferred.warning ? { deferredWarning: deferred.warning } : {}),
     },
   };
 
@@ -1448,13 +1650,42 @@ const server = createServer(async (req, res) => {
        */
       const subjects = [];
       const skipped = [];
+      /*
+       * 结局行裁定的汇总（覆盖率口径的配套）。
+       * 被丢弃的行从 `groups` 里剔除 —— 那才是"丢弃"的实际意义；
+       * 同时把裁定明细带给导出器，让它写进「核对汇总」留痕。
+       */
+      const adjSummary = { keep: 0, drop: 0, disputed: 0, none: 0, rows: [] };
       for (const t of targets) {
         const built = await buildFieldGroups(t.year, t.study);
         if (!built.groups?.length) { skipped.push(`${t.year}/${t.study}`); continue; }
+
+        const deferred = deferredOutcomeRows(t.year, t.study);
+        const dropped = new Set();
+        for (const d of deferred.rows ?? []) {
+          if (d.status === 'disputed') adjSummary.disputed++;
+          else if (d.status === 'none') adjSummary.none++;
+          else adjSummary[d.effective]++;
+          /* 只有明确被丢弃（且非分歧）的才剔除；分歧与未裁定一律保留 */
+          if (d.status !== 'disputed' && d.effective === 'drop') dropped.add(d.index);
+          adjSummary.rows.push({
+            year: t.year, study: t.study, index: d.index, name: d.name || d.instrument || '（未命名）',
+            decision: d.status === 'disputed' ? 'keep' : d.effective,
+            opinions: d.opinions ?? [],
+          });
+        }
+
+        const groups = dropped.size
+          ? built.groups.filter((g) => {
+            const m = /^out-(\d+)$/.exec(g.id ?? '');
+            return !(m && dropped.has(Number(m[1])));
+          })
+          : built.groups;
+
         subjects.push({
           year: t.year,
           study: t.study,
-          groups: built.groups,
+          groups,
           order: built.sheets?.order,
           headerOf: built.sheets?.headerOf,
         });
@@ -1470,6 +1701,7 @@ const server = createServer(async (req, res) => {
         scope,
         signer,
         subjects,
+        ...(adjSummary.rows.length ? { adjudication: adjSummary } : {}),
       });
 
       const name = exportFileName(label, format);
@@ -1661,6 +1893,39 @@ const server = createServer(async (req, res) => {
     if (p === '/api/review-sets') {
       if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
       return json(res, 200, { year, study, sets: reviewSets(year, study) });
+    }
+
+    /*
+     *   GET  /api/adjudication?year=2025&study=2025-01
+     *     → 「金标准没要」的产物结局行 = 人工裁定队列（含证据与裁定状态）
+     *
+     *   POST /api/adjudication    { year, study, reviewer, rowIndex, decision, note? }
+     *     → decision: 'keep' | 'drop' | null（null = 撤销，回到"未裁定"）
+     *
+     * 覆盖率口径下这些行**不判错**，由人工决定留不留；裁定按核对人分开存，
+     * 分歧不替人裁决（保留并标出）。
+     */
+    if (p === '/api/adjudication' && req.method === 'GET') {
+      if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
+      const r = deferredOutcomeRows(year, study);
+      return json(res, 200, { year, study, ...r });
+    }
+
+    if (p === '/api/adjudication' && req.method === 'POST') {
+      let body;
+      try { body = await readBody(req); } catch (e) { return json(res, 400, { error: e.message }); }
+      const bYear = String(body?.year ?? '');
+      const bStudy = String(body?.study ?? '');
+      if (!studyOk(bYear, bStudy)) return json(res, 400, { error: 'year/study 参数非法' });
+      const reviewer = safeReviewer(body?.reviewer);
+      if (!reviewer) return json(res, 400, { error: '请先在右上角填写核对人标识（letters/numbers/中文，≤32 字）' });
+
+      const decision = body?.decision ?? null;
+      const written = setAdjudication(bYear, bStudy, reviewer, body?.rowIndex, decision, body?.note);
+      if (!written.ok) return json(res, 400, { error: written.error });
+
+      const after = deferredOutcomeRows(bYear, bStudy);
+      return json(res, 200, { ok: true, reviewer, decision, ...written, counts: after.counts, rows: after.rows });
     }
 
     /*

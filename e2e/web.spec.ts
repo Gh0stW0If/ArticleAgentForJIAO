@@ -593,6 +593,72 @@ test.describe('前端交互（真实浏览器）', () => {
     await expect(page.locator('[data-testid="settings-test-result"]')).toBeVisible({ timeout: 20_000 });
   });
 
+  /**
+   * 结局行人工裁定（覆盖率口径的配套）。
+   *
+   * 覆盖率口径下"流水线抽了、金标准没要"的结局行**不判错**，改由人工决定留不留。
+   * 这里一次覆盖四件事：① 待裁行在界面上列出来（含"最接近的金标准行"）；
+   * ② 丢弃后落盘且状态归属正确；③ **丢弃的行不再进导出**（这才是裁定的实际意义）；
+   * ④ 撤销能回到"未裁定"。
+   *
+   * 用 `2015-06`：它是 2015 里唯一有待裁行的研究（`2015-01` 是 0 条）。
+   */
+  test('结局行裁定：金标准没要的行可保留/丢弃，丢弃的不进导出', async ({ page, request }) => {
+    const Y = '2015';
+    const ST = '2015-06';
+    const adjUrl = `/api/adjudication?year=${Y}&study=${ST}`;
+    const before = await (await request.get(adjUrl)).json();
+    test.skip(!(before.rows ?? []).length, '该篇没有待人工裁定的结局行');
+
+    const idx: number = before.rows[0].index;
+    const csvUrl = (r: string) => `/api/export?year=${Y}&study=${ST}&format=csv&reviewer=${r}`;
+
+    try {
+      const csvBefore = await (await request.get(csvUrl(REVIEWER))).text();
+      expect(csvBefore).toContain(`outcomes.${idx}.`);
+
+      await page.goto('/');
+      await waitForPdf(page);
+      await signIn(page);
+      await page.locator('[data-testid="study-select"]').selectOption(ST);
+      await page.locator('[data-tab="sheet3"]').click();
+
+      const card = page.locator(`[data-deferred="${idx}"]`);
+      await expect(card).toBeVisible();
+      // 必须摆出"最接近的金标准行"：候选边是窄的，可能把同一个结局也圈进来，
+      // 规则只负责缩小队列，判断交给人。
+      await expect(card).toContainText('最接近的金标准行');
+      await expect(card).toContainText('未裁定');
+
+      await card.locator('[data-action="adjudicate-drop"]').click();
+      await expect(page.locator('[data-testid="notice"]')).toContainText(/已丢弃/);
+
+      const afterDrop = await (await request.get(adjUrl)).json();
+      const row = afterDrop.rows.find((r: { index: number }) => r.index === idx);
+      expect(row.effective).toBe('drop');
+      expect(row.status).toBe('single');
+      expect(row.opinions[0].reviewer).toBe(REVIEWER);
+
+      // ③ 丢弃的行整行从导出里消失
+      const csvAfter = await (await request.get(csvUrl(REVIEWER))).text();
+      expect(csvAfter).not.toContain(`outcomes.${idx}.`);
+
+      // ④ 撤销 → 回到未裁定，且该行重新出现在导出里
+      await card.locator('[data-action="adjudicate-clear"]').click();
+      await expect(page.locator('[data-testid="notice"]')).toContainText(/已撤销裁定/);
+      const afterClear = await (await request.get(adjUrl)).json();
+      expect(afterClear.rows.find((r: { index: number }) => r.index === idx).status).toBe('none');
+      expect(await (await request.get(csvUrl(REVIEWER))).text()).toContain(`outcomes.${idx}.`);
+    } finally {
+      // 测试不留副作用：把 e2e 名下这几行的裁定全部撤销
+      for (const r of before.rows ?? []) {
+        await request.post('/api/adjudication', {
+          data: { year: Y, study: ST, reviewer: REVIEWER, rowIndex: r.index, decision: null },
+        });
+      }
+    }
+  });
+
   test('导入文章：上传 PDF 后出现在研究列表并可打开', async ({ page, request }) => {
     test.skip(!existsSync(CORPUS_PDF), '缺少用于导入的样本 PDF');
     await page.goto('/');

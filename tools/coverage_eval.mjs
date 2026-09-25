@@ -62,8 +62,7 @@ const flat = (node, prefix, out, conv) => {
 };
 const leavesOf = (row, conv) => { const o = []; flat(row, '', o, conv); return o; };
 
-/** 行级 1:1 贪心（与 align.mjs 的 alignOutcomes 同一策略，这里可换不同边集） */
-function oneToOne(rows, preds, adj) {
+/** 行级 1:1 贪心（与 align.mjs 的 alignOutcomes 同一策略，这里可换不同边集） */function oneToOne(rows, preds, adj) {
   const cand = [];
   for (let gi = 0; gi < rows.length; gi++) {
     for (const pi of adj[gi]) cand.push({ gi, pi, s: outcomeSimilarity(rows[gi], preds[pi]).score });
@@ -83,7 +82,10 @@ const acc = {
   e: { h: 0, w: 0, m: 0 },
   f: { h: 0, w: 0, m: 0 },
   g: { h: 0, w: 0, m: 0 },
+  h: { h: 0, w: 0, m: 0 },
 };
+/** (h) 修正边下的产物行去向 */
+let covNeededRows = 0, covDeferRows = 0, covDeferLeaves = 0;
 /** 金标准叶子实例里，有多少是"同一篇内重复的要求"（同路径 + 同值） */
 let gLeafAll = 0, gLeafDup = 0;
 let gRows = 0, pRows = 0, nArts = 0;
@@ -107,14 +109,16 @@ for (const y of YEARS) {
     gRows += rows.length; pRows += preds.length;
     py.gRows += rows.length; py.pRows += preds.length;
 
-    /* 两套候选边：(a) 用 score（含数值佐证）；(b)(c)(d) 只认文本 */
-    const adjS = rows.map(() => []);
-    const adjT = rows.map(() => []);
+    /* 三套候选边 */
+    const adjS = rows.map(() => []);   // score ≥ MIN（含 construct/subconstruct 加成）
+    const adjT = rows.map(() => []);   // textScore ≥ MIN
+    const adjC = rows.map(() => []);   // ★ 修正边：textScore ≥ MIN **或** 数值佐证 ≥2
     for (let gi = 0; gi < rows.length; gi++) {
       for (let pi = 0; pi < preds.length; pi++) {
         const s = outcomeSimilarity(rows[gi], preds[pi]);
         if (s.score >= MIN_SCORE) adjS[gi].push(pi);
         if (s.textScore >= MIN_SCORE) adjT[gi].push(pi);
+        if (s.textScore >= MIN_SCORE || s.corr >= 2) adjC[gi].push(pi);
       }
     }
     const g2pS = oneToOne(rows, preds, adjS);
@@ -152,6 +156,8 @@ for (const y of YEARS) {
     const req = new Map();
     /* (f)：与 (e) 同样去重，但候选边用 score（含数值佐证）—— 用来和现行 (a) 苹果对苹果 */
     const reqS = new Map();
+    /* (h)：★ 去重 + 多对一 + **修正边**（textScore ≥ MIN 或 数值佐证 ≥2） */
+    const reqC = new Map();
 
     for (let gi = 0; gi < rows.length; gi++) {
       const byPath = (pi) => {        const m = new Map();
@@ -187,6 +193,8 @@ for (const y of YEARS) {
         for (const pi of adjT[gi]) req.get(rk).cands.add(pi);
         if (!reqS.has(rk)) reqS.set(rk, { path, gval, cands: new Set() });
         for (const pi of adjS[gi]) reqS.get(rk).cands.add(pi);
+        if (!reqC.has(rk)) reqC.set(rk, { path, gval, cands: new Set() });
+        for (const pi of adjC[gi]) reqC.get(rk).cands.add(pi);
         const bump = (o, list) => {
           if (!list || !list.length) o.m++;
           else if (list.some((v) => eq(gval, v))) o.h++;
@@ -223,6 +231,18 @@ for (const y of YEARS) {
     };
     for (const r of req.values()) scoreReq(r, acc.e);
     for (const r of reqS.values()) scoreReq(r, acc.f);
+    for (const r of reqC.values()) scoreReq(r, acc.h);
+
+    /* 修正边下的"无人要"产物行 = 人工裁定队列 */
+    {
+      const used = new Set();
+      for (const list of adjC) for (const pi of list) used.add(pi);
+      for (let pi = 0; pi < preds.length; pi++) {
+        if (used.has(pi)) continue;
+        covDeferRows++; covDeferLeaves += leavesOf(preds[pi], (k) => camelToSnake(k)).length;
+      }
+      covNeededRows += used.size;
+    }
   }
   py.acc.h = acc.d.h - before.h;
   py.acc.w = acc.d.w - before.w;
@@ -249,6 +269,8 @@ if (AS_JSON) {
       a: { ...acc.a, rate: rateOf(acc.a) }, b: { ...acc.b, rate: rateOf(acc.b) },
       c: { ...acc.c, rate: rateOf(acc.c) }, d: { ...acc.d, rate: rateOf(acc.d) },
       e: { ...acc.e, rate: rateOf(acc.e) }, f: { ...acc.f, rate: rateOf(acc.f) }, g: { ...acc.g, rate: rateOf(acc.g) },
+      h: { ...acc.h, rate: rateOf(acc.h) },
+      correctedNeededRows: covNeededRows, correctedDeferredRows: covDeferRows, correctedDeferredLeaves: covDeferLeaves,
       goldLeafInstances: gLeafAll, goldLeafDuplicates: gLeafDup,
     },
   };
@@ -276,6 +298,16 @@ line('(d) 只认文本 + 多对一 + 叶子级消耗 ★', acc.d);
 line('(e) 要求去重 + 多对一（只认文本）', acc.e);
 line('(f) 要求去重 + 多对一（score 边）★', acc.f);
 line('(g) 不去重 + 多对一（score 边）', acc.g);
+line('(h) ★ 去重 + 多对一 + 修正边（文本 或 数值佐证≥2）', acc.h);
+
+console.log(`\n  ⚠️ (f)/(g) 用的 score 边**过宽**：sameConstruct(+0.25) + sameSub(+0.15) 就够到 0.40，`);
+console.log(`     越过 MIN_SCORE=0.34 —— 于是每个产物行都是每个金标准行的候选，而所有结局行的`);
+console.log(`     叶子路径结构相同 → "候选行里有这个路径"恒成立 → 漏抽退化到 0。`);
+console.log(`     (h) 把边收紧成"名字像 **或** 数值重合 ≥2"，才是"保留数值佐证"的正确落法。`);
+
+console.log(`\n  (h) 口径下的产物行去向：${pRows} 行里`);
+console.log(`    被金标准需要        ${String(covNeededRows).padStart(4)} 行`);
+console.log(`    金标准没要 → 人工裁定 ${String(covDeferRows).padStart(4)} 行（含 ${covDeferLeaves} 个叶子，≈ 每篇 ${(covDeferRows / nArts).toFixed(1)} 行）`);
 
 console.log(`\n  ⭐ 与现行口径**同边定义**的净效果：(a) ${rateOf(acc.a).toFixed(1)}% → (f) ${rateOf(acc.f).toFixed(1)}%`
   + `（+${(rateOf(acc.f) - rateOf(acc.a)).toFixed(1)}pt）`);

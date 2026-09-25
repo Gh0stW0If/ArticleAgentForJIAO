@@ -152,6 +152,11 @@ export const signatureLine = (sig) => `# ${SIG_TAG} ${JSON.stringify(sig)}`;
  * @param {string} [p.signer]      **导出人**（= 导出时界面上的核对人）。给空则不带签名
  * @param {{year:string, study:string, groups:any[], order?:object, headerOf?:object}[]} p.subjects
  *        一个或多个研究。批量导出时按传入顺序排列。
+ * @param {{keep:number, drop:number, disputed:number, none:number,
+ *          rows:{year:string, study:string, index:number, name:string, decision:string,
+ *                opinions:{reviewer:string, decision:string}[]}[]}} [p.adjudication]
+ *        结局行人工裁定汇总。**被丢弃的行应当已从 `subjects[].groups` 里剔除**
+ *        （本函数只负责在汇总页留痕，不做过滤——过滤在调用方做，那里才知道行号）。
  * @param {string} [p.generatedAt]
  * @returns {{ sheets:{name:string,rows:any[][],widths:number[]}[], csv:string, columns:string[], stats:object, signature:object|null }}
  */
@@ -299,6 +304,26 @@ export function buildReviewExport(p) {
   for (const a of pairwise) {
     rows.push([`${a.a} ↔ ${a.b}`, String(a.common), String(a.same), String(a.disputed),
       a.rate === null ? '（无共同字段）' : `${(a.rate * 100).toFixed(1)}%`]);
+  }
+  rows.push(['', '']);
+  /*
+   * 结局行人工裁定（覆盖率口径的配套）。
+   *
+   * 覆盖率口径下"流水线抽了、金标准没要"的结局行**不判错**，留不留由人定；
+   * 被丢弃的行**不进 Sheet3**（那才是裁定的实际意义），但必须在汇总页留痕——
+   * 否则表格少了几行，看表的人不知道是没抽到还是被裁掉了。
+   */
+  const adj = p.adjudication;
+  if (adj) {
+    rows.push(['结局行裁定（金标准没要的行）', '', '', '', '']);
+    rows.push(['保留', String(adj.keep ?? 0), '丢弃', String(adj.drop ?? 0), '未裁定', String(adj.none ?? 0)]);
+    if (adj.disputed) rows.push(['⚠ 核对人有分歧（按保留处理，待仲裁）', String(adj.disputed)]);
+    rows.push(['', '']);
+    rows.push(['年份', '研究', '结局行', '结局名', '裁定', '核对人']);
+    for (const d of adj.rows ?? []) {
+      rows.push([d.year, d.study, String((d.index ?? 0) + 1), d.name, d.decision === 'drop' ? '丢弃' : '保留',
+        (d.opinions ?? []).map((o) => `${o.reviewer}:${o.decision === 'drop' ? '丢弃' : '保留'}`).join('、') || '（未裁定）']);
+    }
   }
   rows.push(['', '']);
   rows.push(['待第三方仲裁', '', '', '', '']);

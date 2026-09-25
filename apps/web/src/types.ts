@@ -71,6 +71,26 @@ export interface SheetOrder {
   sheet3: { top: string[]; timepoint: { baseline: string[]; endOfTreatment: string[]; followUpEnd: string[] } };
 }
 
+/**
+ * 一条「金标准没要」的产物结局行 —— 覆盖率口径下**不判错**，交人工裁定留不留。
+ *
+ * `closest` 是**最接近的金标准行**：候选边是窄的（construct/subconstruct 不能凭空
+ * 造边），所以像「BI score change」↔「activities of daily living / BI: Barthel Index」
+ * 这种明显同一个结局也可能落进来。规则只负责缩小队列，判断交给人。
+ */
+export interface DeferredOutcome {
+  index: number;
+  studyId: string | null;
+  name: string;
+  instrument: string;
+  leaves: number;
+  evidence: { page: number; bbox: [number, number, number, number] | null; quote: string; kind?: string }[];
+  closest: { name: string; instrument: string; textScore: number; corr: number; score: number } | null;
+  status: 'agreed' | 'single' | 'disputed' | 'none';
+  effective: 'keep' | 'drop';
+  opinions: { reviewer: string; decision: 'keep' | 'drop'; note?: string }[];
+}
+
 export interface SheetsPayload {
   layoutSource: string | null;
   headerOf: Record<string, string>;
@@ -82,6 +102,9 @@ export interface SheetsPayload {
     rows: (FieldGroup & { index: number })[];
     candidates: FieldView[];
     nextOutcomeIndex: number;
+    /** 待人工裁定的结局行（金标准没要的产物行） */
+    deferred: DeferredOutcome[];
+    deferredCounts: { keep: number; drop: number; disputed: number; none: number };
   };
 }
 

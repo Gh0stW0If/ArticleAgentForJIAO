@@ -27,7 +27,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { camelToSnake } from './lib/keys.mjs';
-import { alignOutcomes, normText, outcomeSimilarity, MIN_SCORE } from './lib/align.mjs';
+import { alignOutcomes, normText, outcomeSimilarity, MIN_SCORE, isOutcomeCandidate } from './lib/align.mjs';
 import { VERDICT_WEIGHT } from './lib/judge.mjs';
 import { numericEqual } from '../packages/core/dist/index.js';
 
@@ -211,30 +211,18 @@ function countFieldLeaves(node) {
 }
 
 let gRows = 0, aRows = 0, gLeaves = 0, unRows = 0, unLeaves = 0, pRows = 0;
+let pDefer = 0, pDeferLeaves = 0, nArts = 0;
 const worstRows = [];
-/* 未配对行的成因（行数 / 叶子数）：A1 真被抢走、A2 只有数值凑巧的假候选、B 完全没有 */
-const why = { A1: { r: 0, l: 0 }, A2: { r: 0, l: 0 }, B: { r: 0, l: 0 } };
-let a1Single = 0;
-/* 反方向：没被用上的产物行 */
-let pDup = 0, pOther = 0;
-const samplesA1 = [], samplesNo = [];
+const samplesGap = [], samplesLost = [], samplesDefer = [];
 
-/** Kuhn 增广路：二部图最大匹配 —— 用来验证"贪心是否白白漏配" */
-function maxMatching(nG, nP, adj) {
-  const matchP = new Array(nP).fill(-1);
-  const tryK = (gi, seen) => {
-    for (const pi of adj[gi]) {
-      if (seen[pi]) continue;
-      seen[pi] = true;
-      if (matchP[pi] === -1 || tryK(matchP[pi], seen)) { matchP[pi] = gi; return true; }
-    }
-    return false;
-  };
-  let m = 0;
-  for (let gi = 0; gi < nG; gi++) if (tryK(gi, new Array(nP).fill(false))) m++;
-  return m;
-}
-let maxRows = 0;
+/**
+ * 候选边 —— **直接复用 `align.mjs` 的 `isOutcomeCandidate`**。
+ *
+ * ⚠️ 千万别在这里另写一份。这里曾经写过 `textScore >= MIN_SCORE || corr >= 2`，
+ * 比评测用的规则窄，于是诊断工具报的"交人工裁定 464 行"和网页端对不上。
+ * 口径一旦两边各写一份就会漂移（`align.mjs` 顶部就是这么写的）。
+ */
+const isCand = (g, p) => isOutcomeCandidate(g, p);
 
 for (const y of yearsLoaded) {
   const gf = join(ROOT, 'build', 'gold', `${y}.json`);
@@ -248,93 +236,91 @@ for (const y of yearsLoaded) {
     const ex = exclRows.get(art.article_id);
     const rows = ex?.size ? all.filter((_, i) => !ex.has(i)) : all;
     const preds = pred.outcomes ?? [];
-    const { goldToPred } = alignOutcomes(rows, preds);
     pRows += preds.length;
+    if (rows.length) nArts++;
 
-    /* 与对齐器同一相似度建边，用于定性 + 最大匹配对照 */
+    /* 覆盖率口径的候选边 + 旧 1:1 配对，两者对照 */
     const adj = rows.map(() => []);
     const scoreOf = rows.map(() => new Map());
     for (let gi = 0; gi < rows.length; gi++) {
       for (let pi = 0; pi < preds.length; pi++) {
         const s = outcomeSimilarity(rows[gi], preds[pi]);
         scoreOf[gi].set(pi, s);
-        if (s.score >= MIN_SCORE) adj[gi].push(pi);
+        if (isCand(rows[gi], preds[pi])) adj[gi].push(pi);
       }
     }
-    maxRows += maxMatching(rows.length, preds.length, adj);
+    const { goldToPred } = alignOutcomes(rows, preds);
 
-    const owner = new Map();
-    for (const [og, op] of goldToPred) owner.set(op, og);
-    const usedP = new Set(goldToPred.values());
+    /* 产物行去向：被任一金标准行需要 → 参与比对；否则交人工裁定 */
+    const needed = new Set();
+    for (const list of adj) for (const pi of list) needed.add(pi);
     for (let pi = 0; pi < preds.length; pi++) {
-      if (usedP.has(pi)) continue;
-      let bestText = 0;
-      for (let gi = 0; gi < rows.length; gi++) bestText = Math.max(bestText, scoreOf[gi].get(pi).textScore);
-      if (bestText >= MIN_SCORE) pDup++; else pOther++;
+      if (needed.has(pi)) continue;
+      pDefer++;
+      const n = countFieldLeaves(preds[pi]);
+      pDeferLeaves += n;
+      if (samplesDefer.length < 6) {
+        samplesDefer.push({
+          id: art.article_id, n,
+          name: `${preds[pi].outcome?.name?.raw ?? ''} / ${preds[pi].outcome?.instrument?.raw ?? ''}`,
+        });
+      }
     }
 
     rows.forEach((g, i) => {
       const leaves = countFieldLeaves(g);
       gRows++; gLeaves += leaves;
-      if (goldToPred.get(i) !== undefined) { aRows++; return; }
-      unRows++; unLeaves += leaves;
-      worstRows.push({ id: art.article_id, name: g.outcome?.name?.raw ?? '(无结局名)', leaves });
       const gName = `${g.outcome?.name?.raw ?? ''} / ${g.outcome?.instrument?.raw ?? ''}`;
-      const cands = adj[i].map((pi) => ({ pi, ...scoreOf[i].get(pi) })).sort((a, b) => b.score - a.score);
-      if (!cands.length) {
-        why.B.r++; why.B.l += leaves;
-        if (samplesNo.length < 8) samplesNo.push({ id: art.article_id, gName, leaves, pName: '（产物里没有任何接近的结局）' });
+      const paired = goldToPred.get(i) !== undefined;
+      if (paired) aRows++;
+
+      if (!adj[i].length) {
+        /* 覆盖率口径下也找不到任何对应结局 → 这才是"真没抽到" */
+        unRows++; unLeaves += leaves;
+        worstRows.push({ id: art.article_id, name: g.outcome?.name?.raw ?? '(无结局名)', leaves });
+        if (samplesLost.length < 6) samplesLost.push({ id: art.article_id, gName, leaves });
         return;
       }
-      const c = cands[0];
-      const pName = `${preds[c.pi].outcome?.name?.raw ?? ''} / ${preds[c.pi].outcome?.instrument?.raw ?? ''}`;
-      if (c.textScore >= MIN_SCORE) {
-        why.A1.r++; why.A1.l += leaves;
-        if (cands.length === 1) a1Single++;
-        if (samplesA1.length < 8) {
-          samplesA1.push({
-            id: art.article_id, gName, leaves, pName,
-            by: owner.has(c.pi) ? `${rows[owner.get(c.pi)].outcome?.name?.raw ?? ''}` : null,
-            text: c.textScore, corr: c.corr, n: cands.length,
-          });
-        }
-      } else {
-        why.A2.r++; why.A2.l += leaves;
-        if (samplesNo.length < 8) samplesNo.push({ id: art.article_id, gName, leaves, pName, text: c.textScore, corr: c.corr });
+      if (!paired && samplesGap.length < 6) {
+        const pi = adj[i][0];
+        samplesGap.push({
+          id: art.article_id, gName, leaves,
+          pName: `${preds[pi].outcome?.name?.raw ?? ''} / ${preds[pi].outcome?.instrument?.raw ?? ''}`,
+          text: scoreOf[i].get(pi).textScore, corr: scoreOf[i].get(pi).corr,
+        });
       }
     });
   }
 }
 worstRows.sort((a, b) => b.leaves - a.leaves);
 
-console.log('\n§3 结局行配对（Sheet3「漏抽」的主要来源）\n');
+console.log('\n§3 结局行覆盖（**覆盖率口径**，与 llm_eval 一致）\n');
 const S3 = cell(3);
+const covRows = gRows - unRows;
 console.log(`  金标准结局行 ${gRows} 行 ／ 流水线结局行 ${pRows} 行（${(pRows / gRows).toFixed(2)} 倍）`);
-console.log(`  配上 ${aRows} 行 → 行覆盖率 ${pc(aRows, gRows)}；最大匹配可配 ${maxRows} 行（${pc(maxRows, gRows)}）`);
-console.log(`  未配上的 ${unRows} 行共含 ${unLeaves} 个字段叶子，全部计入「漏抽」`);
-console.log(`  → 占 Sheet3 全部漏抽 ${pc(unLeaves, perSheet[3].missed)}，占 Sheet3 全部分母 ${pc(unLeaves, den(S3))}`);
-console.log(`  → 只把"行没配上"这一项修好（未配对叶子按命中算），Sheet3 上限 ${pc(wsum(S3) + unLeaves, den(S3))}`);
-
+console.log(`  有对应结局（覆盖率口径）  ${covRows} 行 → 行覆盖率 ${pc(covRows, gRows)}`);
+console.log(`  旧口径 1:1 只能配上        ${aRows} 行 → ${pc(aRows, gRows)}`);
+console.log(`  差 ${covRows - aRows} 行 = **"抽到了，但在别的行里"**（旧口径会把这些整行计成漏抽）`);
 /*
- * ⚠️ 这一步才是关键：**未配对 ≠ 没抽到**。
- *
- * 配对是 1:1 贪心（`alignOutcomes`），一个产物行只能被一个金标准行用。
- * 于是同一个结局在两边"拆行口径"不同时（金标准按子量表/维度/组别拆、
- * 流水线按自己的粒度拆），必然有一边的行落空——而它在产物里其实是有数据的。
- * 不拆开就会把"配不上"当成"抽不到"，去改提示词，白费力气。
+ * ⚠️ 这里的叶子数是 `countFieldLeaves`（含重复项、含不计分项），
+ * 与去重后的 `Sheet3 分母` **不是同一口径**，所以不给百分比 —— 给了会误导。
  */
-const whyAll = why.A1.l + why.A2.l + why.B.l;
-console.log(`\n  未配对的成因（按**叶子**加权，这才是失分口径）：`);
-const wline = (label, o) => console.log(`    ${pad(label, 46)}${padr(o.r, 6)}${padr(o.l, 8)}${padr(pc(o.l, whyAll), 8)}`);
-wline('A1 产物里有同一结局，被别的金标准行抢走', why.A1);
-wline('A2 只有数值凑巧重合的"假候选"', why.A2);
-wline('B  产物里没有任何接近的结局', why.B);
-console.log(`\n    → **${pc(why.A1.l, whyAll)} 的"漏抽"其实是"抽到了、但在别的行里"**（行数口径 ${pc(why.A1.r, unRows)}）。`);
-console.log(`    → A1 里"产物只有唯一一行、金标准却有两行要它"的：${a1Single}/${why.A1.r} 行。`);
-console.log(`\n  反方向：${pRows - aRows} 个没被用上的产物行`);
-console.log(`    与某金标准行文本高度相似 → 同一结局被流水线拆成多行  ${String(pDup).padStart(5)} 行`);
-console.log(`    与任何金标准行都不像 → 金标准没收的多抽结局（无害）    ${String(pOther).padStart(5)} 行`);
-console.log(`  → 两边都在拆行：同一个结局在两边落在不同行号上，1:1 配对必然有一边落空。`);
+console.log(`\n  真正没抽到的金标准行 ${unRows} 行（含 ${unLeaves} 个叶子，未去重口径）`);
+console.log(`\n  产物行去向：${pRows} 行里被金标准需要 ${pRows - pDefer} 行，`);
+console.log(`  **金标准没要 → 交人工裁定 ${pDefer} 行**（含 ${pDeferLeaves} 个叶子，≈ 每篇 ${(pDefer / Math.max(1, nArts)).toFixed(1)} 行）`);
+
+console.log(`\n  ── "抽到了但在别的行"样例（旧口径整行计漏，新口径正常比对）──`);
+for (const s of samplesGap) {
+  console.log(`    ${pad(s.id, 10)}金「${s.gName.slice(0, 30)}」(${s.leaves}叶)`);
+  console.log(`              → 产物「${s.pName.slice(0, 30)}」  [文本${s.text.toFixed(2)} 数值${s.corr}]`);
+}
+console.log(`\n  ── 真没抽到的样例 ──`);
+for (const s of samplesLost) console.log(`    ${pad(s.id, 10)}金「${s.gName.slice(0, 40)}」(${s.leaves}叶)`);
+console.log(`\n  ── 交人工裁定的产物行样例 ──`);
+for (const s of samplesDefer) console.log(`    ${pad(s.id, 10)}「${s.name.slice(0, 40)}」(${s.n}叶)`);
+
+console.log(`\n  真没抽到的行里最"贵"的（叶子多 = 一行拖垮一整篇）：`);
+for (const r of worstRows.slice(0, 6)) console.log(`    ${pad(r.id, 10)}${padr(`${r.leaves} 叶子`, 10)}${String(r.name).slice(0, 46)}`);
 
 console.log(`\n  ── A1 样例（真抽到了，被抢走）──`);
 for (const s of samplesA1) {

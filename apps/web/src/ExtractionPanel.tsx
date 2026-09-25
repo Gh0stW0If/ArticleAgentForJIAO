@@ -38,6 +38,11 @@ interface Props {
   onAdd(fieldPath: string, raw: string): void;
   onLocate(fieldPath: string, raw: string): void;
   onInclude(field: FieldView): void;
+  /**
+   * 结局行裁定（覆盖率口径的配套）：`decision` 传 'keep' / 'drop'，
+   * 传 null 表示撤销回"未裁定"。
+   */
+  onAdjudicate(rowIndex: number, decision: 'keep' | 'drop' | null): void;
 }
 
 /** 小块白卡（页脚、空态提示用）。 */
@@ -407,6 +412,91 @@ export function ExtractionPanel(props: Props) {
 
         {tab === 'sheet3' && (
           <>
+            {/*
+              待人工裁定的结局行：覆盖率口径下这些是"流水线抽了、金标准没要"的行，
+              **不判错**，由人决定留不留（多抽的可以裁掉，漏抽的才是硬伤）。
+              每条都摆出"最接近的金标准行"，因为候选边是窄的，可能把同一个结局也圈进来。
+            */}
+            {(sheets.sheet3.deferred?.length ?? 0) > 0 && (
+              <Section
+                group={{ id: 's3-defer', title: `待人工裁定：金标准没要的结局行（${sheets.sheet3.deferred.length} 条）`, collapsible: true, fields: [] }}
+                collapsed={collapsed['s3-defer'] ?? false} onToggle={() => toggle('s3-defer')} tone="candidate"
+              >
+                <div style={{ color: T.muted, fontSize: 11, marginBottom: 8, lineHeight: 1.6 }}>
+                  这些行机器抽到了、但金标准里没有对应项。**不判定对错**，只请你决定留不留：
+                  保留的会进导出的 Sheet3，丢弃的不进。<br />
+                  已裁定 保留 {sheets.sheet3.deferredCounts?.keep ?? 0} · 丢弃 {sheets.sheet3.deferredCounts?.drop ?? 0} ·
+                  分歧 {sheets.sheet3.deferredCounts?.disputed ?? 0} · 未裁定 {sheets.sheet3.deferredCounts?.none ?? 0}
+                </div>
+                {sheets.sheet3.deferred.map((d) => {
+                  const dropped = d.status !== 'disputed' && d.effective === 'drop';
+                  const opText = d.opinions.map((o) => `${o.reviewer}:${o.decision === 'keep' ? '保留' : '丢弃'}`).join('、');
+                  return (
+                    <div
+                      key={d.index}
+                      data-deferred={d.index}
+                      style={{
+                        background: dropped ? T.bg : T.amberSoft,
+                        border: `1px solid ${tint(dropped ? T.border : T.amber, '3a')}`,
+                        borderLeft: `3px solid ${dropped ? T.faint : T.amber}`,
+                        borderRadius: R.card, boxShadow: SH.card,
+                        padding: '8px 11px', marginBottom: 8,
+                        opacity: dropped ? 0.62 : 1,
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                        <span style={{ color: T.ink, fontSize: 12, fontWeight: 600 }}>
+                          结局 {d.index + 1}：{d.name || '（无结局名）'}
+                          {d.instrument ? <span style={{ color: T.muted, fontWeight: 400 }}> / {d.instrument}</span> : null}
+                        </span>
+                        <span style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                          <button
+                            data-action="adjudicate-keep"
+                            data-row={d.index}
+                            onClick={() => props.onAdjudicate(d.index, 'keep')}
+                            style={d.status !== 'none' && !dropped ? primaryBtn(T.emerald) : ghostBtn(T.emerald)}
+                            title="保留：会出现在导出的 Sheet3 里"
+                          >保留</button>
+                          <button
+                            data-action="adjudicate-drop"
+                            data-row={d.index}
+                            onClick={() => props.onAdjudicate(d.index, 'drop')}
+                            style={dropped ? primaryBtn(T.red) : ghostBtn(T.red)}
+                            title="丢弃：不进导出的 Sheet3"
+                          >丢弃</button>
+                          {d.status !== 'none' && (
+                            <button
+                              data-action="adjudicate-clear"
+                              data-row={d.index}
+                              onClick={() => props.onAdjudicate(d.index, null)}
+                              style={ghostBtn(T.muted)}
+                              title="撤销裁定，回到「未裁定」"
+                            >撤销</button>
+                          )}
+                        </span>
+                      </div>
+                      <div style={{ color: T.muted, fontSize: 11, marginTop: 3 }}>
+                        {d.leaves} 个字段
+                        {d.closest?.name
+                          ? `；最接近的金标准行：「${d.closest.name}」`
+                            + `（名字相似 ${d.closest.textScore}、重合数值 ${d.closest.corr}）`
+                          : '；金标准里没有任何接近的结局'}
+                        {d.status === 'disputed'
+                          ? ` ⚠ 核对人有分歧（${opText}）——按"保留"处理，等你仲裁`
+                          : d.status === 'none' ? '（未裁定）' : `（${opText}）`}
+                      </div>
+                      {d.evidence?.[0]?.bbox && (
+                        <button
+                          onClick={() => props.onFocusEvidence(d.evidence[0]!.page, d.evidence[0]!.bbox!)}
+                          style={{ ...ghostBtn(T.amber), marginTop: 6 }}
+                        >定位证据</button>
+                      )}
+                    </div>
+                  );
+                })}
+              </Section>
+            )}
+
             {sheets.sheet3.candidates.length > 0 && (
               <Section
                 group={{ id: 's3-cand', title: `待人工确认纳入（${sheets.sheet3.candidates.length} 条）`, collapsible: true, fields: sheets.sheet3.candidates }}

@@ -55,7 +55,7 @@ const EMPTY_SHEETS: SheetsPayload = {
   order: { sheet1: { article: [], comparison: [] }, sheet2: [], sheet3: { top: [], timepoint: { baseline: [], endOfTreatment: [], followUpEnd: [] } } },
   sheet1: { title: 'Sheet1', article: [], comparisons: [], external: [] },
   sheet2: { title: 'Sheet2', fields: [] },
-  sheet3: { title: 'Sheet3', rows: [], candidates: [], nextOutcomeIndex: 0 },
+  sheet3: { title: 'Sheet3', rows: [], candidates: [], nextOutcomeIndex: 0, deferred: [], deferredCounts: { keep: 0, drop: 0, disputed: 0, none: 0 } },
 };
 
 /** MinerU 块类型 → 证据类型。 */
@@ -585,6 +585,34 @@ export default function App() {
     }
   }, [sheets.sheet3.nextOutcomeIndex, year, study, reviewer, currentEvidence, loadFields, loadReview]);
 
+  /**
+   * 结局行裁定：保留 / 丢弃 / 撤销（`decision = null`）。
+   *
+   * 覆盖率口径下，"流水线抽了、金标准没要"的行**不判错**，留不留由人定。
+   * 记录按核对人分开存（`build/adjudications/`），多人分歧时**不替人裁决**——
+   * 服务端按"保留"处理并标出。删数据是不可逆的，宁可留着让人再裁一次。
+   */
+  const onAdjudicate = useCallback(async (rowIndex: number, decision: 'keep' | 'drop' | null) => {
+    if (!reviewer) { setStatus('请先填写「核对人」再裁定——裁定也是一条人工记录'); return; }
+    setBusy(true);
+    try {
+      const r = await fetch('/api/adjudication', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ year, study, reviewer, rowIndex, decision }),
+      });
+      const d = await r.json();
+      if (!r.ok) { setStatus(`裁定失败：${d.error}`); return; }
+      await loadFields(year, study);
+      const verb = decision === 'keep' ? '保留' : decision === 'drop' ? '丢弃' : '撤销裁定';
+      setNotice(`结局行 ${rowIndex + 1} 已${verb}（记在「${reviewer}」名下）`);
+    } catch (e) {
+      setStatus(`裁定失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [year, study, reviewer, loadFields]);
+
   /* ------------------------------ 框选 ------------------------------ */
 
   const attachEvidence = useCallback(async (fieldPath: string, sel: Selection) => {
@@ -1025,6 +1053,7 @@ export default function App() {
             onAdd={onAdd}
             onLocate={onLocate}
             onInclude={onInclude}
+            onAdjudicate={onAdjudicate}
           />
         </div>
       </aside>
