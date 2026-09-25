@@ -15,7 +15,10 @@
 import { describe, it, expect } from 'vitest';
 import { buildXlsx, STYLE } from './lib/xlsxwrite.mjs';
 import { readWorkbook, makeGrid, readZipEntry } from './lib/xlsx.mjs';
-import { buildReviewExport, toCsv, csvBuffer, exportFileName } from './export_review.mjs';
+import {
+  buildReviewExport, toCsv, csvBuffer, exportFileName,
+  makeSignature, verifySignature, SIG_TAG, SIG_SHEET,
+} from './export_review.mjs';
 
 /* ------------------------------ 夹具 ------------------------------ */
 
@@ -64,7 +67,10 @@ const GROUPS = [
 ];
 
 const SUBJECT = { year: '2019', study: '2019-01', groups: GROUPS, headerOf: { country: '国家', condition: '疾病名称', title: '题目', deqi: '得气' } };
-const OPTS = { label: '2019_2019-01', subjects: [SUBJECT], generatedAt: '2026-09-25T00:00:00.000Z' };
+const OPTS = {
+  label: '2019_2019-01', scope: 'study', signer: '评审甲',
+  subjects: [SUBJECT], generatedAt: '2026-09-25T00:00:00.000Z',
+};
 
 /** 表头文字 → 下标。 */
 const cols = (rows) => rows[0].map((c) => (c && typeof c === 'object' ? c.v : c));
@@ -140,8 +146,8 @@ describe('export_review — 摊成表（单篇）', () => {
     return i < 0 ? null : rows[i];
   };
 
-  it('四张工作表且顺序为 核对汇总 / Sheet1 / Sheet2 / Sheet3', () => {
-    expect(out.sheets.map((s) => s.name)).toEqual(['核对汇总', 'Sheet1', 'Sheet2', 'Sheet3']);
+  it('工作表顺序为 核对汇总 / Sheet1 / Sheet2 / Sheet3，署名表在最后', () => {
+    expect(out.sheets.map((s) => s.name)).toEqual(['核对汇总', 'Sheet1', 'Sheet2', 'Sheet3', SIG_SHEET]);
   });
 
   it('列结构：标识列 + 基础列 + 每位核对人三列 + 收尾列', () => {
@@ -258,6 +264,55 @@ describe('export_review — 批量（多研究）', () => {
   });
 });
 
+/* ------------------------------ 署名 ------------------------------ */
+
+describe('export_review — 署名', () => {
+  const out = buildReviewExport(OPTS);
+
+  it('签名含导出人/时间/范围/规模，且校验和自洽', () => {
+    const sig = out.signature;
+    expect(sig).toBeTruthy();
+    expect(sig).toMatchObject({ v: 1, signer: '评审甲', scope: 'study', label: '2019_2019-01', studies: 1 });
+    expect(sig.rows).toBe(7);                     // 与 stats.total 一致
+    expect(sig.reviewers).toEqual(['甲', '乙']);   // 表里的核对人列
+    expect(sig.cols).toBe(out.columns.length);
+    expect(verifySignature(sig)).toBe(true);
+  });
+
+  it('签名块被改动后校验和不符（只防"改坏"，不防篡改）', () => {
+    expect(verifySignature({ ...out.signature, signer: '别人' })).toBe(false);
+    expect(verifySignature({ ...out.signature, sum: 'deadbeef' })).toBe(false);
+    expect(verifySignature(null)).toBe(false);
+  });
+
+  it('xlsx 里多一张「签名」表，A1 是标记、B1 是 JSON', () => {
+    const sheet = out.sheets.find((s) => s.name === SIG_SHEET);
+    expect(sheet).toBeTruthy();
+    expect(sheet.rows[0][0]).toBe(SIG_TAG);
+    expect(JSON.parse(sheet.rows[0][1])).toEqual(out.signature);
+    // 下面还有给人看的键值对
+    expect(sheet.rows.slice(1).some((r) => r[0] === '导出人' && r[1] === '评审甲')).toBe(true);
+  });
+
+  it('CSV 的签名注释带完整 JSON', () => {
+    const line = out.csv.split('\r\n')[0];
+    expect(JSON.parse(line.slice(`# ${SIG_TAG} `.length))).toEqual(out.signature);
+  });
+
+  it('不给 signer 就不带签名（导出仍可用于阅读）', () => {
+    const bare = buildReviewExport({ label: 'x', subjects: [SUBJECT], generatedAt: '2026-09-25T00:00:00.000Z' });
+    expect(bare.signature).toBeNull();
+    expect(bare.sheets.map((s) => s.name)).toEqual(['核对汇总', 'Sheet1', 'Sheet2', 'Sheet3']);
+    expect(bare.csv.startsWith('工作表,')).toBe(true);
+  });
+
+  it('makeSignature 的行数/研究数由调用方给，改动会让校验和失配', () => {
+    const s = makeSignature({ signer: '甲', rows: 3, studies: 1, reviewers: ['甲'], cols: 5, label: 'x' });
+    expect(verifySignature(s)).toBe(true);
+    expect(verifySignature({ ...s, rows: 4 })).toBe(false);
+  });
+});
+
 /* ------------------------------ CSV ------------------------------ */
 
 describe('export_review — CSV', () => {
@@ -265,19 +320,22 @@ describe('export_review — CSV', () => {
     expect(toCsv([['a,b', 'c"d', 'e\nf']])).toBe('"a,b","c""d","e\nf"');
   });
 
-  it('CSV 首列是工作表、表头与 XLSX 一致', () => {
+  it('CSV 首行是签名注释，表头在其后；列与 XLSX 一致', () => {
     const out = buildReviewExport(OPTS);
-    const head = out.csv.split('\r\n')[0];
-    expect(head.startsWith('工作表,年份,研究,所在行,字段')).toBe(true);
-    expect(head).toBe(out.columns.map((c) => (/[",]/.test(c) ? `"${c}"` : c)).join(','));
+    const lines = out.csv.split('\r\n');
+    expect(lines[0].startsWith(`# ${SIG_TAG} {`)).toBe(true);
+    expect(lines[1]).toBe(out.columns.map((c) => (/[",]/.test(c) ? `"${c}"` : c)).join(','));
   });
 
-  it('CSV 行数覆盖三张数据表', () => {
+  it('CSV 行数 = 签名行 + 表头 + 三张数据表的数据行', () => {
     const out = buildReviewExport(OPTS);
-    const expected = 1 + out.sheets.slice(1).reduce((n, s) => n + s.rows.length - 1, 0);
+    // 只数三张数据表——「签名」「核对汇总」不在 CSV 里
+    const dataSheets = out.sheets.filter((s) => /^Sheet[123]$/.test(s.name));
+    const dataRows = dataSheets.reduce((n, s) => n + s.rows.length - 1, 0);
+    expect(out.stats.total).toBe(dataRows);
     const lines = out.csv.split('\r\n');
     // 证据里可能含换行 → 被引号包住，这里只断言下界
-    expect(lines.length).toBeGreaterThanOrEqual(expected);
+    expect(lines.length).toBeGreaterThanOrEqual(1 + 1 + dataRows);
   });
 
   it('CSV 带 UTF-8 BOM（否则 Excel 打开中文乱码）', () => {

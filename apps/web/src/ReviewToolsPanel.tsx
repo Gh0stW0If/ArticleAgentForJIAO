@@ -19,6 +19,10 @@ import { T, R, SH, tint, ghostBtn, primaryBtn, input as inputS } from './theme.t
 
 interface ReviewSet { id: string; label: string; kind: string; count: number | null }
 
+interface Signature {
+  v: number; signer: string; at: string; scope: string; label: string;
+  studies: number; rows: number; reviewers: string[]; cols: number; sum: string;
+}
 interface ImportChange {
   line: number; year: string; study: string; fieldPath: string;
   raw: string; action: string; before: string | null; note?: string;
@@ -30,6 +34,12 @@ interface ImportPlan {
   cleared: { line: number; fieldPath: string; before: string | null }[];
   errors: { line: number; reason: string; fieldPath?: string }[];
   truncated?: boolean;
+  signature: Signature | null;
+  signatureOk: boolean;
+  signerMatches: boolean;
+  /** 改动实际会记到谁名下（署名可信时 = 署名里的导出人）。 */
+  effectiveReviewer: string;
+  warning: string;
 }
 interface CompareRow {
   fieldPath: string; label: string; a: string | null; b: string | null;
@@ -92,6 +102,7 @@ export function ReviewToolsPanel({ year, study, reviewer, tab, onTab, onClose, o
   const fileRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [retract, setRetract] = useState(false);
+  const [allowMismatch, setAllowMismatch] = useState(false);
   const [plan, setPlan] = useState<ImportPlan | null>(null);
 
   const [aId, setAId] = useState('machine');
@@ -131,7 +142,8 @@ export function ReviewToolsPanel({ year, study, reviewer, tab, onTab, onClose, o
     try {
       const q = `year=${year}&study=${encodeURIComponent(study)}&reviewer=${encodeURIComponent(reviewer)}`
         + (apply ? '&apply=1' : '')
-        + (retract ? '&retractCleared=1' : '');
+        + (retract ? '&retractCleared=1' : '')
+        + (allowMismatch ? '&allowMismatch=1' : '');
       const r = await fetch(`/api/import-review?${q}`, {
         method: 'POST',
         headers: { 'content-type': 'application/octet-stream', 'x-file-name': encodeURIComponent(file.name) },
@@ -228,6 +240,9 @@ export function ReviewToolsPanel({ year, study, reviewer, tab, onTab, onClose, o
               <br />
               以核对人「<b style={{ color: T.ink }}>{reviewer || '（未填写）'}</b>」的列作为修改来源；
               他列的内容一律不动。
+              <br />
+              导出的文件带**署名**（导出人 / 时间 / 范围），导回时会校验署名与当前核对人是否一致——
+              署名对不上就不写，避免把改动记到别人名下。
             </div>
 
             <label style={{ ...lbl, marginTop: 12 }}>导回的表格（导出时生成的 xlsx / csv）</label>
@@ -248,6 +263,14 @@ export function ReviewToolsPanel({ year, study, reviewer, tab, onTab, onClose, o
               把「被清空的格子」当作撤回（默认关闭：清空有歧义，可能只是没填）
             </label>
 
+            <label style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 6, fontSize: 11, color: T.muted }}>
+              <input
+                type="checkbox" checked={allowMismatch} onChange={(e) => setAllowMismatch(e.target.checked)}
+                data-testid="import-allow-mismatch" style={{ accentColor: T.red }}
+              />
+              忽略署名异常（文件署名与当前核对人不同，或署名块已损坏）
+            </label>
+
             <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
               <button onClick={() => void runImport(false)} disabled={busy || !file} style={ghostBtn(T.blue)} data-testid="import-preview">
                 预览差异
@@ -265,6 +288,31 @@ export function ReviewToolsPanel({ year, study, reviewer, tab, onTab, onClose, o
 
             {plan && (
               <div style={{ marginTop: 12 }}>
+                {plan.signature && (
+                  <div
+                    data-testid="import-signature"
+                    style={{
+                      ...box, color: T.text, marginBottom: 8,
+                      borderColor: plan.signatureOk ? tint(T.emerald, '55') : tint(T.red, '55'),
+                      background: plan.signatureOk ? tint(T.emerald, '10') : tint(T.red, '10'),
+                    }}
+                  >
+                    <b>文件署名</b>：{plan.signature.signer} ｜
+                    导出 {String(plan.signature.at).slice(0, 19).replace('T', ' ')} ｜
+                    范围 {plan.signature.label} ｜ {plan.signature.studies} 篇 / {plan.signature.rows} 行
+                    {plan.signatureOk
+                      ? <span style={{ color: T.emerald }}> ｜ 校验和 {plan.signature.sum}（签名块完好）</span>
+                      : <span style={{ color: T.red }}> ｜ 校验和不符</span>}
+                  </div>
+                )}
+                {plan.warning && (
+                  <div
+                    data-testid="import-signature-warning"
+                    style={{ ...box, marginBottom: 8, color: '#a12a1e', background: tint(T.red, '10'), borderColor: tint(T.red, '33') }}
+                  >
+                    ⚠️ {plan.warning}
+                  </div>
+                )}
                 <div style={{ ...box, color: T.text }}>
                   读到 <b>{plan.stats.rows}</b> 行 ｜ 变更 <b style={{ color: T.amber }}>{plan.stats.changes}</b> ｜
                   无变化 {plan.stats.unchanged} ｜ 撤回 {plan.stats.cleared} ｜

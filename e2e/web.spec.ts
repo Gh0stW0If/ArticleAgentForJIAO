@@ -293,6 +293,8 @@ test.describe('前端交互（真实浏览器）', () => {
 
   test('导出人工结果：XLSX 与 CSV 都能下载且是合法文件', async ({ page }) => {
     await page.goto('/');
+    // 导出必须署名（文件要带签名，导回时据此判归属）
+    await signIn(page);
     await expect(page.locator('[data-testid="export-xlsx"]')).toBeEnabled();
 
     /** 点按钮 → 等下载 → 读回字节。 */
@@ -322,6 +324,7 @@ test.describe('前端交互（真实浏览器）', () => {
 
   test('批量导出：整年 XLSX 能下载，文件名标出范围', async ({ page }) => {
     await page.goto('/');
+    await signIn(page);
     await expect(page.locator('[data-testid="batch-menu"]')).toBeEnabled();
 
     await page.locator('[data-testid="batch-menu"]').click();
@@ -352,8 +355,10 @@ test.describe('前端交互（真实浏览器）', () => {
     await waitForPdf(page);
     await signIn(page);
 
-    // 导出 CSV，把那一格改掉（模拟医生在 Excel 里改）
-    const csv = (await (await request.get(`/api/export?year=${YEAR}&study=${STUDY}&format=csv`)).body()).toString('utf8');
+    // 导出 CSV（导出要署名），把那一格改掉（模拟医生在 Excel 里改）
+    const csv = (await (await request.get(
+      `/api/export?year=${YEAR}&study=${STUDY}&format=csv&reviewer=${encodeURIComponent(REVIEWER)}`,
+    )).body()).toString('utf8');
     const edited = csv.replace('E2E-改前', 'E2E-改后');
     expect(edited).not.toBe(csv);
 
@@ -404,6 +409,62 @@ test.describe('前端交互（真实浏览器）', () => {
     await expect(page.locator('[data-testid="review-tools"]')).toContainText('一致率');
     await expect(page.locator('[data-testid="review-tools"]')).toContainText('condition');
     await expect(page.locator('[data-testid="review-tools"]')).toContainText('E2E-人工值');
+  });
+
+  test('署名：导出必带签名，导回时署名不符就拒绝写入', async ({ page, request }) => {
+    const OTHER = 'e2e-signer';
+    const imp = (q: string, body: Buffer) => request.post(
+      `/api/import-review?year=${YEAR}&study=${STUDY}&reviewer=${encodeURIComponent(REVIEWER)}${q}`,
+      { headers: { 'content-type': 'text/csv' }, data: body },
+    );
+    let csv = Buffer.alloc(0);
+
+    try {
+      // 以「e2e-signer」名义导出一份（文件里带他的署名与他的列）
+      await request.post(annUrl(YEAR, STUDY, OTHER), {
+        data: {
+          reviewer: OTHER,
+          entry: { fieldPath: 'condition', action: 'override', value: { raw: 'SIGN-1', provenance: 'human', confidence: 1 } },
+        },
+      });
+      csv = await (await request.get(
+        `/api/export?year=${YEAR}&study=${STUDY}&format=csv&reviewer=${encodeURIComponent(OTHER)}`,
+      )).body();
+
+      // ① 不署名就导不出来：导出接口本身就要求 reviewer
+      const noSigner = await request.get(`/api/export?year=${YEAR}&study=${STUDY}&format=csv`);
+      expect(noSigner.status()).toBe(400);
+      expect((await noSigner.json()).error).toContain('签名');
+
+      // ② 以别人身份导回 → 拒绝，并把署名摆出来
+      const bad = await imp('', csv);
+      expect(bad.status()).toBe(400);
+      const bj = await bad.json();
+      expect(bj.error).toContain(OTHER);
+      expect(bj.signature.signer).toBe(OTHER);
+
+      // ③ 显式忽略署名异常 → 放行，且改动记到**署名者**名下（表里那列本来就是他的）
+      const ok = await imp('&apply=1&allowMismatch=1', csv);
+      expect(ok.status()).toBe(200);
+      const oj = await ok.json();
+      expect(oj.effectiveReviewer).toBe(OTHER);
+      expect(oj.stats.errors).toBe(0);
+    } finally {
+      await request.delete(annUrl(YEAR, STUDY, OTHER));
+    }
+
+    // ④ 界面上也能看见署名：勾上「忽略署名异常」后预览，署名横幅要显示导出人
+    await page.goto('/');
+    await waitForPdf(page);
+    await signIn(page);
+    await page.locator('[data-testid="open-import"]').click();
+    await page.locator('[data-testid="import-file"]').setInputFiles({
+      name: 'signed-by-other.csv', mimeType: 'text/csv', buffer: csv,
+    });
+    await page.locator('[data-testid="import-allow-mismatch"]').check();
+    await page.locator('[data-testid="import-preview"]').click();
+    await expect(page.locator('[data-testid="import-signature"]')).toContainText(OTHER);
+    await expect(page.locator('[data-testid="import-signature"]')).toContainText('校验和');
   });
 
   test('设置对话框：显示掩码密钥并可测试连通性', async ({ page }) => {

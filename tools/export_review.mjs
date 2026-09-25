@@ -21,6 +21,8 @@
  *    改列名 = 破坏已发出的文件的可导回性，**必须同步改那边的表头常量**。
  */
 
+import { createHash } from 'node:crypto';
+
 /** 动作 → 中文。 */
 const ACTION_ZH = { confirm: '确认', override: '修改', add: '补录' };
 
@@ -41,6 +43,16 @@ const STATUS_ZH = {
 export const BASE_COLUMNS = ['工作表', '年份', '研究', '所在行', '字段', '原始列', 'fieldPath', '机器值', '机器证据'];
 export const TAIL_COLUMNS = ['核对状态', '采用值', '是否改动'];
 export const reviewerColumns = (r) => [`${r} · 值`, `${r} · 动作`, `${r} · 备注`];
+
+/**
+ * 签名块的标记。
+ *
+ * CSV 里是**行首注释**：`# AA-REVIEW-SIGNATURE {…}`；
+ * XLSX 里是「签名」工作表的 **A1**（B1 放 JSON）。
+ * 两边用同一个标记，读写由 `tools/import_review.mjs` 的 `readSignature` 负责。
+ */
+export const SIG_TAG = 'AA-REVIEW-SIGNATURE';
+export const SIG_SHEET = '签名';
 
 /** 动作的中文（导回时反向用）。 */
 export const ACTION_ZH_MAP = ACTION_ZH;
@@ -88,15 +100,60 @@ function orderIndexer(lists) {
   return (key) => (map.has(key) ? map.get(key) : big);
 }
 
+/* ------------------------------ 签名 ------------------------------ */
+
+/**
+ * 签名块自身的校验和。
+ *
+ * ⚠️ **这不是防篡改签名**——文件本来就是拿去给人编辑的，任何数据哈希都必然失效。
+ * 它的作用只有一个：发现**签名块本身**被表格软件顺手改坏（日期被格式化、
+ * 名字前后多了空格之类），避免导回时按一个坏掉的署名去记账。
+ * 真要防伪得用带密钥的 MAC，而密钥不该放在客户端。
+ */
+function sumOf(core) {
+  return createHash('sha256')
+    .update(JSON.stringify(core, Object.keys(core).sort()))
+    .digest('hex')
+    .slice(0, 16);
+}
+
+/** 构造签名块。`signer` 是**导出人**（= 导出时界面上的核对人）。 */
+export function makeSignature(p) {
+  const core = {
+    v: 1,
+    signer: String(p.signer ?? ''),
+    at: p.at ?? new Date().toISOString(),
+    scope: p.scope ?? 'study',
+    label: p.label ?? '',
+    studies: p.studies ?? 0,
+    rows: p.rows ?? 0,
+    reviewers: p.reviewers ?? [],
+    cols: p.cols ?? 0,
+  };
+  return { ...core, sum: sumOf(core) };
+}
+
+/** 校验和是否对得上（只说明签名块没被改坏，不说明文件没被编辑）。 */
+export function verifySignature(sig) {
+  if (!sig || typeof sig !== 'object') return false;
+  const { sum, ...core } = sig;
+  return typeof sum === 'string' && sum === sumOf(core);
+}
+
+/** CSV 里的签名行。 */
+export const signatureLine = (sig) => `# ${SIG_TAG} ${JSON.stringify(sig)}`;
+
 /**
  * 构建导出表。
  *
  * @param {object} p
  * @param {string} [p.label]       导出范围的文字（汇总表标题用）
+ * @param {'study'|'year'|'all'} [p.scope]
+ * @param {string} [p.signer]      **导出人**（= 导出时界面上的核对人）。给空则不带签名
  * @param {{year:string, study:string, groups:any[], order?:object, headerOf?:object}[]} p.subjects
  *        一个或多个研究。批量导出时按传入顺序排列。
  * @param {string} [p.generatedAt]
- * @returns {{ sheets:{name:string,rows:any[][],widths:number[]}[], csv:string, columns:string[], stats:object }}
+ * @returns {{ sheets:{name:string,rows:any[][],widths:number[]}[], csv:string, columns:string[], stats:object, signature:object|null }}
  */
 export function buildReviewExport(p) {
   const subjects = p.subjects ?? [];
@@ -259,7 +316,56 @@ export function buildReviewExport(p) {
     { name: 'Sheet3', rows: [columns, ...dataRows[3]], widths },
   ];
 
-  return { sheets, csv: toCsv([columns, ...dataRows[1], ...dataRows[2], ...dataRows[3]]), columns, stats, pairwise };
+  /* ---- 签名 ---- */
+  /*
+   * 数据行数在签名里要如实记（导出后被改了多少行，一比对就知道），
+   * 所以签名只能在这里构造——调用方在构建前拿不到行数。
+   */
+  const dataRowCount = dataRows[1].length + dataRows[2].length + dataRows[3].length;
+  const signature = p.signer
+    ? makeSignature({
+      signer: p.signer,
+      at: generatedAt,
+      scope: p.scope ?? 'study',
+      label: p.label ?? '',
+      studies: subjects.length,
+      rows: dataRowCount,
+      reviewers,
+      cols: columns.length,
+    })
+    : null;
+
+  if (signature) {
+    // 放最后：前面四张是给人用的，签名是元数据
+    sheets.push({
+      name: SIG_SHEET,
+      rows: [
+        [SIG_TAG, JSON.stringify(signature)],
+        ['项目', '值'],
+        ['导出人', signature.signer],
+        ['导出时间', signature.at],
+        ['导出范围', signature.scope === 'all' ? '全部年份' : (signature.scope === 'year' ? '整年' : '单篇')],
+        ['范围标签', signature.label],
+        ['研究数', String(signature.studies)],
+        ['数据行数', String(signature.rows)],
+        ['核对人列', signature.reviewers.join('、') || '（无）'],
+        ['校验和', signature.sum],
+        ['说明', '校验和只用来发现签名块被表格软件改坏；文件本来就是要编辑的，所以它不是防篡改签名。'],
+      ],
+      widths: [22, 96],
+    });
+  }
+
+  const csvBody = toCsv([columns, ...dataRows[1], ...dataRows[2], ...dataRows[3]]);
+  return {
+    sheets,
+    // CSV 没有工作表，签名以行首注释的形式放在最前面
+    csv: signature ? `${signatureLine(signature)}\r\n${csvBody}` : csvBody,
+    columns,
+    stats,
+    pairwise,
+    signature,
+  };
 }
 
 /* ------------------------------ CSV ------------------------------ */

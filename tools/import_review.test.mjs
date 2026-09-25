@@ -12,7 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildReviewExport } from './export_review.mjs';
 import { buildXlsx } from './lib/xlsxwrite.mjs';
-import { parseCsv, readReviewTables, planImport, HEAD } from './import_review.mjs';
+import { parseCsv, readReviewTables, planImport, readSignature, HEAD } from './import_review.mjs';
 
 /* ------------------------------ 夹具 ------------------------------ */
 
@@ -72,22 +72,27 @@ describe('import_review — CSV 解析', () => {
 });
 
 describe('import_review — 读表', () => {
-  it('导出 → xlsx → 读回：表头与行数对得上', () => {
-    const { sheets } = buildReviewExport({ label: 'x', subjects: [SUBJECT] });
-    const buf = buildXlsx(sheets);
-    const tables = readReviewTables(buf, 'xlsx');
-    // 只认有 fieldPath 列的数据表，跳过「核对汇总」
+  const SIGNED = { label: '2019_2019-01', scope: 'study', signer: '评审甲' };
+
+  it('导出 → xlsx → 读回：表头与行数对得上（签名表自动跳过）', () => {
+    const { sheets } = buildReviewExport({ ...SIGNED, subjects: [SUBJECT] });
+    const tables = readReviewTables(buildXlsx(sheets), 'xlsx');
+    // 只认有 fieldPath 列的数据表，跳过「核对汇总」与「签名」
     expect(tables.map((t) => t.tag)).toEqual(['Sheet1']);
     expect(tables[0].columns).toContain(HEAD.fieldPath);
     expect(tables[0].rows.length).toBe(3);
     expect(tables[0].rows.some((r) => r.includes('country'))).toBe(true);
   });
 
-  it('导出 → csv → 读回：按「工作表」切段', () => {
-    const { csv } = buildReviewExport({ label: 'x', subjects: [SUBJECT] });
+  it('导出 → csv → 读回：跳过顶部签名注释、按「工作表」切段', () => {
+    const { csv, signature } = buildReviewExport({ ...SIGNED, subjects: [SUBJECT] });
+    expect(csv.startsWith('# AA-REVIEW-SIGNATURE ')).toBe(true);
     const tables = readReviewTables(Buffer.from(csv, 'utf8'), 'csv');
     expect(tables.length).toBe(1);
     expect(tables[0].rows.length).toBe(3);
+    // 注释行不能被当成表头
+    expect(tables[0].columns[0]).toBe('工作表');
+    expect(readSignature(Buffer.from(csv, 'utf8'), 'csv')).toEqual(signature);
   });
 
   it('表头带多余空格也能认出来', () => {
@@ -97,6 +102,33 @@ describe('import_review — 读表', () => {
 
   it('表头不认识时明确报错，而不是当成 0 行静默通过', () => {
     expect(() => readReviewTables(Buffer.from('a,b\n1,2\n', 'utf8'), 'csv')).toThrow(/表头不认识/);
+  });
+});
+
+describe('import_review — 读签名', () => {
+  it('有签名：xlsx 与 csv 都能读回同一份', () => {
+    const { sheets, csv, signature } = buildReviewExport({
+      label: '2019_全部', scope: 'year', signer: '评审甲', subjects: [SUBJECT],
+    });
+    expect(readSignature(buildXlsx(sheets), 'xlsx')).toEqual(signature);
+    expect(readSignature(Buffer.from(csv, 'utf8'), 'csv')).toEqual(signature);
+    expect(signature.scope).toBe('year');
+  });
+
+  it('没签名（旧版导出的文件）返回 null，不报错', () => {
+    const { sheets, csv } = buildReviewExport({ label: 'x', subjects: [SUBJECT] });
+    expect(readSignature(buildXlsx(sheets), 'xlsx')).toBeNull();
+    expect(readSignature(Buffer.from(csv, 'utf8'), 'csv')).toBeNull();
+  });
+
+  it('签名注释只在**顶部**生效：正文里以 # 开头的行不算签名', () => {
+    const buf = Buffer.from('工作表,年份,研究,fieldPath\nSheet1,2019,2019-01,#not-a-signature\n', 'utf8');
+    expect(readSignature(buf, 'csv')).toBeNull();
+  });
+
+  it('签名 JSON 损坏时返回 null，而不是抛异常', () => {
+    const buf = Buffer.from('# AA-REVIEW-SIGNATURE {坏掉的}\n工作表,年份,研究,fieldPath\n', 'utf8');
+    expect(readSignature(buf, 'csv')).toBeNull();
   });
 });
 

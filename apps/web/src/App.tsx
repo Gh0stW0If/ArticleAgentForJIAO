@@ -216,13 +216,22 @@ export default function App() {
     scope: 'study' | 'year' | 'all' = 'study',
   ) => {
     if (scope === 'study' && !study) { setStatus('请先选择一篇文章'); return; }
+    /*
+     * **导出必须署名**。文件是要拿去改、再导回来的；署名就是"这份表是谁的"。
+     * 没有署名，导回时改动该记到谁名下就只能靠输入框，而输入框可以随手填别人名字。
+     */
+    if (!reviewer) {
+      setStatus('请先在「核对人」里填名字再导出——导出的文件要带署名');
+      return;
+    }
     setBatchOpen(false);
     setBusy(true);
     setStatus(scope === 'study' ? '导出中…' : '批量导出中（篇数多时需要几秒）…');
     try {
-      const q = scope === 'study'
+      const q = (scope === 'study'
         ? `year=${year}&study=${encodeURIComponent(study)}&format=${format}`
-        : (scope === 'year' ? `year=${year}&format=${format}` : `scope=all&format=${format}`);
+        : (scope === 'year' ? `year=${year}&format=${format}` : `scope=all&format=${format}`))
+        + `&reviewer=${encodeURIComponent(reviewer)}`;
       const r = await fetch(`/api/export?${q}`);
       if (!r.ok) {
         const d = await r.json().catch(() => ({} as { error?: string }));
@@ -250,7 +259,9 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [year, study]);
+    // ⚠️ 依赖里必须有 reviewer：onExport 现在要读它（导出必须署名）。
+    //    漏掉就是经典闭包陷阱——函数永远看到初始的空字符串，导出一律被拦。
+  }, [year, study, reviewer]);
 
   /** 提交核对人改名（输入框失焦 / 回车）。 */
   const commitReviewer = useCallback(() => {

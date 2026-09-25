@@ -22,7 +22,7 @@
  */
 
 import { readWorkbook } from './lib/xlsx.mjs';
-import { BASE_COLUMNS, TAIL_COLUMNS, reviewerColumns } from './export_review.mjs';
+import { BASE_COLUMNS, TAIL_COLUMNS, reviewerColumns, SIG_TAG } from './export_review.mjs';
 
 /** 表头文字（与导出侧同源，避免两处各写一份字符串）。 */
 export const HEAD = Object.freeze({
@@ -85,6 +85,45 @@ export function parseCsv(text) {
 /* ------------------------------ 读表 ------------------------------ */
 
 /**
+ * 去掉 CSV 顶部的 `#` 注释行（签名就放在那里）。
+ *
+ * ⚠️ 只剥**顶部连续**的注释，不能全文过滤 `#`：
+ * 证据列里可能有换行，换行后正好以 `#` 开头的行是真数据。
+ */
+function stripLeadingComments(text) {
+  const lines = String(text).replace(/^\uFEFF/, '').split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length && lines[i].startsWith('#')) i++;
+  return lines.slice(i).join('\r\n');
+}
+
+/**
+ * 读签名块；没有签名返回 null（旧版导出的文件也走这条路）。
+ *
+ * @param {Buffer} bytes
+ * @param {'xlsx'|'csv'} kind
+ */
+export function readSignature(bytes, kind) {
+  if (kind === 'csv') {
+    const lines = bytes.toString('utf8').replace(/^\uFEFF/, '').split(/\r?\n/);
+    const re = new RegExp(`^#\\s*${SIG_TAG}\\s+(\\{.*\\})\\s*$`);
+    for (const l of lines) {
+      if (!l.startsWith('#')) break;     // 只看顶部注释块
+      const m = re.exec(l);
+      if (m) { try { return JSON.parse(m[1]); } catch { return null; } }
+    }
+    return null;
+  }
+  const wb = readWorkbook(bytes);
+  for (const sh of wb.sheets) {
+    const r1 = sh.rows.find((x) => x.r === 1);
+    if (String(r1?.cells?.[0] ?? '') !== SIG_TAG) continue;
+    try { return JSON.parse(String(r1.cells[1] ?? '')); } catch { return null; }
+  }
+  return null;
+}
+
+/**
  * 读成 `{ columns, rows }[]`（每张数据表一份）。
  *
  * @param {Buffer} bytes
@@ -93,7 +132,7 @@ export function parseCsv(text) {
 export function readReviewTables(bytes, kind) {
   const out = [];
   if (kind === 'csv') {
-    const rows = parseCsv(bytes.toString('utf8'));
+    const rows = parseCsv(stripLeadingComments(bytes.toString('utf8')));
     // CSV 是三张表拼在一起的，靠「工作表」列区分；这里按连续段切开
     if (!rows.length) return out;
     const head = rows[0].map(normHead);

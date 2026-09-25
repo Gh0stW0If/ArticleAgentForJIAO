@@ -39,7 +39,8 @@ import {
 } from '../../packages/core/dist/index.js';
 import { buildReviewExport, csvBuffer, exportFileName } from '../../tools/export_review.mjs';
 import { buildXlsx } from '../../tools/lib/xlsxwrite.mjs';
-import { readReviewTables, planImport, studyPairs } from '../../tools/import_review.mjs';
+import { readReviewTables, planImport, studyPairs, readSignature } from '../../tools/import_review.mjs';
+import { verifySignature } from '../../tools/export_review.mjs';
 
 const ROOT = resolve(process.env.AA_ROOT ?? process.cwd());
 const PORT = Number(process.env.AA_PORT ?? 43130);
@@ -1387,21 +1388,39 @@ const server = createServer(async (req, res) => {
         return json(res, 400, { error: `format 非法：${format}（只支持 xlsx / csv）` });
       }
 
+      /*
+       * **导出必须署名**。
+       *
+       * 导出的文件是要拿去改、再导回来的；署名就是"这份表是谁的"。
+       * 没有署名，导回时就没法判断改动该记到谁名下——只能靠界面输入框，
+       * 而那个框是可以随手填别人名字的。
+       */
+      const signer = safeReviewer(url.searchParams.get('reviewer'));
+      if (!signer) {
+        return json(res, 400, {
+          error: '导出必须指定 reviewer：导出人要写进文件签名。请先在界面右上角填写「核对人」。',
+        });
+      }
+
       const wantAll = (url.searchParams.get('scope') ?? '').toLowerCase() === 'all';
       let targets;
       let label;
+      let scope;
       if (study) {
         if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
         targets = [{ year, study }];
         label = `${year}_${studyKey(study)}`;
+        scope = 'study';
       } else if (wantAll) {
         targets = listYears().flatMap((y) => listStudies(y).map((s) => ({ year: y, study: s.studyId })));
         label = '全部年份';
+        scope = 'all';
       } else if (okYear(year)) {
         const list = listStudies(year);
         if (!list.length) return json(res, 409, { error: `${year} 下没有研究` });
         targets = list.map((s) => ({ year, study: s.studyId }));
         label = `${year}_全部`;
+        scope = 'year';
       } else {
         return json(res, 400, { error: '请给 study、year 或 scope=all' });
       }
@@ -1432,6 +1451,8 @@ const server = createServer(async (req, res) => {
 
       const { sheets, csv } = buildReviewExport({
         label: `${label}${skipped.length ? `（${skipped.length} 篇无产物已跳过）` : ''}`,
+        scope,
+        signer,
         subjects,
       });
 
@@ -1482,6 +1503,43 @@ const server = createServer(async (req, res) => {
       }
 
       /*
+       * 验签。
+       *
+       * ⚠️ 这**不是**密码学校验——文件本来就要给人编辑，任何数据哈希都必然失效。
+       * 它解决的是**归属**：这份表是谁导出的、改动该记到谁名下。
+       * 没有签名（本次改动之前导出的文件）→ 放行但明确标注，由界面提示。
+       */
+      const allowMismatch = url.searchParams.get('allowMismatch') === '1';
+      const signature = readSignature(bytes, kind);
+      const signatureOk = signature ? verifySignature(signature) : false;
+      const signerMatches = Boolean(signature?.signer) && signature.signer === reviewer;
+
+      if (signature && !signatureOk && !allowMismatch) {
+        return json(res, 400, {
+          error: `文件签名校验和不符（署名块可能被表格软件改坏了）。署名写的是「${signature.signer ?? '（空）'}」。`
+            + '建议重新导出后再改；确实要按当前核对人写入，请勾选「忽略署名异常」。',
+          signature,
+        });
+      }
+      if (signatureOk && !signerMatches && !allowMismatch) {
+        return json(res, 400, {
+          error: `这份文件是「${signature.signer}」导出的，但你当前以「${reviewer}」身份导回。`
+            + `请把界面右上角「核对人」改成「${signature.signer}」（改动才记得到他名下）；`
+            + '若确认要按文件署名写入，请勾选「忽略署名异常」。',
+          signature,
+        });
+      }
+
+      /*
+       * **生效的核对人由署名决定**，不是界面输入框。
+       *
+       * 表里那一列本来就属于"导出人"——署名可信时，改动就该记到他名下。
+       * 界面输入框退化为"本次提交人"的角色，两者不一致时写进批次快照备查。
+       * 没有署名（旧版文件）或署名块已损坏时，才退回用界面上的核对人。
+       */
+      const effectiveReviewer = (signatureOk && signature?.signer) ? signature.signer : reviewer;
+
+      /*
        * 只给**文件里出现过**的研究建字段索引——
        * 全部年份的批量文件有两百多篇，全量建索引会白读几百兆 JSON。
        */
@@ -1490,7 +1548,7 @@ const server = createServer(async (req, res) => {
         const [y, s] = pair.split('/');
         if (!okYear(y) || !okStudy(s)) continue;
         const built = await buildFieldGroups(y, s);
-        const ov = readAnnotation(y, s, reviewer);
+        const ov = readAnnotation(y, s, effectiveReviewer);
         const existing = new Map((ov?.entries ?? []).map((e) => [e.fieldPath, e]));
 
         for (const g of built.groups ?? []) {
@@ -1523,7 +1581,7 @@ const server = createServer(async (req, res) => {
         }
       }
 
-      const plan = planImport({ tables, reviewer, index, retractCleared });
+      const plan = planImport({ tables, reviewer: effectiveReviewer, index, retractCleared });
       const stats = {
         rows: plan.seen,
         changes: plan.changes.length,
@@ -1531,10 +1589,25 @@ const server = createServer(async (req, res) => {
         cleared: plan.cleared.length,
         errors: plan.errors.length,
       };
+      /** 署名信息随响应回传，界面要把它显眼地摆出来。 */
+      const sig = {
+        signature,
+        signatureOk,
+        signerMatches,
+        effectiveReviewer,
+        // 没签名的文件也要能导（本次改动之前导出的），但必须让人知道
+        warning: !signature
+          ? '这份文件没有签名（可能是旧版导出的），无法确认导出人，改动将按当前「核对人」记录。'
+          : (!signatureOk
+            ? '署名块校验和不符，署名不可信，改动将按当前「核对人」记录。'
+            : (!signerMatches
+              ? `文件署名是「${signature.signer}」，与当前核对人「${reviewer}」不同；改动将记到署名者「${signature.signer}」名下。`
+              : '')),
+      };
 
       if (!apply) {
         return json(res, 200, {
-          dryRun: true, kind, reviewer, stats,
+          dryRun: true, kind, reviewer, stats, ...sig,
           changes: plan.changes.slice(0, 300),
           cleared: plan.cleared.slice(0, 100),
           errors: plan.errors.slice(0, 100),
@@ -1545,17 +1618,25 @@ const server = createServer(async (req, res) => {
       if (!plan.changes.length && !plan.cleared.length) {
         return json(res, 200, {
           ok: true, kind, reviewer, applied: 0, retracted: 0, batchId: null,
-          stats, errors: plan.errors.slice(0, 100),
+          stats, ...sig, errors: plan.errors.slice(0, 100),
         });
       }
 
       const fname = req.headers['x-file-name']
         ? decodeURIComponent(String(req.headers['x-file-name'])) : '';
       const result = applyReviewImport({
-        reviewer,
+        reviewer: effectiveReviewer,
         changes: plan.changes,
         cleared: plan.cleared,
-        meta: { kind, ...(fname ? { file: fname } : {}), stats },
+        meta: {
+          kind,
+          ...(fname ? { file: fname } : {}),
+          stats,
+          // 批次里同时留「文件署名」与「实际提交人」，署名对不上时能查
+          signature: signature ?? null,
+          signerMatches: signature ? signerMatches : null,
+          submittedBy: reviewer,
+        },
       });
       return json(res, 200, { ok: true, kind, reviewer, ...result, stats, errors: plan.errors.slice(0, 100) });
     }
