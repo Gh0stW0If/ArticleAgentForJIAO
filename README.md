@@ -123,6 +123,8 @@ pnpm gold:anomalies               # 金标准异常检测
 pnpm gold:vs-paper                # 取证：金标准的值是否真在论文里
 pnpm llm:run --year 2015          # 跑抽取
 pnpm llm:eval --year 2015         # 评分
+pnpm accuracy:overview            # 三张工作表的准确率（统一口径）
+pnpm accuracy:diagnose            # **失分归因**：分丢在哪、是漏抽还是抽错
 pnpm report:clinicians            # 面向医生的讨论报告
 pnpm web:e2e                      # Playwright 端到端
 pnpm desktop:build                # 打包便携 exe
