@@ -100,6 +100,8 @@ function FieldRow({
   return (
     <div
       data-field={f.fieldPath}
+      /* 规范键：e2e 用它断言「按原表列序」——列序表里存的是规范键，不是 fieldPath 末段 */
+      data-key={f.key ?? ''}
       style={{
         background: isMarking ? T.amberSoft : T.bg,
         border: `1px solid ${isMarking ? tint(T.amber, '55') : T.border}`,

@@ -41,6 +41,8 @@ import { buildReviewExport, csvBuffer, exportFileName } from '../../tools/export
 import { buildXlsx } from '../../tools/lib/xlsxwrite.mjs';
 import { readReviewTables, planImport, studyPairs, readSignature } from '../../tools/import_review.mjs';
 import { verifySignature } from '../../tools/export_review.mjs';
+import { labelOutcomeField } from '../../tools/outcome-field-map.mjs';
+import { RETIRED_KEYS } from '../../tools/canonical-field-map.mjs';
 
 const ROOT = resolve(process.env.AA_ROOT ?? process.cwd());
 const PORT = Number(process.env.AA_PORT ?? 43130);
@@ -864,6 +866,8 @@ async function buildFromExtraction(year, study, norm, doc) {
   }
   for (const [k, gv] of Object.entries(art)) {
     if (used.has(k) || k === 'articleId' || k === 'external' || k === 'studyOutcomes') continue;
+    // 旧产物里的退役字段不再展示（见 canonical-field-map 的 RETIRED_KEYS）
+    if (RETIRED_KEYS.has(k)) continue;
     const v = toView(k, k, gv, k);
     if (v) artFields.push(v);
   }
@@ -919,6 +923,8 @@ async function buildFromExtraction(year, study, norm, doc) {
     const fields = [];
     for (const [k, gv] of Object.entries(c)) {
       if (k === 'studyId') continue;
+      // 旧产物里的退役字段不再展示（见 canonical-field-map 的 RETIRED_KEYS）
+      if (RETIRED_KEYS.has(k)) continue;
       const label = canon.comparison.find((f) => f.key === k)?.label ?? k;
       const v = toView(`comparisons.${i}.${k}`, label, gv, k);
       if (v) fields.push(v);
@@ -969,7 +975,16 @@ async function buildFromExtraction(year, study, norm, doc) {
         if (v === null || v === undefined || typeof v !== 'object' || Array.isArray(v)) continue;
         const path = `outcomes.${i}.${prefix}${k}`;
         if ('raw' in v) {
-          const v2 = toView(path, `${prefix}${k}`, v, k);
+          /*
+           * ⚠️ 标题**不能**直接用契约路径（`outcome.name`、`timepoints.baseline.contin...`）——
+           * 那是抽取侧的写法，医生看不懂，也查不到原表列。
+           * 统一过一遍 `labelOutcomeField`：中文名 + 规范键（规范键用于查原始表头、按原表列序排序）。
+           */
+          const rel = `${prefix}${k}`;
+          // 旧产物里的退役字段不再展示（见 canonical-field-map 的 RETIRED_KEYS）
+          if (RETIRED_KEYS.has(k)) continue;
+          const named = labelOutcomeField(rel);
+          const v2 = toView(path, named?.label ?? rel, v, named?.key ?? k);
           if (v2) fields.push(v2);
         } else {
           walk(v, `${prefix}${k}.`);
@@ -985,7 +1000,8 @@ async function buildFromExtraction(year, study, norm, doc) {
       for (const [suffix] of formTemplate) {
         const path = `outcomes.${i}.${suffix}`;
         if (fields.some((x) => x.fieldPath === path)) continue;
-        const v = toView(path, suffix, null, suffix.split('.').pop());
+        const named = labelOutcomeField(suffix);
+        const v = toView(path, named?.label ?? suffix, null, named?.key ?? suffix.split('.').pop());
         if (v) fields.push(v);
       }
     }

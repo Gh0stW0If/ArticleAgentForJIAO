@@ -198,22 +198,54 @@ test.describe('前端交互（真实浏览器）', () => {
     await waitForPdf(page);
     await page.locator('[data-tab="sheet3"]').click();
 
-    // 第一行展开后，逐个字段的 key 顺序应与布局里的列序一致
-    const keysInDom: string[] = await page.locator(`[data-field^="outcomes.0."]`).evaluateAll((els) =>
-      els.map((e) => (e as HTMLElement).dataset.field?.split('.').pop() ?? ''));
-    const expected = row.fields
-      .map((f: { fieldPath: string }) => f.fieldPath.split('.').pop())
-      .filter((k: string) => keysInDom.includes(k));
-    const posOf = (k: string) => order.indexOf(k);
-    const ordered = [...keysInDom].sort((a, b) => {
-      const pa = posOf(a); const pb = posOf(b);
-      if (pa >= 0 && pb >= 0) return pa - pb;
-      if (pa >= 0) return -1;
-      if (pb >= 0) return 1;
-      return 0;
-    });
-    expect(keysInDom).toEqual(ordered);
-    expect(expected.length).toBeGreaterThan(0);
+    /*
+     * 该行在界面上的字段顺序，按**规范键**取。
+     *
+     * ⚠️ 这条用例以前是**假通过**的：它用 fieldPath 的末段去和列序表比，
+     * 而列序表里存的是规范键（`outcomeName` vs `name`）——两边对不上，
+     * 比较器对所有键都返回 0，断言恒真。先用「契约路径当标题」那个 bug 就是这么漏过去的。
+     * 现在 data-key 给出规范键，并且断言的是**顺序本身**。
+     */
+    const domKeys: string[] = await page.locator('[data-field^="outcomes.0."]').evaluateAll((els) =>
+      els.map((e) => (e as HTMLElement).dataset.key ?? ''));
+
+    expect(domKeys.length).toBeGreaterThan(5);   // 空列表会让下面的断言失去意义
+
+    // 复刻界面 orderFields 的排序规则：列序表里有的按序排，没有的保持原相对次序
+    const pos = new Map(order.map((k, i) => [k, i]));
+    const expected = [...row.fields]
+      .map((f: { key?: string }) => f.key ?? '')
+      .sort((a: string, b: string) => {
+        const pa = pos.get(a); const pb = pos.get(b);
+        if (pa !== undefined && pb !== undefined) return pa - pb;
+        if (pa !== undefined) return -1;
+        if (pb !== undefined) return 1;
+        return 0;
+      });
+
+    expect(domKeys).toEqual(expected);
+    // 原表列序里排第一的字段应当真的排在前面（防止两边同时退化成原始顺序而"对上"）
+    expect(order.indexOf(domKeys[0]!)).toBeGreaterThanOrEqual(0);
+  });
+
+  test('Sheet3 字段标题用原表中文名，不是契约路径', async ({ page, request }) => {
+    const fields = await (await request.get(`/api/fields?year=${YEAR}&study=${STUDY}`)).json();
+    const row = fields.sheets.sheet3.rows[0];
+    test.skip(!row, '该篇没有结局行');
+
+    await page.goto('/');
+    await waitForPdf(page);
+    await page.locator('[data-tab="sheet3"]').click();
+
+    const labels: string[] = await page.locator('[data-field^="outcomes.0."]').evaluateAll((els) =>
+      els.map((e) => (e as HTMLElement).innerText.split('\n')[0]?.trim() ?? ''));
+
+    expect(labels.length).toBeGreaterThan(5);
+    // 契约路径的形态：驼峰且带点（如 outcome.name / timepoints.baseline.continuous.experimental.estimate）
+    const rawPaths = labels.filter((l) => /^[a-z][A-Za-z]*\.[a-zA-Z]/.test(l));
+    expect(rawPaths).toEqual([]);
+    // 原表里就叫 construct / subconstruct，这两个允许是英文
+    expect(labels.some((l) => /[\u4e00-\u9fa5]/.test(l))).toBe(true);
   });
 
   test('Sheet2 选项卡能切过去并显示结局分类', async ({ page }) => {

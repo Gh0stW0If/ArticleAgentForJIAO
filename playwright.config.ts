@@ -10,9 +10,21 @@ import { defineConfig, devices } from '@playwright/test';
  * testDir 限定在 `e2e/`，否则 Playwright 会把 vitest 的用例也扫进来（两边默认的
  * 文件名匹配规则几乎一样）。
  *
- * webServer：优先复用已在跑的 `pnpm web:api`（reuseExistingServer），
- * 没跑时自己起一个，保证 `pnpm web:e2e` 一条命令可跑。
+ * webServer：**固定占用测试专用端口**（默认 43131，可用 AA_E2E_PORT 覆盖），并且
+ * `reuseExistingServer: false`——端口被占就直接报错，绝不悄悄复用别人的服务。
+ *
+ * 这里踩过一个真实的坑：开发机常驻着打包好的 Electron 应用（它内嵌同一个
+ * `apps/web/server.mjs`，监听默认的 43130）。`reuseExistingServer: true` 会让
+ * Playwright 复用它，于是静态资源读的是磁盘上的**新** dist（DOM 是新的），
+ * 接口却跑在**旧**进程的内存代码里——测试看着在跑，其实测的是旧构建，
+ * 报错信息还完全对不上。宁可响亮地失败，也不要静默地测错版本。
+ *
+ * 需要对着已经起好的服务跑（例如调试线上问题）时，显式给 AA_WEB_URL，
+ * 此时不再自己起 webServer。
  */
+const E2E_PORT = process.env.AA_E2E_PORT ?? '43131';
+const E2E_BASE = process.env.AA_WEB_URL ?? `http://127.0.0.1:${E2E_PORT}`;
+
 export default defineConfig({
   testDir: './e2e',
   timeout: 60_000,
@@ -21,15 +33,17 @@ export default defineConfig({
   workers: 1,
   reporter: [['list']],
   use: {
-    baseURL: process.env.AA_WEB_URL ?? 'http://127.0.0.1:43130',
+    baseURL: E2E_BASE,
     trace: 'retain-on-failure',
     ...devices['Desktop Chrome'],
   },
-  webServer: {
-    command: 'node apps/web/server.mjs',
-    url: 'http://127.0.0.1:43130/api/health',
-    reuseExistingServer: true,
-    timeout: 60_000,
-    env: { AA_ROOT: process.cwd() },
-  },
+  webServer: process.env.AA_WEB_URL
+    ? undefined
+    : {
+        command: 'node apps/web/server.mjs',
+        url: `${E2E_BASE}/api/health`,
+        reuseExistingServer: false,
+        timeout: 60_000,
+        env: { AA_ROOT: process.cwd(), AA_PORT: E2E_PORT },
+      },
 });

@@ -313,6 +313,19 @@ export const RETIRED_FIELDS = [
   { sheet: 'Sheet3', col: 'R', key: 'specialCategory', label: '结局特殊类别', reason: '规则明列删除；原本只在金标准里、未抽取' },
 ];
 
+/**
+ * 退役字段的规范键集合。
+ *
+ * 用途：**挡住旧抽取产物里的遗留字段**。
+ * 本次是"只改代码、没重跑抽取"，所以 `build/extraction/*` 里那些列还在；
+ * 界面的兜底循环会把清单外的键原样显示出来（标题就是 `totalSessionsClassA`
+ * 这种驼峰键），看起来像是"标题没对上原文"，其实是**已退役的残留**。
+ * 退役是需求方明确定的，所以这里按规范键直接挡掉，而不是留着让人猜。
+ */
+export const RETIRED_KEYS = new Set(
+  RETIRED_FIELDS.map((f) => f.key).filter((k) => /^[A-Za-z]/.test(k)),
+);
+
 /** LLM 不负责的字段来源说明。 */
 export const SOURCE_LABELS = {
   llm: '由 LLM 从 PDF 抽取',

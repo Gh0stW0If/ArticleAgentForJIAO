@@ -22,7 +22,7 @@ import { join } from 'node:path';
 import { indexToCol } from './xlsx.mjs';
 
 /** 块内路径 → 中文列名（Sheet3 的列码是缩写，医生看不懂 IESTI 这类字符）。 */
-const BLOCK_FIELD_ZH = {
+export const BLOCK_FIELD_ZH = {
   'continuous.estimate_type': '效应量类型',
   'continuous.variance_type': '变异值类型',
   'continuous.experimental.estimate': '试验组效应量',
