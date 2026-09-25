@@ -7,15 +7,20 @@
  *   右 = 三张选项卡（Sheet1 / Sheet2 / Sheet3），字段按**原始表格列序**排布，可编辑/确认/回滚
  *
  * 数据流：
- *   GET  /api/fields                       → 字段视图（流水线值 + 人工覆盖层合并；含 sheets 布局）
- *   POST /api/annotation                   → 写入人工标注（confirm / override / add）
- *   DELETE /api/annotation?fieldPath=…     → 单字段回滚
+ *   GET  /api/fields                       → 字段视图（流水线值 + 多人核对合并；含 sheets 布局）
+ *   GET  /api/annotation?reviewer=…        → 某核对人的记录 + 全部核对人进度 + 分歧 + 两两一致率
+ *   POST /api/annotation {reviewer,…}      → 写入某核对人的标注（confirm / override / add）
+ *   DELETE /api/annotation?reviewer=…&fieldPath=… → 单字段回滚（按核对人）
  *   POST /api/import                       → 导入 PDF（写入 build/imports，不动 Datas/）
  *   POST /api/parse | /api/extract         → 后台任务（MinerU 解析 / LLM 抽取）
  *   GET  /api/jobs                         → 任务状态与日志尾部
  *
  * 「人工修改」的存储原则：绝不改写流水线产物，只写独立的覆盖层
  * （见 packages/core/src/annotation.ts），因此随时可对比"原始 vs 人工"。
+ *
+ * 多人机核对（202609）：**一位核对人一份文件** —— `build/annotations/<year>/<study>.<reviewer>.json`。
+ * 各人独立盲评、互不覆盖；结论一致的字段才生效，**有分歧的字段不替人取值**（保留机器原值并标出），
+ * 等第三方仲裁。核对人身份存在 localStorage，提交时随请求带上。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -56,6 +61,50 @@ function evKindOf(blockType: string | undefined): EvKind {
   return 'text';
 }
 
+/** 一位核对人的工作量（`/api/annotation` 的 `reviewers`）。 */
+interface ReviewerSummary {
+  reviewer: string;
+  total: number;
+  added: number;
+  overridden: number;
+  confirmed: number;
+  updatedAt: string | null;
+}
+
+/** 多人机核对汇总（`/api/annotation` 的 `reviewers` + `consensus`）。 */
+interface ReviewSummary {
+  reviewers: ReviewerSummary[];
+  consensus: {
+    stats: {
+      total: number; agreed: number; disputed: number; single: number;
+      machineOnly: number; reviewed: number; changed: number;
+    };
+    disputed: {
+      fieldPath: string;
+      machineRaw: string | null;
+      opinions: { reviewer: string; raw: string; action: string }[];
+    }[];
+    pairwise: { reviewerA: string; reviewerB: string; common: number; same: number; disputed: number; rate: number | null }[];
+  };
+}
+
+const EMPTY_REVIEW: ReviewSummary = {
+  reviewers: [],
+  consensus: {
+    stats: { total: 0, agreed: 0, disputed: 0, single: 0, machineOnly: 0, reviewed: 0, changed: 0 },
+    disputed: [],
+    pairwise: [],
+  },
+};
+
+/**
+ * 核对人身份的本地存储键。
+ *
+ * 为什么必须持久化：多人核对是**按人留痕**的（服务端强制校验 reviewer）。
+ * 每次刷新都要重填姓名，人会干脆不填或随手填一个——两种都会污染"人机核对"数据。
+ */
+const REVIEWER_KEY = 'aa.reviewer';
+
 export default function App() {
   const [year, setYear] = useState('2015');
   const [studies, setStudies] = useState<StudyEntry[]>([]);
@@ -63,6 +112,16 @@ export default function App() {
   const [doc, setDoc] = useState<MiniDoc | null>(null);
   const [sheets, setSheets] = useState<SheetsPayload>(EMPTY_SHEETS);
   const [annStats, setAnnStats] = useState({ total: 0, added: 0, overridden: 0, confirmed: 0 });
+  /*
+   * 多人机核对：核对人身份 + 汇总。
+   * 「草稿」与「生效」分开——输入框 onBlur / 回车才生效，否则每敲一个字就重新拉一遍汇总。
+   */
+  const [reviewer, setReviewer] = useState(() => {
+    try { return window.localStorage.getItem(REVIEWER_KEY) ?? ''; } catch { return ''; }
+  });
+  const [reviewerDraft, setReviewerDraft] = useState(reviewer);
+  const [review, setReview] = useState<ReviewSummary>(EMPTY_REVIEW);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [page, setPage] = useState(1);
   const [focusPage, setFocusPage] = useState<number | undefined>(undefined);
   const [focusToken, setFocusToken] = useState(0);
@@ -122,6 +181,31 @@ export default function App() {
       setStatus(`字段加载失败: ${(e as Error).message}`);
     }
   }, []);
+
+  /* --------------------------- 多人核对汇总 --------------------------- */
+  const loadReview = useCallback(async (y: string, s: string, r: string) => {
+    if (!s) { setReview(EMPTY_REVIEW); return; }
+    try {
+      const q = r ? `&reviewer=${encodeURIComponent(r)}` : '';
+      const d = await (await fetch(`/api/annotation?year=${y}&study=${encodeURIComponent(s)}${q}`)).json();
+      setReview({ reviewers: d.reviewers ?? [], consensus: d.consensus ?? EMPTY_REVIEW.consensus });
+    } catch {
+      // 汇总失败不该拖垮字段视图：静默保留上一次的汇总
+    }
+  }, []);
+
+  useEffect(() => { void loadReview(year, study, reviewer); }, [year, study, reviewer, loadReview]);
+
+  /** 提交核对人改名（输入框失焦 / 回车）。 */
+  const commitReviewer = useCallback(() => {
+    const next = reviewerDraft.trim();
+    setReviewer(next);
+    try {
+      if (next) window.localStorage.setItem(REVIEWER_KEY, next);
+      else window.localStorage.removeItem(REVIEWER_KEY);
+    } catch { /* 隐私模式下 localStorage 不可用：不影响本次会话 */ }
+    if (next && next !== reviewer) setStatus(`核对人已切换为「${next}」，此前提交的记录仍归原核对人`);
+  }, [reviewerDraft, reviewer]);
 
   /* --------------------------- MiniDoc + 字段 --------------------------- */
   useEffect(() => {
@@ -278,15 +362,28 @@ export default function App() {
       note?: string;
     },
   ): Promise<boolean> => {
+    /*
+     * 核对人必填（服务端也会校验一次）。这里先拦是为了给出**看得懂的话**，
+     * 而不是把 400 的错误原文抛给医生。
+     */
+    if (!reviewer) {
+      setStatus('请先填写「核对人」再提交——多人核对按人留痕，不接受匿名写入');
+      return false;
+    }
     setBusy(true);
     try {
-      const r = await fetch(`/api/annotation?year=${year}&study=${encodeURIComponent(study)}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ entry }),
-      });
+      const r = await fetch(
+        `/api/annotation?year=${year}&study=${encodeURIComponent(study)}&reviewer=${encodeURIComponent(reviewer)}`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ reviewer, entry }),
+        },
+      );
       const d = await r.json();
       if (!r.ok) { setStatus(`保存失败: ${d.error}`); return false; }
+      // POST 的响应已带回最新汇总，直接用，省一次往返
+      if (d.reviewers) setReview({ reviewers: d.reviewers, consensus: d.consensus ?? EMPTY_REVIEW.consensus });
       await loadFields(year, study);
       return true;
     } catch (e) {
@@ -295,7 +392,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [year, study, loadFields]);
+  }, [year, study, reviewer, loadFields]);
 
   /**
    * 人工改值。
@@ -348,23 +445,26 @@ export default function App() {
   }, [postAnnotation]);
 
   const onRevert = useCallback(async (fieldPath: string) => {
+    if (!reviewer) { setStatus('请先填写「核对人」'); return; }
     if (findField(fieldPath)?.decidedBy !== 'human') { setStatus('该字段没有人工标注'); return; }
     setBusy(true);
     try {
       const r = await fetch(
-        `/api/annotation?year=${year}&study=${encodeURIComponent(study)}&fieldPath=${encodeURIComponent(fieldPath)}`,
+        `/api/annotation?year=${year}&study=${encodeURIComponent(study)}`
+          + `&reviewer=${encodeURIComponent(reviewer)}&fieldPath=${encodeURIComponent(fieldPath)}`,
         { method: 'DELETE' },
       );
       const d = await r.json();
       if (!r.ok) { setStatus(`回滚失败: ${d.error}`); return; }
       await loadFields(year, study);
+      void loadReview(year, study, reviewer);
       setStatus(d.removed ? `已回滚 ${fieldPath}` : `${fieldPath} 无人工标注`);
     } catch (e) {
       setStatus(`回滚失败: ${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
-  }, [year, study, findField, loadFields]);
+  }, [year, study, reviewer, findField, loadFields, loadReview]);
 
   /**
    * 「纳入抽取」：把「待人工确认纳入」的候选结局提升为正式的 Sheet3 行。
@@ -376,31 +476,37 @@ export default function App() {
   const onInclude = useCallback(async (f: FieldView) => {
     const meta = f.candidate;
     if (!meta) { setStatus('该候选缺少名称/工具，无法纳入'); return; }
+    if (!reviewer) { setStatus('请先填写「核对人」再纳入——纳入也是一条人工记录'); return; }
     const idx = sheets.sheet3.nextOutcomeIndex;
     const ev = currentEvidence(f.fieldPath);
     const note = '从「待人工确认纳入」纳入抽取';
     setBusy(true);
     try {
-      const r = await fetch(`/api/annotation?year=${year}&study=${encodeURIComponent(study)}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          entries: [
-            { fieldPath: `outcomes.${idx}.outcome.name`, action: 'add', value: { raw: meta.name || '（未命名）', evidence: ev, provenance: 'human', confidence: 1 }, note },
-            { fieldPath: `outcomes.${idx}.outcome.instrument`, action: 'add', value: { raw: meta.instrument || 'NR', evidence: ev, provenance: 'human', confidence: 1 }, note },
-          ],
-        }),
-      });
+      const r = await fetch(
+        `/api/annotation?year=${year}&study=${encodeURIComponent(study)}&reviewer=${encodeURIComponent(reviewer)}`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            reviewer,
+            entries: [
+              { fieldPath: `outcomes.${idx}.outcome.name`, action: 'add', value: { raw: meta.name || '（未命名）', evidence: ev, provenance: 'human', confidence: 1 }, note },
+              { fieldPath: `outcomes.${idx}.outcome.instrument`, action: 'add', value: { raw: meta.instrument || 'NR', evidence: ev, provenance: 'human', confidence: 1 }, note },
+            ],
+          }),
+        },
+      );
       const d = await r.json();
       if (!r.ok) { setStatus(`纳入失败：${d.error}`); return; }
       await loadFields(year, study);
+      void loadReview(year, study, reviewer);
       setNotice(`已纳入为 Sheet3 结局 ${idx + 1}：${meta.name || meta.instrument}（可继续编辑/框选证据）`);
     } catch (e) {
       setStatus(`纳入失败：${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
-  }, [sheets.sheet3.nextOutcomeIndex, year, study, currentEvidence, loadFields]);
+  }, [sheets.sheet3.nextOutcomeIndex, year, study, reviewer, currentEvidence, loadFields, loadReview]);
 
   /* ------------------------------ 框选 ------------------------------ */
 
@@ -669,17 +775,85 @@ export default function App() {
         background: T.panel, display: 'flex', flexDirection: 'column',
       }}>
         <div style={{
-          padding: '11px 14px', background: T.bg, borderBottom: `1px solid ${T.border}`,
-          display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8,
+          padding: '9px 14px', background: T.bg, borderBottom: `1px solid ${T.border}`,
+          display: 'flex', flexDirection: 'column', gap: 7,
         }}>
-          <span style={{ color: T.ink, fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            抽取字段{currentStudy?.imported ? '（导入件）' : ''}
-          </span>
-          <span style={{ fontSize: 11, color: T.faint, whiteSpace: 'nowrap' }}>
-            人工 {annStats.total}
-            {annStats.overridden > 0 && <span style={{ color: T.amber }}> · 修改 {annStats.overridden}</span>}
-            {annStats.confirmed > 0 && <span style={{ color: T.emerald }}> · 确认 {annStats.confirmed}</span>}
-          </span>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
+            <span style={{ color: T.ink, fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              抽取字段{currentStudy?.imported ? '（导入件）' : ''}
+            </span>
+            <span style={{ fontSize: 11, color: T.faint, whiteSpace: 'nowrap' }}>
+              人工 {annStats.total}
+              {annStats.overridden > 0 && <span style={{ color: T.amber }}> · 修改 {annStats.overridden}</span>}
+              {annStats.confirmed > 0 && <span style={{ color: T.emerald }}> · 确认 {annStats.confirmed}</span>}
+            </span>
+          </div>
+
+          {/* 多人机核对：核对人身份 + 汇总入口（202609） */}
+          <div style={{ display: 'flex', gap: 7, alignItems: 'center', fontSize: 11 }}>
+            <span style={{ color: T.faint }}>核对人</span>
+            <input
+              value={reviewerDraft}
+              onChange={(e) => setReviewerDraft(e.target.value)}
+              onBlur={commitReviewer}
+              onKeyDown={(e) => { if (e.key === 'Enter') commitReviewer(); }}
+              placeholder="填姓名后才能提交"
+              data-testid="reviewer-input"
+              style={{ ...inputS(), width: 116, padding: '3px 8px', fontSize: 11 }}
+            />
+            {!reviewer && <span style={{ color: T.red }}>未设置，暂不能提交</span>}
+            <button
+              onClick={() => setReviewOpen((v) => !v)}
+              style={{ ...ghostBtn(review.consensus.stats.disputed > 0 ? T.red : T.indigo), marginLeft: 'auto' }}
+              data-testid="review-toggle"
+            >
+              核对 {review.consensus.stats.reviewed}/{review.consensus.stats.total}
+              {review.consensus.stats.disputed > 0 ? ` · 分歧 ${review.consensus.stats.disputed}` : ''}
+            </button>
+          </div>
+
+          {reviewOpen && (
+            <div
+              data-testid="review-panel"
+              style={{
+                border: `1px solid ${T.border}`, borderRadius: R.btn, padding: '7px 9px',
+                background: T.panel, fontSize: 11, color: T.muted, maxHeight: 200, overflow: 'auto',
+              }}
+            >
+              <div style={{ marginBottom: 4 }}>
+                {review.reviewers.length
+                  ? review.reviewers.map((r) => `${r.reviewer}（${r.total} 条）`).join('、')
+                  : '尚无人核对本篇'}
+              </div>
+              <div style={{ marginBottom: 4, color: T.faint }}>
+                一致 {review.consensus.stats.agreed} · 仅一人 {review.consensus.stats.single}
+                {' · '}分歧 {review.consensus.stats.disputed} · 未核对 {review.consensus.stats.machineOnly}
+              </div>
+              {review.consensus.pairwise.filter((p) => p.rate !== null).map((p) => (
+                <div key={`${p.reviewerA}-${p.reviewerB}`} style={{ color: T.faint }}>
+                  {p.reviewerA} ↔ {p.reviewerB}：一致 {p.same}/{p.common}（{Math.round((p.rate ?? 0) * 100)}%）
+                </div>
+              ))}
+              {review.consensus.disputed.length > 0 && (
+                <div style={{ marginTop: 6, color: T.amber }}>
+                  <div style={{ fontWeight: 600, marginBottom: 3 }}>待第三方仲裁：</div>
+                  {review.consensus.disputed.map((d) => (
+                    <div key={d.fieldPath} style={{ marginBottom: 4 }}>
+                      <code style={{ fontSize: 10.5 }}>{d.fieldPath}</code>
+                      <div style={{ color: T.faint }}>
+                        机器「{d.machineRaw ?? '（无）'}」／
+                        {d.opinions.map((o) => `${o.reviewer}「${o.raw}」`).join('，')}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button
+                onClick={() => void loadReview(year, study, reviewer)}
+                style={{ ...ghostBtn(), marginTop: 6 }}
+              >刷新汇总</button>
+            </div>
+          )}
         </div>
         <div style={{ flex: 1, overflow: 'hidden' }}>
           <ExtractionPanel

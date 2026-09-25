@@ -21,10 +21,25 @@ import { join, resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { studiesFromPdfNames } from '../../packages/core/dist/index.js';
+import {
+  studiesFromPdfNames,
+  buildConsensus, consensusStats, pairwiseAgreement, reviewerSummaries,
+  LEGACY_REVIEWER,
+} from '../../packages/core/dist/index.js';
 
 const ROOT = resolve(process.env.AA_ROOT ?? process.cwd());
 const PORT = Number(process.env.AA_PORT ?? 43130);
+
+/*
+ * 多人核对依赖 @aa/core 的新增导出。dist 是**构建产物**——若它比源码旧（没跑过 `pnpm build`），
+ * 这些符号会是 undefined，然后要等到某个请求进来才炸，报错还很难懂。
+ * 因此在启动时就把话说明白：缺哪个符号、该怎么修。
+ */
+for (const [name, fn] of Object.entries({ buildConsensus, consensusStats, pairwiseAgreement, reviewerSummaries })) {
+  if (typeof fn !== 'function') {
+    throw new Error(`@aa/core 缺少导出 ${name}：packages/core/dist 是旧版本，请先运行 \`pnpm build\``);
+  }
+}
 
 /**
  * 本服务**代码**所在目录（开发时=仓库根；Electron 打包后=exe 内的 app 目录）。
@@ -60,24 +75,164 @@ const DIRS = {
 };
 
 /* ------------------------------ 标注读写 ------------------------------ */
+/*
+ * 202609 起：**一位核对人一份文件**（需求见 packages/core/src/annotation.ts 顶部说明）。
+ *
+ *   build/annotations/<year>/<study>.json                 v1 遗留件（读取时归属 legacy）
+ *   build/annotations/<year>/<study>.<reviewer>.json      某位核对人的记录
+ *
+ * 为什么按人分文件、而不是在同一份 JSON 里放 reviewer 数组：
+ *   · **盲评**——各写各的文件，物理上不可能互相覆盖；
+ *   · **并发安全**——两人同时提交不会丢更新（同文件"读-改-写"会丢）；
+ *   · **可单独删除**某一位的记录，不影响其他人。
+ * 代价是"读一篇研究要先列目录"，但量级是几十个文件，可以忽略。
+ */
 
-const annotationPath = (year, study) =>
-  join(DIRS.annotations, year, `${study.replace(/^-+/, '')}.json`);
+/** 研究号归一化（去掉前导 `-`，与文件名一致）。 */
+const studyKey = (study) => String(study ?? '').replace(/^-+/, '');
 
-function readAnnotation(year, study) {
-  const p = annotationPath(year, study);
-  if (!existsSync(p)) return null;
+/*
+ * 核对人标识会**直接拼进文件名**，因此必须严格校验：
+ * 只允许中英文数字与 `.` `-` `_`，长度 1–40，且显式拒绝 `..`（否则可穿越出 annotations 目录）。
+ * `legacy` 是保留字，不允许被写成核对人名，避免与 v1 遗留件混淆。
+ */
+const REVIEWER_RE = /^[\w.\-\u4e00-\u9fa5]{1,40}$/u;
+function safeReviewer(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s || s === LEGACY_REVIEWER) return null;
+  if (!REVIEWER_RE.test(s) || s.includes('..')) return null;
+  return s;
+}
+
+const annotationDir = (year) => join(DIRS.annotations, year);
+const legacyAnnotationPath = (year, study) => join(annotationDir(year), `${studyKey(study)}.json`);
+const reviewerAnnotationPath = (year, study, reviewer) =>
+  join(annotationDir(year), `${studyKey(study)}.${reviewer}.json`);
+
+/** 读一份覆盖层文件（损坏时返回 null，不让整个接口失败）。 */
+function readOverlayFile(path) {
+  if (!existsSync(path)) return null;
   try {
-    return JSON.parse(readFileSync(p, 'utf8'));
+    const ov = JSON.parse(readFileSync(path, 'utf8'));
+    if (!ov || !Array.isArray(ov.entries)) return null;
+    return ov;
   } catch {
-    return null;   // 文件损坏不应让整个接口失败
+    return null;
   }
 }
 
-function writeAnnotation(year, study, overlay) {
-  const p = annotationPath(year, study);
+/** 某位核对人的覆盖层（reviewer 省略时读 v1 遗留件）。 */
+function readAnnotation(year, study, reviewer = LEGACY_REVIEWER) {
+  if (reviewer === LEGACY_REVIEWER) return readOverlayFile(legacyAnnotationPath(year, study));
+  const r = safeReviewer(reviewer);
+  return r ? readOverlayFile(reviewerAnnotationPath(year, study, r)) : null;
+}
+
+/** 某篇研究的**全部**核对人记录（含 v1 遗留件）。 */
+function listAnnotations(year, study) {
+  const key = studyKey(study);
+  const out = [];
+
+  const legacy = readOverlayFile(legacyAnnotationPath(year, study));
+  if (legacy) out.push(legacy);
+
+  const dir = annotationDir(year);
+  if (!existsSync(dir)) return out;
+  for (const f of readdirSync(dir)) {
+    if (!f.startsWith(`${key}.`) || !f.endsWith('.json')) continue;
+    const reviewer = f.slice(key.length + 1, -'.json'.length);
+    if (!reviewer || reviewer === LEGACY_REVIEWER) continue;
+    const ov = readOverlayFile(join(dir, f));
+    // 文件名是权威来源：早先手工放进去的文件可能没有 reviewer 字段
+    if (ov) out.push({ ...ov, reviewer: ov.reviewer ?? reviewer });
+  }
+  return out;
+}
+
+/** 写某位核对人的覆盖层，返回落盘路径。 */
+function writeAnnotation(year, study, reviewer, overlay) {
+  const r = safeReviewer(reviewer);
+  if (!r) throw new Error(`核对人标识非法：${JSON.stringify(reviewer)}`);
+  const p = reviewerAnnotationPath(year, study, r);
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(overlay, null, 2), 'utf8');
+  writeFileSync(p, JSON.stringify({
+    ...overlay, schemaVersion: 'AA_ANNOTATION/2.0', reviewer: r,
+  }, null, 2), 'utf8');
+  return p;
+}
+
+/** 删除某位核对人的记录：带 fieldPath 只删该字段，否则整份删除。 */
+function deleteAnnotation(year, study, reviewer, fieldPath) {
+  const r = safeReviewer(reviewer);
+  if (!r) return { ok: false, removed: 0, error: `核对人标识非法：${JSON.stringify(reviewer)}` };
+  const p = reviewerAnnotationPath(year, study, r);
+
+  if (!fieldPath) {
+    if (existsSync(p)) rmSync(p, { force: true });
+    return { ok: true, removed: 'all' };
+  }
+  const ov = readOverlayFile(p);
+  if (!ov) return { ok: true, removed: 0 };
+  const before = ov.entries.length;
+  ov.entries = ov.entries.filter((e) => e.fieldPath !== fieldPath);
+  const removed = before - ov.entries.length;
+  if (!ov.entries.length) rmSync(p, { force: true });
+  else writeFileSync(p, JSON.stringify({ ...ov, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
+  return { ok: true, removed };
+}
+
+/**
+ * 多位核对人的记录 → 前端要的两个索引：
+ *   `entries`：fieldPath → **生效的**人工条目（一致 / 仅一人时才生效）
+ *   `review` ：fieldPath → { status, opinions }（分歧时供界面标红）
+ *
+ * ⚠️ 有分歧（disputed）的字段**故意不生效**——保留机器原值，等第三方仲裁。
+ * 替人挑一个值会让"专家分歧"这个信号在数据里消失，而它正是要建模的东西。
+ */
+function consensusIndex(overlays) {
+  const entries = new Map();
+  const review = new Map();
+  for (const row of buildConsensus({}, overlays)) {
+    review.set(row.fieldPath, { status: row.status, opinions: row.opinions });
+    if (row.status === 'disputed' || !row.agreedValue) continue;
+
+    const first = row.opinions[0];
+    // 与机器原值相同 = 确认；不同 = 改动（具体是 add 还是 override 取核对人标的动作）
+    const action = row.agreedWithMachine
+      ? 'confirm'
+      : (first?.action === 'confirm' ? 'override' : (first?.action ?? 'override'));
+
+    entries.set(row.fieldPath, {
+      fieldPath: row.fieldPath,
+      value: row.agreedValue,
+      action,
+      ...(row.machineValue ? { llmValue: row.machineValue } : {}),
+      ...(first?.note ? { note: first.note } : {}),
+      ...(first?.reviewer ? { author: first.reviewer } : {}),
+      ...(first?.updatedAt ? { updatedAt: first.updatedAt } : {}),
+    });
+  }
+  return { entries, review };
+}
+
+/** 某篇研究的核对汇总（给界面用）：逐人进度 + 分歧清单 + 两两一致率。 */
+function reviewSummary(year, study) {
+  const overlays = listAnnotations(year, study);
+  const rows = buildConsensus({}, overlays);
+  const stats = consensusStats(rows);
+  return {
+    reviewers: reviewerSummaries(overlays),
+    consensus: {
+      stats,
+      disputed: rows.filter((r) => r.status === 'disputed')
+        .map((r) => ({
+          fieldPath: r.fieldPath,
+          machineRaw: r.machineValue?.raw ?? null,
+          opinions: r.opinions.map((o) => ({ reviewer: o.reviewer, raw: o.raw, action: o.action })),
+        })),
+      pairwise: pairwiseAgreement(overlays),
+    },
+  };
 }
 
 /** 读取请求体（限制大小，防止误传大文件）。 */
@@ -457,10 +612,14 @@ async function buildFieldGroups(year, study) {
 /** 流水线产物 → 字段视图（含"待人工确认"分组）。 */
 async function buildFromExtraction(year, study, norm, doc) {
   const canon = await loadCanonical();
-  const overlay = readAnnotation(year, study);
-  const byPath = new Map((overlay?.entries ?? []).map((e) => [e.fieldPath, e]));
+  /*
+   * 多位核对人的记录 → 「生效的人工条目」+「逐字段核对状态」。
+   * 分歧（disputed）的字段**不生效**，保留机器原值，只把状态带给界面（见 consensusIndex）。
+   */
+  const { entries: byPath, review } = consensusIndex(listAnnotations(year, study));
+  const annEntries = [...byPath.values()];
 
-  const toView = makeToView(byPath);
+  const toView = makeToView(byPath, review);
   const groups = [];
 
   /* ---- 文章级 ---- */
@@ -478,7 +637,7 @@ async function buildFromExtraction(year, study, norm, doc) {
     const v = toView(k, k, gv, k);
     if (v) artFields.push(v);
   }
-  for (const e of overlay?.entries ?? []) {
+  for (const e of annEntries) {
     if (e.fieldPath.includes('.') || artFields.some((f) => f.fieldPath === e.fieldPath)) continue;
     const v = toView(e.fieldPath, e.fieldPath, null, e.fieldPath);
     if (v) artFields.push(v);
@@ -546,7 +705,7 @@ async function buildFromExtraction(year, study, norm, doc) {
    * 因此行的枚举范围要取「产物行数」与「覆盖层里出现的最大结局下标 + 1」的较大者。
    * 这样点一下「纳入」就能得到一条可编辑的 Sheet3 行（含原始表格的全部列）。
    */
-  const ovOutcomeIdx = (overlay?.entries ?? [])
+  const ovOutcomeIdx = annEntries
     .map((e) => /^outcomes\.(\d+)\./.exec(e.fieldPath))
     .filter(Boolean)
     .map((m) => Number(m[1]));
@@ -665,19 +824,13 @@ async function buildFromExtraction(year, study, norm, doc) {
     },
   };
 
-  const entries = overlay?.entries ?? [];
   return {
     groups,
     sheets,
     source: 'extraction',
     generatedAt: doc.generatedAt ?? null,
     model: doc.pipeline?.modelIds?.[0] ?? null,
-    stats: {
-      total: entries.length,
-      added: entries.filter((e) => e.action === 'add').length,
-      overridden: entries.filter((e) => e.action === 'override').length,
-      confirmed: entries.filter((e) => e.action === 'confirm').length,
-    },
+    stats: statsOfEntries(annEntries),
     articleId: norm,
   };
 }
@@ -692,10 +845,10 @@ async function buildFromGold(year, study, norm) {
   if (!article) return { groups: [], stats: emptyStats(), source: 'none', warning: `金标准中未找到 ${norm}` };
 
   const canon = await loadCanonical();
-  const overlay = readAnnotation(year, study);
-  const byPath = new Map((overlay?.entries ?? []).map((e) => [e.fieldPath, e]));
+  const { entries: byPath, review } = consensusIndex(listAnnotations(year, study));
+  const annEntries = [...byPath.values()];
 
-  const toView = makeToView(byPath);
+  const toView = makeToView(byPath, review);
 
   const groups = [];
   const artFields = [];
@@ -711,7 +864,7 @@ async function buildFromGold(year, study, norm) {
     const v = toView(k, k, gv);
     if (v) artFields.push(v);
   }
-  for (const e of overlay?.entries ?? []) {
+  for (const e of annEntries) {
     if (e.fieldPath.includes('.') || artFields.some((f) => f.fieldPath === e.fieldPath)) continue;
     const v = toView(e.fieldPath, e.fieldPath, null);
     if (v) artFields.push(v);
@@ -725,17 +878,17 @@ async function buildFromGold(year, study, norm) {
       if (!groups.includes(g)) groups.push(g);
     }
   }
-  for (const e of overlay?.entries ?? []) {
+  for (const e of annEntries) {
     if (e.fieldPath.includes('.') || artFields.some((f) => f.fieldPath === e.fieldPath)) continue;
     const v = toView(e.fieldPath, e.fieldPath, null);
     if (v && !artFields.includes(v)) artFields.push(v);
   }
-  return { groups, source: 'gold', stats: statsOf(overlay), articleId: norm };
+  return { groups, source: 'gold', stats: statsOfEntries(annEntries), articleId: norm };
 }
 
 const emptyStats = () => ({ total: 0, added: 0, overridden: 0, confirmed: 0 });
-const statsOf = (overlay) => {
-  const entries = overlay?.entries ?? [];
+/** 「生效的人工条目」→ 统计（界面头部用）。有分歧的字段不在其中，见 consensusIndex。 */
+const statsOfEntries = (entries) => {
   return {
     total: entries.length,
     added: entries.filter((e) => e.action === 'add').length,
@@ -744,8 +897,13 @@ const statsOf = (overlay) => {
   };
 };
 
-/** 值 + 人工覆盖层 → FieldView（两条数据源共用）。 */
-function makeToView(byPath) {
+/**
+ * 值 + 人工覆盖层 → FieldView（两条数据源共用）。
+ *
+ * `review` 来自 `consensusIndex`：有核对记录的字段会带上 `reviewStatus`
+ * （agreed / disputed / single）与各人意见 `reviews`，前端据此标分歧、看详情。
+ */
+function makeToView(byPath, review = new Map()) {
   return (fieldPath, label, gv, key) => {
     const ann = byPath.get(fieldPath);
     const base = ann ? ann.value : gv;
@@ -763,6 +921,9 @@ function makeToView(byPath) {
       ...(base.legend !== undefined ? { legend: base.legend } : {}),
       decidedBy: ann ? 'human' : (base.provenance ?? 'model'),
       overridden: ann ? ann.action !== 'confirm' : false,
+      ...(review.has(fieldPath)
+        ? { reviewStatus: review.get(fieldPath).status, reviews: review.get(fieldPath).opinions }
+        : {}),
       /** 原始产物里是否存在该字段：false 表示人工新增（写回时用 action='add'） */
       inGold: Boolean(gv),
       ...(base.confidence !== undefined ? { confidence: base.confidence } : {}),
@@ -899,46 +1060,57 @@ const server = createServer(async (req, res) => {
       return json(res, 200, r);
     }
 
+    /*
+     * 人机核对记录（202609：**一位核对人一份文件**）。
+     *
+     *   GET    ?reviewer=X               X 的覆盖层 + 全部核对人进度 + 分歧清单 + 两两一致率
+     *   POST   { reviewer, entry|entries } 写入 X 的记录（盲评：互不覆盖）
+     *   DELETE ?reviewer=X[&fieldPath=…]  删除 X 的某字段 / 整份记录
+     *
+     * reviewer **一律必填**：静默落到某个默认核对人，会让人以为自己标上了、
+     * 实际写进了别人的文件——这种 bug 在盲评场景里最难发现。
+     */
     if (p === '/api/annotation') {
       if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
 
+      const wantReviewer = url.searchParams.get('reviewer');
+      if (wantReviewer && !safeReviewer(wantReviewer)) {
+        return json(res, 400, { error: 'reviewer 非法：只允许 1–40 位中英文/数字/. - _，且不含 ..' });
+      }
+
       if (req.method === 'GET') {
-        const ov = readAnnotation(year, study);
-        return json(res, 200, { overlay: ov, stats: ov ? {
-          total: ov.entries.length,
-          added: ov.entries.filter((e) => e.action === 'add').length,
-          overridden: ov.entries.filter((e) => e.action === 'override').length,
-          confirmed: ov.entries.filter((e) => e.action === 'confirm').length,
-        } : { total: 0, added: 0, overridden: 0, confirmed: 0 } });
+        const ov = wantReviewer ? readAnnotation(year, study, wantReviewer) : null;
+        return json(res, 200, {
+          overlay: ov,
+          stats: statsOfEntries(ov?.entries ?? []),
+          ...reviewSummary(year, study),
+        });
       }
 
       if (req.method === 'DELETE') {
-        const fp = annotationPath(year, study);
-        // 带 fieldPath 时只删除该字段的人工标注（= 单字段「回滚」），
-        // 否则清空整份覆盖层（= 该研究全部「重置」）。
-        const fieldPath = url.searchParams.get('fieldPath') ?? '';
-        if (!fieldPath) {
-          if (existsSync(fp)) rmSync(fp, { force: true });
-          return json(res, 200, { ok: true, removed: 'all' });
+        if (!wantReviewer) {
+          return json(res, 400, { error: '删除必须指定 reviewer（不指定会把所有核对人的记录一起删掉）' });
         }
-        const ov = readAnnotation(year, study);
-        if (!ov) return json(res, 200, { ok: true, removed: 0 });
-        const before = ov.entries.length;
-        ov.entries = ov.entries.filter((e) => e.fieldPath !== fieldPath);
-        const removed = before - ov.entries.length;
-        if (!ov.entries.length) rmSync(fp, { force: true });
-        else writeAnnotation(year, study, { ...ov, updatedAt: new Date().toISOString() });
-        return json(res, 200, { ok: true, removed });
+        const fieldPath = url.searchParams.get('fieldPath') ?? '';
+        const r = deleteAnnotation(year, study, wantReviewer, fieldPath);
+        if (!r.ok) return json(res, 400, { error: r.error });
+        return json(res, 200, r);
       }
 
       if (req.method === 'POST' || req.method === 'PUT') {
         const body = await readBody(req);
-        const artId = study.replace(/^-+/, '');
-        const base = readAnnotation(year, study) ?? {
-          schemaVersion: 'AA_ANNOTATION/1.0',
+        const reviewer = safeReviewer(body.reviewer ?? wantReviewer);
+        if (!reviewer) {
+          return json(res, 400, { error: '缺少或非法的 reviewer：只允许 1–40 位中英文/数字/. - _，且不含 ..' });
+        }
+
+        const artId = studyKey(study);
+        const base = readAnnotation(year, study, reviewer) ?? {
+          schemaVersion: 'AA_ANNOTATION/2.0',
           year,
           articleId: artId,
           sourcePdf: `Datas/articles/${year}/${artId}.pdf`,
+          reviewer,
           entries: [],
           updatedAt: new Date().toISOString(),
         };
@@ -953,14 +1125,17 @@ const server = createServer(async (req, res) => {
           if (!['confirm', 'override', 'add'].includes(e.action)) {
             return json(res, 400, { error: `action 非法：${e.action}` });
           }
-          // 同一 fieldPath 只保留最新一条
+          // 同一位核对人对同一 fieldPath 只保留最新一条（其他人的记录互不影响）
           const idx = base.entries.findIndex((x) => x.fieldPath === e.fieldPath);
-          const rec = { ...e, updatedAt: new Date().toISOString() };
+          const rec = { ...e, author: reviewer, updatedAt: new Date().toISOString() };
           if (idx >= 0) base.entries[idx] = rec; else base.entries.push(rec);
         }
         base.updatedAt = new Date().toISOString();
-        writeAnnotation(year, study, base);
-        return json(res, 200, { ok: true, overlay: base, count: base.entries.length });
+        writeAnnotation(year, study, reviewer, base);
+        return json(res, 200, {
+          ok: true, reviewer, overlay: { ...base, reviewer }, count: base.entries.length,
+          ...reviewSummary(year, study),
+        });
       }
 
       return json(res, 405, { error: `不支持的方法 ${req.method}` });

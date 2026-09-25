@@ -156,7 +156,6 @@ export interface OutcomeLevel {
     measurementType?: FieldValue;
     baselineAdjusted?: FieldValue;
     primaryOutcomeTimepoint?: FieldValue;
-    specialCategory?: FieldValue;
   };
   followUp?: {
     description?: FieldValue;

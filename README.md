@@ -20,6 +20,20 @@ Web/桌面端具备人工覆盖层（`add` / `override` / `confirm`，不改写�
 已知缺口（`docs/10-roadmap.md`）：无 XLSX/CSV 导出、无多人评审、二分类与生存结局的 OR/RR/RD/HR 尚未抽取、
 `build/eval` 与 `build/extraction` 存在版本漂移。
 
+## 本分支新增（`feat/202609-prune-and-review-records`）
+
+按 202609 的新要求做了两件事：
+
+- **提取项目删减** —— 按列规则退役 6 个 Sheet1 列（E/F/AW/BB/BC/BK）与 2 个 Sheet3 列（E/R）
+  对应的字段，**抽取与评测同步移除**（只删抽取会让这些列被判成「漏抽」，白掉准确率）。
+  清单与依据见 `tools/canonical-field-map.mjs` 的 `RETIRED_FIELDS`。
+- **多人机核对** —— 标注改为**一位核对人一份文件**
+  （`build/annotations/<year>/<study>.<reviewer>.json`），支持多人独立盲评；
+  逐字段给出「一致 / 分歧 / 仅一人 / 未核对」四态，
+  **有分歧的字段不替人取值**（保留机器原值并标出），等第三方仲裁。
+
+详见 `docs/26-202609-字段删减与多人核对.md`。
+
 ## ⚠️ 本仓库不含数据与私有配置
 
 以下目录被 `.gitignore` 排除，**clone 后需要另行准备**，否则无法跑端到端流程：

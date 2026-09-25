@@ -16,19 +16,38 @@ const YEAR = '2015';
 const STUDY = '2015-01';
 const CORPUS_PDF = join(process.cwd(), 'Datas', 'articles', YEAR, '-2015-01.pdf');
 
-/** 备份/还原某研究的覆盖层（测试不留副作用）。 */
+/**
+ * 多人机核对（202609）：标注按**核对人**分文件存。
+ *
+ * 测试固定用 `e2e` 这个核对人，只快照/还原它自己的记录——
+ * 不去碰使用者或其它核对人的真实标注（这也正是分文件存储的好处：
+ * 回滚一位核对人不会连累其他人）。
+ */
+const REVIEWER = 'e2e';
+const annUrl = (year: string, study: string, reviewer?: string) =>
+  `/api/annotation?year=${year}&study=${study}${reviewer ? `&reviewer=${encodeURIComponent(reviewer)}` : ''}`;
+
+/** 备份/还原 `e2e` 核对人的覆盖层（测试不留副作用）。 */
 async function snapshotOverlay(req: APIRequestContext): Promise<{ year: string; study: string; overlay: unknown }> {
-  const r = await req.get(`/api/annotation?year=${YEAR}&study=${STUDY}`);
+  const r = await req.get(annUrl(YEAR, STUDY, REVIEWER));
   const d = await r.json();
   return { year: YEAR, study: STUDY, overlay: d.overlay ?? null };
 }
 
 async function restoreOverlay(req: APIRequestContext, snap: { overlay: unknown }): Promise<void> {
-  await req.delete(`/api/annotation?year=${YEAR}&study=${STUDY}`);
+  await req.delete(annUrl(YEAR, STUDY, REVIEWER));
   const entries = (snap.overlay as { entries?: unknown[] } | null)?.entries ?? [];
   if (entries.length) {
-    await req.post(`/api/annotation?year=${YEAR}&study=${STUDY}`, { data: { entries } });
+    await req.post(annUrl(YEAR, STUDY, REVIEWER), { data: { reviewer: REVIEWER, entries } });
   }
+}
+
+/** 在界面上设定核对人（多人核对的必填项；不设则提交会被服务端拒绝）。 */
+async function signIn(page: Page): Promise<void> {
+  const box = page.locator('[data-testid="reviewer-input"]');
+  await box.fill(REVIEWER);
+  await box.press('Enter');
+  await expect(box).toHaveValue(REVIEWER);
 }
 
 /** 等在 PDF 上画出可交互的页（惰性渲染完成）。 */
@@ -121,6 +140,7 @@ test.describe('前端交互（真实浏览器）', () => {
   test('标注模式：框选写入字段证据 → 落盘 → 回滚', async ({ page, request }) => {
     await page.goto('/');
     await waitForPdf(page);
+    await signIn(page);
 
     // 进入标注模式（点某个字段的「框选证据」）
     await page.locator('[data-field="title"] button:has-text("框选证据")').click();
@@ -130,7 +150,7 @@ test.describe('前端交互（真实浏览器）', () => {
 
     // 落盘校验：覆盖层里出现 title，且带 bbox
     await expect.poll(async () => {
-      const d = await (await request.get(`/api/annotation?year=${YEAR}&study=${STUDY}`)).json();
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
       const e = (d.overlay?.entries ?? []).find((x: { fieldPath: string }) => x.fieldPath === 'title');
       return e?.value?.evidence?.[0]?.bbox ? 'ok' : 'no';
     }).toBe('ok');
@@ -138,7 +158,7 @@ test.describe('前端交互（真实浏览器）', () => {
     // 回滚 → 覆盖层里的 title 消失，界面回到流水线值
     await page.locator('[data-field="title"] button:has-text("回滚")').click();
     await expect.poll(async () => {
-      const d = await (await request.get(`/api/annotation?year=${YEAR}&study=${STUDY}`)).json();
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
       return (d.overlay?.entries ?? []).some((x: { fieldPath: string }) => x.fieldPath === 'title');
     }).toBe(false);
   });
@@ -146,6 +166,7 @@ test.describe('前端交互（真实浏览器）', () => {
   test('编辑字段 → 记为人工修改 → 回滚', async ({ page, request }) => {
     await page.goto('/');
     await waitForPdf(page);
+    await signIn(page);
     const row = page.locator('[data-field="condition"]');
     await row.locator('button:has-text("编辑")').click();
     const original = (await row.locator('div').first().innerText()).trim();
@@ -154,14 +175,14 @@ test.describe('前端交互（真实浏览器）', () => {
     await expect(page.getByText(/已(修改|补录) condition/)).toBeVisible();
 
     await expect.poll(async () => {
-      const d = await (await request.get(`/api/annotation?year=${YEAR}&study=${STUDY}`)).json();
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
       const e = (d.overlay?.entries ?? []).find((x: { fieldPath: string }) => x.fieldPath === 'condition');
       return e?.value?.raw ?? '';
     }).toBe('E2E 测试值');
 
     await page.locator('[data-field="condition"] button:has-text("回滚")').click();
     await expect.poll(async () => {
-      const d = await (await request.get(`/api/annotation?year=${YEAR}&study=${STUDY}`)).json();
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
       return (d.overlay?.entries ?? []).some((x: { fieldPath: string }) => x.fieldPath === 'condition');
     }).toBe(false);
     expect(original.length).toBeGreaterThan(0);
@@ -209,6 +230,7 @@ test.describe('前端交互（真实浏览器）', () => {
 
     await page.goto('/');
     await waitForPdf(page);
+    await signIn(page);
     await page.locator('[data-tab="sheet3"]').click();
     const before = fields.sheets.sheet3.rows.length;
 
@@ -220,6 +242,53 @@ test.describe('前端交互（真实浏览器）', () => {
     expect(after.sheets.sheet3.rows.length).toBe(before + 1);
     expect(after.sheets.sheet3.rows.at(-1).fields.some((f: { fieldPath: string }) =>
       f.fieldPath === `outcomes.${before}.outcome.name`)).toBe(true);
+  });
+
+  test('多人机核对：两人分歧时不生效（保留机器值），一致后才生效', async ({ page, request }) => {
+    const A = 'e2e-a';
+    const B = 'e2e-b';
+    const post = (reviewer: string, raw: string) => request.post(annUrl(YEAR, STUDY, reviewer), {
+      data: {
+        reviewer,
+        entry: { fieldPath: 'condition', action: 'override', value: { raw, provenance: 'human', confidence: 1 } },
+      },
+    });
+    const fieldsOf = async (): Promise<{ fieldPath: string; raw: string }[]> =>
+      (await (await request.get(`/api/fields?year=${YEAR}&study=${STUDY}`)).json())
+        .groups.flatMap((g: { fields?: { fieldPath: string; raw: string }[] }) => g.fields ?? []);
+    const condRaw = async () => (await fieldsOf()).find((f) => f.fieldPath === 'condition')?.raw ?? '';
+
+    try {
+      await page.goto('/');
+      const machine = await condRaw();
+      expect(machine.length).toBeGreaterThan(0);
+
+      // 两位核对人给出不同结论 → 分歧
+      await post(A, 'E2E-甲');
+      await post(B, 'E2E-乙');
+      const disputed = await (await request.get(annUrl(YEAR, STUDY, A))).json();
+      expect(disputed.consensus.stats.disputed).toBe(1);
+      expect(disputed.consensus.disputed[0].fieldPath).toBe('condition');
+      // 关键语义：分歧**不替人裁决**，字段视图仍是机器原值
+      expect(await condRaw()).toBe(machine);
+
+      // 界面上标出分歧
+      await page.reload();
+      await expect(page.locator('[data-testid="review-toggle"]')).toContainText('分歧 1');
+
+      // 两人改成同一结论 → 生效，且两两一致率为 1
+      await post(B, 'E2E-甲');
+      const agreed = await (await request.get(annUrl(YEAR, STUDY, A))).json();
+      expect(agreed.consensus.stats.agreed).toBe(1);
+      const pair = agreed.consensus.pairwise.find(
+        (p: { reviewerA: string; reviewerB: string }) => p.reviewerA === A && p.reviewerB === B,
+      );
+      expect(pair?.rate).toBe(1);
+      await expect.poll(condRaw).toBe('E2E-甲');
+    } finally {
+      await request.delete(annUrl(YEAR, STUDY, A));
+      await request.delete(annUrl(YEAR, STUDY, B));
+    }
   });
 
   test('设置对话框：显示掩码密钥并可测试连通性', async ({ page }) => {

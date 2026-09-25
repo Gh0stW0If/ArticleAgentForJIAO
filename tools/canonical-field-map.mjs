@@ -13,7 +13,7 @@ export const ARTICLE_FIELDS = [
   { key: 'literatureNo', label: '文献编号', comment: 'B2', source: 'gold_meta', desc: '金标准内部编号。英文文献形如 EN001，中文文献形如 CH001。由数据集分配，不由 LLM 推断。' },
   { key: 'extractor', label: '提取人姓名', source: 'gold_meta', desc: '提取执行人。由流程记录，不由 LLM 推断。' },
   { key: 'outliersInfluential', label: 'outliers and influential observations', comment: 'D1', source: 'comments', codes: { '1': 'overall', '2': 'pain', '3': 'non-pain', '4': 'function', '0': 'no OI' }, desc: '该研究属于哪一类分析对象（整体/疼痛/非疼痛/功能/无重要结局）。' },
-  { key: 'eligibilityCheck', label: '复核合格标准', source: 'gold_meta', desc: '复核结论。由复核流程填写，不由 LLM 抽取。' },
+  // ~~eligibilityCheck（复核合格标准，Sheet1 F 列）~~ —— 已按 202609 规则退役，见 RETIRED_FIELDS。
 
   // ---- 文献计量 ----
   { key: 'title', label: '题目', source: 'llm', desc: '论文标题，照抄原文（含副标题）。不要翻译、不要改标点。' },
@@ -98,7 +98,7 @@ export const COMPARISON_FIELDS = [
   { key: 'frequencyDesc', label: '治疗频次描述（标明单位）', comment: 'AT2', source: 'llm', desc: '治疗频次的原文描述，如 one per week。未报告填 NR。' },
   { key: 'frequencyValue', label: '治疗频次数值', comment: 'AU2', source: 'llm', desc: '频次数值（如 2~3 填 2~3）。' },
   { key: 'frequencyUnit', label: '治疗频次单位', comment: 'AV2', source: 'llm', codes: { '1': '天', '2': '周', '3': '1小时' }, desc: '频次的时间单位。' },
-  { key: 'frequencyClass', label: '治疗频次分类', comment: 'AW2', source: 'llm', codes: { '1': '低频次', '2': '高频次' }, desc: '频次的低级/高级归类。' },
+  // ~~frequencyClass（治疗频次分类，Sheet1 AW 列）~~ —— 已按 202609 规则退役，见 RETIRED_FIELDS。
   { key: 'courseDesc', label: '疗程', comment: 'AX2', source: 'llm', desc: '疗程原文描述，如 9 weeks。未报告填 NR。' },
   { key: 'courseValue', label: '疗程数值', comment: 'AY2', source: 'llm', desc: '疗程数值。' },
   { key: 'courseUnit', label: '疗程单位', comment: 'AZ2', source: 'llm', codes: { '1': '天', '2': '周' }, desc: '疗程的时间单位。' },
@@ -168,9 +168,9 @@ export const COMPARISON_FIELDS = [
   { key: 'baselineCatExperimentalPos', label: '试验组基线值（+）', source: 'llm', desc: '基线连续变量在试验组的另一侧取值（列标题「试验组+」）。若原文只有一个数值，本列省略或填 NA。' },
   { key: 'baselineCatControlNeg', label: '对照组基线值（-）', source: 'llm', desc: '基线连续变量（如年龄）在对照组的取值。未报告填 NR。' },
   { key: 'baselineCatControlPos', label: '对照组基线值（+）', source: 'llm', desc: '基线连续变量在对照组的另一侧取值（列标题「对照组+」）。只有一个数值时省略或填 NA。' },
-  { key: 'needleRetentionClass', label: '留针时间分类', source: 'llm', codes: { '1': '手术+非穴位按压', '2': '慢性病+非穴位按压' }, desc: '留针时间的分类编码（取表格批注给出的取值表）。' },
-  { key: 'totalSessionsClassA', label: '治疗总次数分类 A', source: 'llm', codes: { '1': '手术+穴位按压', '2': '手术+非穴位按压', '3': '慢性+穴位按压', '4': '慢性+非穴位按压' }, desc: '治疗总次数的分类编码 A（急性/手术 vs 慢性 × 是否穴位按压）。' },
-  { key: 'totalSessionsClassB', label: '治疗总次数分类 B', source: 'llm', desc: '治疗总次数的分类编码 B。该列在原始表格里没有对应批注，按原文可判定的分类填写；无法判定填 NR。' },
+  // ~~needleRetentionClass（留针时间分类，Sheet1 BK 列）~~、
+  // ~~totalSessionsClassA / totalSessionsClassB（治疗总次数分类，Sheet1 BB/BC 列）~~
+  // —— 三个 *_class 字段已按 202609 规则退役，见 RETIRED_FIELDS。
 ];
 
 /** Sheet2 的文章级结局分类（值为描述文本）。 */
@@ -196,7 +196,7 @@ export const STUDY_OUTCOME_FIELDS = [
 export const OUTCOME_TOP_FIELDS = [
   { key: 'literatureCode', label: '文献编号(带结局序号)', code: 'STUDYID', source: 'gold_meta', desc: '形如 EN009-1 的文献编号+结局序号。由编号规则推导，不从 PDF 抽取（PDF 里根本不存在该编号）。' },
   { key: 'armNumber', label: '研究组别的数量', code: 'ARMNU', source: 'gold_meta', codes: { '1': '双臂', '2': '多臂', '3': '多试验组', '4': '多对照组' }, desc: '本研究涉及的组别结构。**由比较组数量确定性推导**（1 个比较组=双臂，≥2 个=多臂），不由模型推断。' },
-  { key: 'specialDataFlag', label: '特殊数据情况', code: 'STDATA', comment: 'E1', source: 'llm', codes: { '1': '无法确定数据', '2': '等级资料 无法转化二分类', '3': '等级转二分类', '4': '排除' }, desc: '该结局数据的特殊处理情况。' },
+  // ~~specialDataFlag（特殊数据情况，Sheet3 E 列）~~ —— 已按 202609 规则退役，见 RETIRED_FIELDS。
   { key: 'construct', label: 'construct', code: 'CONST', comment: 'F1', source: 'llm', codes: { '1': 'Pains', '2': 'Other symptoms excluding pains', '3': 'Functions', '4': 'Quality of Life', '5': 'Major events', '6': 'primary outcomes' }, desc: '结局所属的 construct 大类。' },
   {
     key: 'subconstruct', label: 'subconstruct', code: 'SUBCONST', comment: 'G1', source: 'llm',
@@ -281,6 +281,36 @@ export const TIMEPOINT_FIELDS = [
   { key: 'cat4Control', source: 'llm', desc: '【等级资料】对照组第 4 等级人数。' },
   { key: 'cat5Control', source: 'llm', desc: '【等级资料】对照组第 5 等级人数。' },
   { key: 'cat6Control', source: 'llm', desc: '【等级资料】对照组第 6 等级人数。' },
+];
+
+/**
+ * ===== 已退役字段（202609 规则）=====
+ *
+ * 来源：`Datas/design/文章计划 整理 202609/03 第一篇 第一次提取excel的3个sheet3说明.docx`
+ * 的「规则类别归并」：
+ *
+ *   - Sheet1：删除（5 列）E、F、AW、BB、BC；另 AW / BB / BC / **BK** 在逐行表格里标注
+ *     「不要了 / 删除」。逐行表格给 6 列，汇总列表写 5 列（漏掉 BK）——
+ *     实测口径以逐行表格为准，**6 列全删**（已与需求方确认）。
+ *   - Sheet3：删除 E（特殊数据情况）、R（结局特殊类别）。
+ *
+ * 退役的含义：**既不再抽取，也不参与评测**。
+ *   1. 不在这里的字段清单里 → 提示词不会要求模型输出（prompt_gen 只认上面的数组）；
+ *   2. `tools/gold_schema.mjs` 同步删除对应金标准字段 → 评测不再把它们计入分母。
+ * 否则「金标准里有、我们不再抽」会被判成漏抽，白白拉低准确率。
+ *
+ * ⚠️ 原始表格 `Datas/label/*.xlsx` 里的这些列**依然存在**，我们不改数据；
+ * 只是提取与评分不再覆盖它们。列字母为 2015–2019 版布局（2020 起整体左移一列）。
+ */
+export const RETIRED_FIELDS = [
+  { sheet: 'Sheet1', col: 'E', key: '(construct)', label: 'construct', reason: '规则明列删除；原本即未收录进金标准字段' },
+  { sheet: 'Sheet1', col: 'F', key: 'eligibilityCheck', label: '复核合格标准', reason: '规则明列删除（原为 gold_meta，不由模型抽取）' },
+  { sheet: 'Sheet1', col: 'AW', key: 'frequencyClass', label: '治疗频次分类', reason: '规则标「不要了」' },
+  { sheet: 'Sheet1', col: 'BB', key: 'totalSessionsClassA', label: '治疗总次数治疗分类', reason: '规则标「不要了」' },
+  { sheet: 'Sheet1', col: 'BC', key: 'totalSessionsClassB', label: '治疗总次数分类', reason: '规则标「不要了」（且该列无编码表，实测整列 0%）' },
+  { sheet: 'Sheet1', col: 'BK', key: 'needleRetentionClass', label: '留针时间分类', reason: '逐行表格标「不要了」；汇总列表漏计，已确认按逐行执行' },
+  { sheet: 'Sheet3', col: 'E', key: 'specialDataFlag', label: '特殊数据情况', reason: '规则明列删除' },
+  { sheet: 'Sheet3', col: 'R', key: 'specialCategory', label: '结局特殊类别', reason: '规则明列删除；原本只在金标准里、未抽取' },
 ];
 
 /** LLM 不负责的字段来源说明。 */
