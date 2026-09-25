@@ -22,7 +22,7 @@ Web/桌面端具备人工覆盖层（`add` / `override` / `confirm`，不改写�
 
 ## 本分支新增（`feat/202609-prune-and-review-records`）
 
-按 202609 的新要求做了三件事：
+按 202609 的新要求做了这些事：
 
 - **提取项目删减** —— 按列规则退役 6 个 Sheet1 列（E/F/AW/BB/BC/BK）与 2 个 Sheet3 列（E/R）
   对应的字段，**抽取与评测同步移除**（只删抽取会让这些列被判成「漏抽」，白掉准确率）。
@@ -31,11 +31,22 @@ Web/桌面端具备人工覆盖层（`add` / `override` / `confirm`，不改写�
   （`build/annotations/<year>/<study>.<reviewer>.json`），支持多人独立盲评；
   逐字段给出「一致 / 分歧 / 仅一人 / 未核对」四态，
   **有分歧的字段不替人取值**（保留机器原值并标出），等第三方仲裁。
-- **导出人工核对结果** —— 界面右上「导出 XLSX / 导出 CSV」两个按钮。
+- **导出人工核对结果** —— 「导出 XLSX / 导出 CSV」。
   XLSX 含 4 个工作表（`核对汇总` + `Sheet1/2/3`）：每个字段一行、每位核对人三列（值/动作/备注）、
   **有分歧的行整行标红**；CSV 列结构相同、带 UTF-8 BOM 供 Excel/AI 读。
-  零依赖自写 ZIP + OOXML（`tools/lib/zipwrite.mjs` / `xlsxwrite.mjs`），
-  接口 `GET /api/export?year=&study=&format=xlsx|csv`。
+- **批量导出** —— 「批量 ▾」菜单：整年 / 全部年份。批量时每行多带 `年份`/`研究` 两列，
+  缺抽取产物的篇目跳过并计数。
+- **导回** —— 医生改完的表格传回来即可写回标注。**默认 dry-run 先给差异预览**，
+  显式确认才落盘；只增改默认不删；动作由「值 vs 机器值」现算而不是信文件里的过期快照；
+  每次导回落一份批次快照（`build/review-batches/`）供追溯。
+- **两组结果对比** —— 任选两组（机器 / 各位核对人 / 导入批次）逐字段并排，
+  四态 `一致 / 不同 / 仅 A 有 / 仅 B 有`；
+  「没表态」不算「一致」，一致率只在两组都表过态的字段上算。
+
+导出用零依赖自写 ZIP + OOXML（`tools/lib/zipwrite.mjs` / `xlsxwrite.mjs`），
+导回解析与差异计算在 `tools/import_review.mjs`（纯逻辑，可单测）。
+
+接口：`GET /api/export` · `POST /api/import-review` · `GET /api/review-sets` · `GET /api/compare`。
 
 详见 `docs/26-202609-字段删减与多人核对.md`。
 

@@ -11,6 +11,10 @@
  *   POST /api/annotation                     写入某核对人的标注（reviewer 必填）
  *   DELETE /api/annotation                   删某核对人的某字段 / 整份记录
  *   GET  /api/export?year&study&format=      导出人工核对结果（xlsx / csv）
+ *                                             给 year 不带 study = 整年；scope=all = 全部年份
+ *   POST /api/import-review?reviewer=         把改过的表导回（默认 dry-run，apply=1 才落盘）
+ *   GET  /api/review-sets?year&study          可比较的结果集目录（机器 / 核对人 / 导入批次）
+ *   GET  /api/compare?year&study&a=&b=        两组结果逐字段对比
  *   POST /api/import                         导入 PDF
  *   POST /api/parse | /api/extract           后台任务（MinerU 解析 / LLM 抽取）
  *   GET  /api/jobs                           任务状态与日志尾部
@@ -30,11 +34,12 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   studiesFromPdfNames,
-  buildConsensus, consensusStats, pairwiseAgreement, reviewerSummaries,
+  buildConsensus, consensusStats, pairwiseAgreement, reviewerSummaries, reviewerOf,
   LEGACY_REVIEWER,
 } from '../../packages/core/dist/index.js';
 import { buildReviewExport, csvBuffer, exportFileName } from '../../tools/export_review.mjs';
 import { buildXlsx } from '../../tools/lib/xlsxwrite.mjs';
+import { readReviewTables, planImport, studyPairs } from '../../tools/import_review.mjs';
 
 const ROOT = resolve(process.env.AA_ROOT ?? process.cwd());
 const PORT = Number(process.env.AA_PORT ?? 43130);
@@ -71,6 +76,13 @@ const DIRS = {
    *   - 便于计算人工修正率（评估 LLM 质量的关键指标）
    */
   annotations: join(ROOT, 'build', 'annotations'),
+  /**
+   * 导回批次快照。
+   *
+   * 每导回一次留一份「这一批改了哪些字段、从什么改成什么」。
+   * 用途有二：① 可追溯（谁在哪一批改的）；② 当「两组结果对比」里的一组。
+   */
+  batches: join(ROOT, 'build', 'review-batches'),
   /**
    * 用户导入的 PDF。
    *
@@ -242,6 +254,208 @@ function reviewSummary(year, study) {
       pairwise: pairwiseAgreement(overlays),
     },
   };
+}
+
+/* ------------------------------ 导回与结果集 ------------------------------ */
+
+/*
+ * 批次 id 的净化：保留中文（核对人名字要能认出来），去掉路径分隔符与 `..`。
+ * 读写两侧**必须用同一个函数**，否则写进去的文件名读不回来。
+ */
+const safeBatchId = (id) => String(id ?? '')
+  .replace(/\.\./g, '_')
+  .replace(/[^\w.\-\u4e00-\u9fa5]/g, '_')
+  .slice(0, 120);
+
+/** 读一个导回批次快照（文件名 = 批次 id）。 */
+function readBatch(id) {
+  const safe = safeBatchId(id);
+  if (!safe) return null;
+  const p = join(DIRS.batches, `${safe}.json`);
+  if (!existsSync(p)) return null;
+  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+/** 列出导回批次（可按研究过滤），新的在前。 */
+function listBatches(year, study) {
+  if (!existsSync(DIRS.batches)) return [];
+  const out = [];
+  for (const f of readdirSync(DIRS.batches)) {
+    if (!f.endsWith('.json')) continue;
+    const b = readBatch(f.replace(/\.json$/, ''));
+    if (!b) continue;
+    if (year && study && !(b.changes ?? []).some((c) => c.year === year && c.study === study)) continue;
+    out.push(b);
+  }
+  return out.sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? '')));
+}
+
+/**
+ * 把导回的差异落到覆盖层，并留一份批次快照。
+ *
+ * ⚠️ 这是整个程序里**第二处会改写人工记录**的地方（另一处是 /api/annotation 的单条标注）。
+ * 两处都只写覆盖层、绝不碰流水线产物。
+ *
+ * 保留原证据：值被改了，但之前框选的 bbox/quote 仍然有意义，不清掉。
+ */
+function applyReviewImport({ reviewer, changes, cleared, meta }) {
+  /** (year/study) → { entries: Map<fieldPath, rec>, removed: string[] } */
+  const byStudy = new Map();
+  const slot = (year, study) => {
+    const k = `${year}/${study}`;
+    if (!byStudy.has(k)) byStudy.set(k, { year, study, entries: new Map(), removed: [] });
+    return byStudy.get(k);
+  };
+
+  for (const c of changes) {
+    const g = slot(c.year, c.study);
+    const prev = g.entries.get(c.fieldPath);
+    g.entries.set(c.fieldPath, {
+      fieldPath: c.fieldPath,
+      action: c.action,
+      // 证据留空数组占位；若该字段原先有证据，下面合并时保留
+      value: { raw: c.raw, evidence: prev?.value?.evidence ?? [], provenance: 'human', confidence: 1 },
+      ...(c.note ? { note: c.note } : {}),
+    });
+  }
+  for (const c of cleared) slot(c.year, c.study).removed.push(c.fieldPath);
+
+  const touched = [];
+  for (const g of byStudy.values()) {
+    const ov = readAnnotation(g.year, g.study, reviewer) ?? {
+      schemaVersion: 'AA_ANNOTATION/2.0',
+      year: g.year,
+      articleId: studyKey(g.study),
+      sourcePdf: `Datas/articles/${g.year}/${studyKey(g.study)}.pdf`,
+      reviewer,
+      entries: [],
+      updatedAt: new Date().toISOString(),
+    };
+    const prevByPath = new Map((ov.entries ?? []).map((e) => [e.fieldPath, e]));
+    const now = new Date().toISOString();
+
+    for (const [fp, rec] of g.entries) {
+      const prev = prevByPath.get(fp);
+      const evidence = rec.value.evidence.length ? rec.value.evidence : (prev?.value?.evidence ?? []);
+      const full = { ...rec, value: { ...rec.value, evidence }, author: reviewer, updatedAt: now };
+      const i = ov.entries.findIndex((x) => x.fieldPath === fp);
+      if (i >= 0) ov.entries[i] = full; else ov.entries.push(full);
+    }
+    if (g.removed.length) {
+      const gone = new Set(g.removed);
+      ov.entries = ov.entries.filter((x) => !gone.has(x.fieldPath));
+    }
+
+    ov.updatedAt = now;
+    if (ov.entries.length) writeAnnotation(g.year, g.study, reviewer, ov);
+    else {
+      const p = reviewerAnnotationPath(g.year, g.study, reviewer);
+      if (existsSync(p)) rmSync(p, { force: true });
+    }
+    touched.push({ year: g.year, study: g.study, written: g.entries.size, removed: g.removed.length });
+  }
+
+  // 批次快照
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
+  mkdirSync(DIRS.batches, { recursive: true });
+  /*
+   * id 精确到秒。同一秒内连导两次会撞名——而撞名 = 后一次**覆盖**前一次的快照，
+   * 等于悄悄丢掉一批记录（实测踩到：两次导入相隔 200ms）。这里加序数兜底。
+   */
+  const base = safeBatchId(`${stamp}-${reviewer}`);
+  let batchId = base;
+  for (let n = 2; existsSync(join(DIRS.batches, `${batchId}.json`)); n++) batchId = `${base}-${n}`;
+
+  const batch = {
+    id: batchId,
+    at: new Date().toISOString(),
+    reviewer,
+    ...(meta ?? {}),
+    changes: changes.map((c) => ({
+      year: c.year, study: c.study, fieldPath: c.fieldPath,
+      action: c.action, raw: c.raw, before: c.before ?? null,
+    })),
+    cleared: cleared.map((c) => ({
+      year: c.year, study: c.study, fieldPath: c.fieldPath, before: c.before ?? null,
+    })),
+    studies: touched,
+  };
+  writeFileSync(join(DIRS.batches, `${batch.id}.json`), JSON.stringify(batch, null, 2), 'utf8');
+
+  return { batchId: batch.id, applied: changes.length, retracted: cleared.length, studies: touched };
+}
+
+/* ---- 结果集：机器 / 某位核对人 / 某个导回批次 ---- */
+
+/** 字段路径 → 中文标签（比较表里要显示人看得懂的名字）。 */
+function labelIndex(groups) {
+  const m = new Map();
+  for (const g of groups ?? []) {
+    for (const f of g.fields ?? []) m.set(f.fieldPath, f.label ?? f.fieldPath);
+  }
+  return m;
+}
+
+/** 机器结果集：只收「机器真的产出了值」的字段（人工补录的不算机器值）。 */
+function machineSet(groups) {
+  const m = new Map();
+  for (const g of groups ?? []) {
+    for (const f of g.fields ?? []) {
+      const v = f.decidedBy === 'human' ? f.llmRaw : f.raw;
+      const s = v === undefined || v === null ? '' : String(v);
+      if (s !== '') m.set(f.fieldPath, { raw: s });
+    }
+  }
+  return m;
+}
+
+/** 核对人结果集：只收他**表过态**的字段。没表过态 ≠ 他认可机器值。 */
+function reviewerSet(year, study, name) {
+  const ov = readAnnotation(year, study, name);
+  const m = new Map();
+  for (const e of ov?.entries ?? []) m.set(e.fieldPath, { raw: String(e.value?.raw ?? '') });
+  return m;
+}
+
+/** 导回批次结果集：只含**该批改动过**的字段（不是当时的全量状态，标签里要写明）。 */
+function batchSet(year, study, id) {
+  const b = readBatch(id);
+  const m = new Map();
+  for (const c of b?.changes ?? []) {
+    if (c.year !== year || c.study !== study) continue;
+    m.set(c.fieldPath, { raw: String(c.raw ?? '') });
+  }
+  for (const c of b?.cleared ?? []) {
+    if (c.year !== year || c.study !== study) continue;
+    m.set(c.fieldPath, { raw: '（已撤回）' });
+  }
+  return m;
+}
+
+/** 可比较的结果集目录（前端下拉用）。 */
+function reviewSets(year, study) {
+  const out = [{ id: 'machine', label: '机器抽取', kind: 'machine', count: null }];
+  for (const ov of listAnnotations(year, study)) {
+    const r = reviewerOf(ov);
+    out.push({ id: `reviewer:${r}`, label: `核对人 · ${r}`, kind: 'reviewer', count: (ov.entries ?? []).length });
+  }
+  for (const b of listBatches(year, study)) {
+    out.push({
+      id: `batch:${b.id}`,
+      label: `导入批次 · ${b.reviewer}（${String(b.at ?? '').slice(0, 16).replace('T', ' ')}）`,
+      kind: 'batch',
+      count: (b.changes ?? []).length,
+    });
+  }
+  return out;
+}
+
+/** 解析结果集 id → Map<fieldPath, {raw}>。 */
+function resolveSet(id, year, study, groups) {
+  if (id === 'machine') return machineSet(groups);
+  if (id.startsWith('reviewer:')) return reviewerSet(year, study, id.slice('reviewer:'.length));
+  if (id.startsWith('batch:')) return batchSet(year, study, id.slice('batch:'.length));
+  return null;
 }
 
 /** 读取请求体（限制大小，防止误传大文件）。 */
@@ -458,6 +672,12 @@ function listStudies(year) {
   }
 
   return out.sort((a, b) => a.studyId.localeCompare(b.studyId));
+}
+
+/** 语料目录下有哪些年份（升序）。用于「全部年份」批量导出。 */
+function listYears() {
+  if (!existsSync(DIRS.articles)) return [];
+  return readdirSync(DIRS.articles).filter((d) => /^\d{4}$/.test(d)).sort();
 }
 
 /** 某研究对应的 PDF 绝对路径（语料优先，其次导入件）。 */
@@ -1153,36 +1373,69 @@ const server = createServer(async (req, res) => {
     /*
      * 导出人工核对结果（XLSX / CSV）。
      *
-     * 数据来源与界面**完全同一份**：buildFieldGroups（字段视图）+ reviewSummary（核对汇总）。
-     * 这样导出的内容必然与屏幕上看到的一致，不会出现"页面一个值、文件另一个值"。
+     * 三种范围：
+     *   ?study=2015-01    单篇（界面上单篇"导出"用它）
+     *   ?year=2015        该年份全部研究
+     *   ?scope=all        全部年份
      *
-     *   GET /api/export?year=2015&study=2015-01&format=xlsx
-     *   GET /api/export?year=2015&study=2015-01&format=csv
+     * 数据来源与界面**完全同一份**（buildFieldGroups），
+     * 所以导出的内容必然与屏幕上看到的一致，不会"页面一个值、文件另一个值"。
      */
     if (p === '/api/export') {
-      if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
       const format = (url.searchParams.get('format') ?? 'xlsx').toLowerCase();
       if (!['xlsx', 'csv'].includes(format)) {
         return json(res, 400, { error: `format 非法：${format}（只支持 xlsx / csv）` });
       }
 
-      const built = await buildFieldGroups(year, study);
-      if (!built.groups?.length) {
-        return json(res, 409, { error: built.warning ?? '该研究没有可导出的字段' });
+      const wantAll = (url.searchParams.get('scope') ?? '').toLowerCase() === 'all';
+      let targets;
+      let label;
+      if (study) {
+        if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
+        targets = [{ year, study }];
+        label = `${year}_${studyKey(study)}`;
+      } else if (wantAll) {
+        targets = listYears().flatMap((y) => listStudies(y).map((s) => ({ year: y, study: s.studyId })));
+        label = '全部年份';
+      } else if (okYear(year)) {
+        const list = listStudies(year);
+        if (!list.length) return json(res, 409, { error: `${year} 下没有研究` });
+        targets = list.map((s) => ({ year, study: s.studyId }));
+        label = `${year}_全部`;
+      } else {
+        return json(res, 400, { error: '请给 study、year 或 scope=all' });
+      }
+      if (!targets.length) return json(res, 409, { error: '没有可导出的研究' });
+
+      /*
+       * 逐篇组装。缺抽取产物的篇目**跳过并计数**，而不是让整次导出失败——
+       * 批量导出的场景下，一篇没有产物不该拖住另外两百篇。
+       */
+      const subjects = [];
+      const skipped = [];
+      for (const t of targets) {
+        const built = await buildFieldGroups(t.year, t.study);
+        if (!built.groups?.length) { skipped.push(`${t.year}/${t.study}`); continue; }
+        subjects.push({
+          year: t.year,
+          study: t.study,
+          groups: built.groups,
+          order: built.sheets?.order,
+          headerOf: built.sheets?.headerOf,
+        });
+      }
+      if (!subjects.length) {
+        return json(res, 409, {
+          error: `没有可导出的字段（${skipped.length} 篇缺抽取产物，先跑 pnpm llm:run）`,
+        });
       }
 
-      const summary = reviewSummary(year, study);
       const { sheets, csv } = buildReviewExport({
-        year,
-        study,
-        groups: built.groups,
-        order: built.sheets?.order,
-        headerOf: built.sheets?.headerOf,
-        reviewers: summary.reviewers.map((r) => r.reviewer),
-        summary,
+        label: `${label}${skipped.length ? `（${skipped.length} 篇无产物已跳过）` : ''}`,
+        subjects,
       });
 
-      const name = exportFileName(year, study, format);
+      const name = exportFileName(label, format);
       const bytes = format === 'csv' ? csvBuffer(csv) : buildXlsx(sheets);
       res.writeHead(200, {
         'content-type': format === 'csv'
@@ -1195,6 +1448,171 @@ const server = createServer(async (req, res) => {
           `attachment; filename="review-export.${format}"; filename*=UTF-8''${encodeURIComponent(name)}`,
       });
       return res.end(bytes);
+    }
+
+    /* ------------------------------ 导回人工结果 ------------------------------ */
+    /*
+     * POST /api/import-review?reviewer=X[&apply=1][&retractCleared=1]
+     * body = 导出的 xlsx / csv 原始字节（`x-file-name` 可选，仅用于回显）
+     *
+     * **两段式**：默认 dry-run，只回差异供人确认；真要落盘必须显式 `apply=1`。
+     * 能覆盖人工成果的功能，默认值就该是"不发生"。
+     */
+    if (p === '/api/import-review' && req.method === 'POST') {
+      const reviewer = safeReviewer(url.searchParams.get('reviewer'));
+      if (!reviewer) return json(res, 400, { error: '缺少或非法的 reviewer（1–40 位中英文/数字/. - _）' });
+      const apply = url.searchParams.get('apply') === '1';
+      const retractCleared = url.searchParams.get('retractCleared') === '1';
+
+      let bytes;
+      try { bytes = await readBinary(req, 64 * 1024 * 1024); }
+      catch (e) { return json(res, 400, { error: `读取上传内容失败：${e.message}` }); }
+      if (!bytes.length) return json(res, 400, { error: '上传内容为空' });
+
+      // 认格式：xlsx 本质是 ZIP（PK 头），其余按 CSV
+      const kind = bytes.subarray(0, 2).toString('latin1') === 'PK' ? 'xlsx' : 'csv';
+
+      let tables;
+      try { tables = readReviewTables(bytes, kind); }
+      catch (e) { return json(res, 400, { error: `解析失败：${e.message}` }); }
+      if (!tables.length) {
+        return json(res, 400, {
+          error: '文件里没有可识别的数据表（需要导出生成的那三张表，含 年份/研究/fieldPath 列）',
+        });
+      }
+
+      /*
+       * 只给**文件里出现过**的研究建字段索引——
+       * 全部年份的批量文件有两百多篇，全量建索引会白读几百兆 JSON。
+       */
+      const index = new Map();
+      for (const pair of studyPairs(tables)) {
+        const [y, s] = pair.split('/');
+        if (!okYear(y) || !okStudy(s)) continue;
+        const built = await buildFieldGroups(y, s);
+        const ov = readAnnotation(y, s, reviewer);
+        const existing = new Map((ov?.entries ?? []).map((e) => [e.fieldPath, e]));
+
+        for (const g of built.groups ?? []) {
+          for (const f of g.fields ?? []) {
+            // 机器值：人工已改过时取 LLM 原值；空串即"机器本来没有"
+            const machineRaw = f.decidedBy === 'human' ? (f.llmRaw ?? '') : (f.raw ?? '');
+            const cur = existing.get(f.fieldPath);
+            index.set(`${y}/${s}::${f.fieldPath}`, {
+              machineRaw,
+              hasMachine: machineRaw !== '',
+              ...(cur ? {
+                existing: {
+                  raw: String(cur.value?.raw ?? ''),
+                  action: cur.action,
+                  ...(cur.note ? { note: cur.note } : {}),
+                },
+              } : {}),
+            });
+          }
+        }
+        // 覆盖层里有、字段视图里没有的（人工补录的行）也要能导回
+        for (const [fp, e] of existing) {
+          const key = `${y}/${s}::${fp}`;
+          if (index.has(key)) continue;
+          index.set(key, {
+            machineRaw: '',
+            hasMachine: false,
+            existing: { raw: String(e.value?.raw ?? ''), action: e.action, ...(e.note ? { note: e.note } : {}) },
+          });
+        }
+      }
+
+      const plan = planImport({ tables, reviewer, index, retractCleared });
+      const stats = {
+        rows: plan.seen,
+        changes: plan.changes.length,
+        unchanged: plan.unchanged,
+        cleared: plan.cleared.length,
+        errors: plan.errors.length,
+      };
+
+      if (!apply) {
+        return json(res, 200, {
+          dryRun: true, kind, reviewer, stats,
+          changes: plan.changes.slice(0, 300),
+          cleared: plan.cleared.slice(0, 100),
+          errors: plan.errors.slice(0, 100),
+          truncated: plan.changes.length > 300 || plan.errors.length > 100,
+        });
+      }
+
+      if (!plan.changes.length && !plan.cleared.length) {
+        return json(res, 200, {
+          ok: true, kind, reviewer, applied: 0, retracted: 0, batchId: null,
+          stats, errors: plan.errors.slice(0, 100),
+        });
+      }
+
+      const fname = req.headers['x-file-name']
+        ? decodeURIComponent(String(req.headers['x-file-name'])) : '';
+      const result = applyReviewImport({
+        reviewer,
+        changes: plan.changes,
+        cleared: plan.cleared,
+        meta: { kind, ...(fname ? { file: fname } : {}), stats },
+      });
+      return json(res, 200, { ok: true, kind, reviewer, ...result, stats, errors: plan.errors.slice(0, 100) });
+    }
+
+    /* ------------------------------ 结果集与两组对比 ------------------------------ */
+    if (p === '/api/review-sets') {
+      if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
+      return json(res, 200, { year, study, sets: reviewSets(year, study) });
+    }
+
+    /*
+     *   GET /api/compare?year=2019&study=2019-01&a=machine&b=reviewer:评审A
+     *
+     * 某一组没有的字段**不算"两边相同"**，单独计 onlyA / onlyB——
+     * 「没表态」和「表态说一样」是两件事。
+     */
+    if (p === '/api/compare') {
+      if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
+      const aId = url.searchParams.get('a') ?? 'machine';
+      const bId = url.searchParams.get('b') ?? '';
+      if (!bId) return json(res, 400, { error: '请给 a 与 b 两个结果集' });
+
+      const built = await buildFieldGroups(year, study);
+      if (!built.groups?.length) return json(res, 409, { error: built.warning ?? '该研究没有可比较的字段' });
+
+      const A = resolveSet(aId, year, study, built.groups);
+      const B = resolveSet(bId, year, study, built.groups);
+      if (!A) return json(res, 400, { error: `未知的结果集：${aId}` });
+      if (!B) return json(res, 400, { error: `未知的结果集：${bId}` });
+
+      const labels = labelIndex(built.groups);
+      const rows = [];
+      for (const fp of [...new Set([...A.keys(), ...B.keys()])].sort()) {
+        const av = A.get(fp);
+        const bv = B.get(fp);
+        rows.push({
+          fieldPath: fp,
+          label: labels.get(fp) ?? fp,
+          a: av?.raw ?? null,
+          b: bv?.raw ?? null,
+          status: av && bv ? (av.raw === bv.raw ? 'same' : 'diff') : (av ? 'only-a' : 'only-b'),
+        });
+      }
+      const count = (s) => rows.filter((r) => r.status === s).length;
+      const same = count('same');
+      const diff = count('diff');
+      return json(res, 200, {
+        year, study, a: aId, b: bId,
+        sets: reviewSets(year, study),
+        stats: {
+          total: rows.length, same, diff,
+          onlyA: count('only-a'), onlyB: count('only-b'),
+          // 一致率只在「两边都表过态」的字段上算——没表态的不该拉低它
+          rate: same + diff ? same / (same + diff) : null,
+        },
+        rows,
+      });
     }
 
     /* ------------------------------ 设置（API 配置） ------------------------------ */

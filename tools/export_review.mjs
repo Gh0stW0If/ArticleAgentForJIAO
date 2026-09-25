@@ -6,11 +6,19 @@
  *   · XLSX —— 给人看：每个字段一行，每位核对人三列（值 / 动作 / 备注），有分歧的行标红
  *   · CSV  —— 给程序/AI 读：三张表拼成一张，首列 `工作表` 区分
  *
+ * 支持**单篇**与**批量**（一个年份 / 全部年份）：批量时每行多带 `年份` / `研究` 两列，
+ * 方便在 Excel 里筛选与透视。
+ *
  * 设计取舍：
  *  1. **一位核对人三列**，不是一人一列拼字符串——机器要能按列取值，人也一眼看得清。
  *  2. **列结构两种格式保持一致**：同一份数据换个壳，比对与 diff 才不会打架。
  *  3. 只做"摊平"，不重新取数：输入就是服务端已经算好的字段视图（groups/order/headerOf），
  *     因此导出的内容**必然与界面上看到的一致**，不会出现"页面一个值、文件另一个值"。
+ *  4. **汇总自己算**，不依赖外部传进来的 summary——批量导出时没有单篇 summary 可用，
+ *     而这里本来就走过了每个字段，顺手统计比再传一份口径更不容易对不上。
+ *
+ * ⚠️ 「导回」功能（`tools/import_review.mjs`）读的就是本文件产出的列名。
+ *    改列名 = 破坏已发出的文件的可导回性，**必须同步改那边的表头常量**。
  */
 
 /** 动作 → 中文。 */
@@ -24,10 +32,20 @@ const STATUS_ZH = {
   'machine-only': '未核对',
 };
 
-/** 三张数据表的列（不含核对人部分）。 */
-const HEAD_BASE = ['工作表', '所在行', '字段', '原始列', 'fieldPath', '机器值', '机器证据'];
-const HEAD_TAIL = ['核对状态', '采用值', '是否改动'];
-const REVIEW_HEAD = (r) => [`${r} · 值`, `${r} · 动作`, `${r} · 备注`];
+/*
+ * ===== 列定义（导回侧按这些**表头文字**定位，见 tools/import_review.mjs）=====
+ *
+ * ⚠️ 不要随手改这里的字符串：已经发出去的文件就是靠它们导回的。
+ *    真要改，得同时兼容旧表头。
+ */
+export const BASE_COLUMNS = ['工作表', '年份', '研究', '所在行', '字段', '原始列', 'fieldPath', '机器值', '机器证据'];
+export const TAIL_COLUMNS = ['核对状态', '采用值', '是否改动'];
+export const reviewerColumns = (r) => [`${r} · 值`, `${r} · 动作`, `${r} · 备注`];
+
+/** 动作的中文（导回时反向用）。 */
+export const ACTION_ZH_MAP = ACTION_ZH;
+/** 反向：中文 → 动作。 */
+export const ZH_ACTION = { 确认: 'confirm', 修改: 'override', 补录: 'add' };
 
 /** 组 id → 工作表序号（1/2/3）；返回 null 表示不导出。 */
 function sheetOfGroup(id) {
@@ -64,7 +82,7 @@ function evidenceOf(f) {
 function orderIndexer(lists) {
   const map = new Map();
   lists.filter(Boolean).forEach((list) => {
-    (list ?? []).forEach((k, i) => { if (!map.has(k)) map.set(k, map.size); });
+    (list ?? []).forEach((k) => { if (!map.has(k)) map.set(k, map.size); });
   });
   const big = map.size + 100000;
   return (key) => (map.has(key) ? map.get(key) : big);
@@ -74,122 +92,164 @@ function orderIndexer(lists) {
  * 构建导出表。
  *
  * @param {object} p
- * @param {string} p.year
- * @param {string} p.study
- * @param {{id:string,title:string,fields:any[]}[]} p.groups  服务端 /api/fields 的 groups
- * @param {object} [p.order]      服务端 /api/fields 的 sheets.order（用于按原始列序排）
- * @param {Record<string,string>} [p.headerOf]  规范键 → 原始表头
- * @param {string[]} [p.reviewers] 已知核对人（固定列；缺省时从字段里现收）
- * @param {object} [p.summary]     reviewSummary() 的结果（核对汇总表用）
+ * @param {string} [p.label]       导出范围的文字（汇总表标题用）
+ * @param {{year:string, study:string, groups:any[], order?:object, headerOf?:object}[]} p.subjects
+ *        一个或多个研究。批量导出时按传入顺序排列。
  * @param {string} [p.generatedAt]
- * @returns {{ sheets: {name:string, rows:any[][], widths:number[]}[], csv: string, columns: string[] }}
+ * @returns {{ sheets:{name:string,rows:any[][],widths:number[]}[], csv:string, columns:string[], stats:object }}
  */
 export function buildReviewExport(p) {
-  const { year, study, groups, order, headerOf, summary } = p;
+  const subjects = p.subjects ?? [];
   const generatedAt = p.generatedAt ?? new Date().toISOString();
 
-  // 核对人列：以服务端给的顺序为准，再把字段里出现过的补上（防止某人的记录只在别处出现）
-  const reviewers = [...(p.reviewers ?? [])];
-  for (const g of groups ?? []) {
-    for (const f of g.fields ?? []) {
-      for (const o of f.reviews ?? []) if (!reviewers.includes(o.reviewer)) reviewers.push(o.reviewer);
+  // 核对人列：所有研究里出现过的核对人的并集，**按名字排序**（中文走拼音序）。
+  // 排序而不是"首次出现顺序"：列顺序要跨研究、跨多次导出都稳定，
+  // 否则导出的表与「导回」的表头对不上（见 tools/import_review.mjs 的表头契约）。
+  const reviewers = [];
+  for (const s of subjects) {
+    for (const g of s.groups ?? []) {
+      for (const f of g.fields ?? []) {
+        for (const o of f.reviews ?? []) if (!reviewers.includes(o.reviewer)) reviewers.push(o.reviewer);
+      }
     }
   }
+  reviewers.sort((a, b) => a.localeCompare(b));
 
-  const columns = [...HEAD_BASE, ...reviewers.flatMap(REVIEW_HEAD), ...HEAD_TAIL];
-  const widths = [10, 18, 22, 26, 34, 26, 40,
+  const columns = [...BASE_COLUMNS, ...reviewers.flatMap(reviewerColumns), ...TAIL_COLUMNS];
+  const widths = [10, 8, 18, 18, 22, 26, 34, 26, 40,
     ...reviewers.flatMap(() => [18, 8, 20]), 12, 24, 8];
 
-  const idx1 = orderIndexer([order?.sheet1?.article, order?.sheet1?.comparison]);
-  const idx2 = orderIndexer([order?.sheet2]);
-  const idx3 = orderIndexer([order?.sheet3?.top]);
-
-  /** 三张数据表：{ 序号 → 行数组 }。 */
   const dataRows = { 1: [], 2: [], 3: [] };
-  /**
-   * 待仲裁清单。
-   *
-   * ⚠️ 这里**从字段视图现取**，而不是用 `summary.consensus.disputed`:
-   * 那份汇总是在"没有机器值"的前提下算出来的（`buildConsensus({}, …)`），
-   * 它的 `machineRaw` 恒为 null —— 仲裁表里会出现「机器值：（无）」这种误导性内容。
-   * 字段视图里有真实的机器值，从这儿取才对。
-   */
+  /** 待仲裁清单（从字段视图现取，那里有真实机器值）。 */
   const disputedList = [];
+  /** 逐字段的意见（跨研究要加前缀，否则不同研究的同名字段会串）。 */
+  const opinionsByField = new Map();
+  const perReviewer = new Map();
+  const stats = { total: 0, agreed: 0, disputed: 0, single: 0, machineOnly: 0, reviewed: 0, changed: 0 };
 
-  for (const g of groups ?? []) {
-    const sheet = sheetOfGroup(g.id);
-    if (!sheet) continue;
-    const idx = sheet === 1 ? idx1 : sheet === 2 ? idx2 : idx3;
+  for (const s of subjects) {
+    const idx1 = orderIndexer([s.order?.sheet1?.article, s.order?.sheet1?.comparison]);
+    const idx2 = orderIndexer([s.order?.sheet2]);
+    const idx3 = orderIndexer([s.order?.sheet3?.top]);
 
-    const fields = [...(g.fields ?? [])].sort((a, b) => idx(keyOf(a)) - idx(keyOf(b)));
-    for (const f of fields) {
-      const status = f.reviewStatus ?? 'machine-only';
-      const disputed = status === 'disputed';
-      const byReviewer = new Map((f.reviews ?? []).map((o) => [o.reviewer, o]));
+    for (const g of s.groups ?? []) {
+      const sheet = sheetOfGroup(g.id);
+      if (!sheet) continue;
+      const idx = sheet === 1 ? idx1 : sheet === 2 ? idx2 : idx3;
 
-      const cells = [
-        `Sheet${sheet}`,
-        g.title ?? '',
-        f.label ?? keyOf(f),
-        headerFor(f, headerOf),
-        f.fieldPath,
-        machineRawOf(f),
-        evidenceOf(f),
-      ];
-      for (const r of reviewers) {
-        const o = byReviewer.get(r);
-        cells.push(o?.raw ?? '', o ? (ACTION_ZH[o.action] ?? o.action) : '', o?.note ?? '');
-      }
-      cells.push(STATUS_ZH[status] ?? status, f.raw ?? '', f.overridden ? '是' : '');
+      const fields = [...(g.fields ?? [])].sort((a, b) => idx(keyOf(a)) - idx(keyOf(b)));
+      for (const f of fields) {
+        const status = f.reviewStatus ?? 'machine-only';
+        const disputed = status === 'disputed';
+        const byReviewer = new Map((f.reviews ?? []).map((o) => [o.reviewer, o]));
 
-      // 有分歧的行整行标红——医生打开文件要一眼找到需要仲裁的地方
-      dataRows[sheet].push(disputed ? cells.map((v) => ({ v, s: 3 })) : cells);
-      if (disputed) {
-        disputedList.push({
-          fieldPath: f.fieldPath,
-          machineRaw: machineRawOf(f) || '（无）',
-          opinions: (f.reviews ?? []).map((o) => ({ reviewer: o.reviewer, raw: o.raw })),
-        });
+        const cells = [
+          `Sheet${sheet}`,
+          s.year ?? '',
+          s.study ?? '',
+          g.title ?? '',
+          f.label ?? keyOf(f),
+          headerFor(f, s.headerOf),
+          f.fieldPath,
+          machineRawOf(f),
+          evidenceOf(f),
+        ];
+        for (const r of reviewers) {
+          const o = byReviewer.get(r);
+          cells.push(o?.raw ?? '', o ? (ACTION_ZH[o.action] ?? o.action) : '', o?.note ?? '');
+        }
+        const isChange = Boolean(f.overridden);
+        cells.push(STATUS_ZH[status] ?? status, f.raw ?? '', isChange ? '是' : '');
+
+        // 有分歧的行整行标红——医生打开文件要一眼找到需要仲裁的地方
+        dataRows[sheet].push(disputed ? cells.map((v) => ({ v, s: 3 })) : cells);
+
+        // ---- 统计（自己算，不依赖外部 summary）----
+        stats.total += 1;
+        if (status === 'agreed') stats.agreed += 1;
+        else if (status === 'disputed') stats.disputed += 1;
+        else if (status === 'single') stats.single += 1;
+        else stats.machineOnly += 1;
+        if (isChange) stats.changed += 1;
+
+        const fkey = `${s.year ?? ''}/${s.study ?? ''}::${f.fieldPath}`;
+        if (f.reviews?.length) {
+          opinionsByField.set(fkey, new Map(f.reviews.map((o) => [o.reviewer, String(o.raw ?? '')])));
+        }
+        for (const o of f.reviews ?? []) {
+          const cur = perReviewer.get(o.reviewer) ?? { total: 0, confirmed: 0, overridden: 0, added: 0 };
+          cur.total += 1;
+          if (o.action === 'confirm') cur.confirmed += 1;
+          else if (o.action === 'add') cur.added += 1;
+          else cur.overridden += 1;
+          perReviewer.set(o.reviewer, cur);
+        }
+
+        if (disputed) {
+          disputedList.push({
+            year: s.year ?? '',
+            study: s.study ?? '',
+            fieldPath: f.fieldPath,
+            machineRaw: machineRawOf(f) || '（无）',
+            opinions: (f.reviews ?? []).map((o) => ({ reviewer: o.reviewer, raw: o.raw })),
+          });
+        }
       }
     }
   }
 
-  /** 核对汇总表（封面）：进度 + 分歧清单 + 两两一致率。 */
+  stats.reviewed = stats.agreed + stats.disputed + stats.single;
+
+  /* ---- 两两一致率：只用「两人都表过态」的字段做分母 ---- */
+  const pairwise = [];
+  for (let i = 0; i < reviewers.length; i++) {
+    for (let j = i + 1; j < reviewers.length; j++) {
+      const A = reviewers[i];
+      const B = reviewers[j];
+      let common = 0;
+      let same = 0;
+      for (const m of opinionsByField.values()) {
+        if (!m.has(A) || !m.has(B)) continue;
+        common += 1;
+        if (m.get(A) === m.get(B)) same += 1;
+      }
+      pairwise.push({ a: A, b: B, common, same, disputed: common - same, rate: common ? same / common : null });
+    }
+  }
+
+  /* ---- 核对汇总（封面）---- */
   const rows = [
     ['指标', '值'],
-    ['研究', `${year} / ${study}`],
+    ['导出范围', p.label ?? '（未标注）'],
+    ['研究数', String(subjects.length)],
     ['导出时间', generatedAt],
     ['核对人', reviewers.length ? reviewers.join('、') : '（无）'],
+    ['字段总数', String(stats.total)],
+    ['已核对', String(stats.reviewed)],
+    ['　一致', String(stats.agreed)],
+    ['　有分歧', String(stats.disputed)],
+    ['　仅一人核对', String(stats.single)],
+    ['未核对', String(stats.machineOnly)],
+    ['已生效的人工改动', String(stats.changed)],
+    ['', ''],
+    ['核对人', '条数', '确认', '修改', '补录'],
   ];
-  const st = summary?.consensus?.stats;
-  if (st) {
-    rows.push(
-      ['字段总数', String(st.total)],
-      ['已核对', String(st.reviewed)],
-      ['　一致', String(st.agreed)],
-      ['　有分歧', String(st.disputed)],
-      ['　仅一人核对', String(st.single)],
-      ['未核对', String(st.machineOnly)],
-      ['已生效的人工改动', String(st.changed)],
-    );
-  }
-  rows.push(['', '']);
-  rows.push(['核对人', '条数', '确认', '修改', '补录', '最后提交']);
-  for (const r of summary?.reviewers ?? []) {
-    rows.push([r.reviewer, String(r.total), String(r.confirmed), String(r.overridden), String(r.added), r.updatedAt ?? '']);
+  for (const [r, v] of [...perReviewer.entries()].sort((x, y) => x[0].localeCompare(y[0]))) {
+    rows.push([r, String(v.total), String(v.confirmed), String(v.overridden), String(v.added)]);
   }
   rows.push(['', '']);
   rows.push(['两两一致率', '共同字段', '一致', '分歧', '一致率']);
-  for (const a of summary?.consensus?.pairwise ?? []) {
-    rows.push([`${a.reviewerA} ↔ ${a.reviewerB}`, String(a.common), String(a.same), String(a.disputed),
+  for (const a of pairwise) {
+    rows.push([`${a.a} ↔ ${a.b}`, String(a.common), String(a.same), String(a.disputed),
       a.rate === null ? '（无共同字段）' : `${(a.rate * 100).toFixed(1)}%`]);
   }
   rows.push(['', '']);
-  rows.push(['待第三方仲裁', '', '', '']);
-  rows.push(['fieldPath', '机器值', '核对人', '意见']);
-  for (const d of disputedList.sort((a, b) => a.fieldPath.localeCompare(b.fieldPath))) {
-    if (!d.opinions.length) rows.push([d.fieldPath, d.machineRaw, '', '']);
-    else for (const o of d.opinions) rows.push([d.fieldPath, d.machineRaw, o.reviewer, o.raw]);
+  rows.push(['待第三方仲裁', '', '', '', '']);
+  rows.push(['年份', '研究', 'fieldPath', '机器值', '核对人', '意见']);
+  for (const d of disputedList.sort((x, y) =>
+    `${x.year}${x.study}${x.fieldPath}`.localeCompare(`${y.year}${y.study}${y.fieldPath}`))) {
+    if (!d.opinions.length) rows.push([d.year, d.study, d.fieldPath, d.machineRaw, '', '']);
+    else for (const o of d.opinions) rows.push([d.year, d.study, d.fieldPath, d.machineRaw, o.reviewer, o.raw]);
   }
 
   const sheets = [
@@ -199,7 +259,7 @@ export function buildReviewExport(p) {
     { name: 'Sheet3', rows: [columns, ...dataRows[3]], widths },
   ];
 
-  return { sheets, csv: toCsv([columns, ...dataRows[1], ...dataRows[2], ...dataRows[3]]), columns };
+  return { sheets, csv: toCsv([columns, ...dataRows[1], ...dataRows[2], ...dataRows[3]]), columns, stats, pairwise };
 }
 
 /* ------------------------------ CSV ------------------------------ */
@@ -213,9 +273,8 @@ function csvCell(v) {
 /**
  * 行数组 → CSV 文本。
  *
- * ⚠️ 带 UTF-8 BOM：不带的话 Excel 打开中文全是乱码（项目里已踩过一次，
- * 见 accuracy_overview.mjs 里关于 PowerShell 写 BOM 的注释）。
- * 但这里返回的是**字符串**、由调用方决定编码，所以 BOM 在 `csvBuffer()` 里加。
+ * ⚠️ 带 UTF-8 BOM 由 `csvBuffer()` 负责（不带的话 Excel 打开中文全是乱码）。
+ * 这里只产出文本，编码交给调用方。
  */
 export function toCsv(rows) {
   return rows.map((r) => r.map(csvCell).join(',')).join('\r\n');
@@ -226,8 +285,12 @@ export function csvBuffer(text) {
   return Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(text, 'utf8')]);
 }
 
-/** 导出文件名（去掉研究号里的前导 `-`，与 annotations 的命名一致）。 */
-export function exportFileName(year, study, ext, stamp = new Date()) {
+/**
+ * 导出文件名。
+ * @param {string} label 范围标签，如 `2015_2015-01` / `2015_全部` / `全部年份`
+ */
+export function exportFileName(label, ext, stamp = new Date()) {
   const d = stamp.toISOString().slice(0, 10);
-  return `人工核对_${year}_${String(study).replace(/^-+/, '')}_${d}.${ext}`;
+  const safe = String(label).replace(/[\\/:*?"<>|]/g, '_');
+  return `人工核对_${safe}_${d}.${ext}`;
 }

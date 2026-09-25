@@ -30,7 +30,8 @@ import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { PdfViewer, type Selection, type SelectMode } from './PdfViewer.tsx';
 import { ExtractionPanel } from './ExtractionPanel.tsx';
 import { SettingsPanel } from './SettingsPanel.tsx';
-import { T, R, tint, ghostBtn, primaryBtn, input as inputS } from './theme.ts';
+import { ReviewToolsPanel } from './ReviewToolsPanel.tsx';
+import { T, R, SH, tint, ghostBtn, primaryBtn, input as inputS } from './theme.ts';
 import type { Bbox } from './geometry.ts';
 import type { FieldView, JobInfo, MiniDoc, SheetsPayload, StudyEntry } from './types.ts';
 
@@ -123,6 +124,10 @@ export default function App() {
   const [reviewerDraft, setReviewerDraft] = useState(reviewer);
   const [review, setReview] = useState<ReviewSummary>(EMPTY_REVIEW);
   const [reviewOpen, setReviewOpen] = useState(false);
+  /** 人工核对工具面板：null = 关闭；否则是当前选项卡。 */
+  const [toolsTab, setToolsTab] = useState<'import' | 'compare' | null>(null);
+  /** 批量导出菜单是否展开。 */
+  const [batchOpen, setBatchOpen] = useState(false);
   const [page, setPage] = useState(1);
   const [focusPage, setFocusPage] = useState<number | undefined>(undefined);
   const [focusToken, setFocusToken] = useState(0);
@@ -200,15 +205,25 @@ export default function App() {
   /**
    * 导出人工核对结果。
    *
-   * 服务端直接从**界面同一份数据**生成，所以文件与屏幕必然一致。
+   * `scope`：单篇 / 整年 / 全部年份。服务端直接从**界面同一份数据**生成，
+   * 所以文件与屏幕必然一致。
+   *
    * 用 fetch + blob 而不是 `<a download>`：出错时（比如该篇没有可导出的字段）
    * 能拿到中文错误信息显示出来，而不是把浏览器导航到一个 JSON 页面。
    */
-  const onExport = useCallback(async (format: 'xlsx' | 'csv') => {
-    if (!study) { setStatus('请先选择一篇文章'); return; }
+  const onExport = useCallback(async (
+    format: 'xlsx' | 'csv',
+    scope: 'study' | 'year' | 'all' = 'study',
+  ) => {
+    if (scope === 'study' && !study) { setStatus('请先选择一篇文章'); return; }
+    setBatchOpen(false);
     setBusy(true);
+    setStatus(scope === 'study' ? '导出中…' : '批量导出中（篇数多时需要几秒）…');
     try {
-      const r = await fetch(`/api/export?year=${year}&study=${encodeURIComponent(study)}&format=${format}`);
+      const q = scope === 'study'
+        ? `year=${year}&study=${encodeURIComponent(study)}&format=${format}`
+        : (scope === 'year' ? `year=${year}&format=${format}` : `scope=all&format=${format}`);
+      const r = await fetch(`/api/export?${q}`);
       if (!r.ok) {
         const d = await r.json().catch(() => ({} as { error?: string }));
         setStatus(`导出失败：${d.error ?? r.status}`);
@@ -217,7 +232,9 @@ export default function App() {
       // 文件名在 content-disposition 里（中文名走 RFC 5987 的 filename*）
       const cd = r.headers.get('content-disposition') ?? '';
       const m = /filename\*=UTF-8''([^;]+)/i.exec(cd);
-      const name = m?.[1] ? decodeURIComponent(m[1]) : `人工核对_${study}.${format}`;
+      const fallback = scope === 'study' ? `人工核对_${year}_${study}.${format}`
+        : (scope === 'year' ? `人工核对_${year}_全部.${format}` : `人工核对_全部年份.${format}`);
+      const name = m?.[1] ? decodeURIComponent(m[1]) : fallback;
 
       const url = URL.createObjectURL(await r.blob());
       const a = document.createElement('a');
@@ -855,6 +872,47 @@ export default function App() {
               data-testid="export-csv"
               title="导出人工核对结果（CSV，三表拼成一张，带 UTF-8 BOM）"
             >导出 CSV</button>
+
+            {/* 批量导出：整年 / 全部年份 */}
+            <span style={{ position: 'relative' }}>
+              <button
+                onClick={() => setBatchOpen((v) => !v)}
+                style={ghostBtn(T.amberBright)}
+                disabled={busy}
+                data-testid="batch-menu"
+                title="整年或全部年份一起导出（每行多带「年份/研究」两列）"
+              >批量 ▾</button>
+              {batchOpen && (
+                <div
+                  data-testid="batch-popup"
+                  style={{
+                    position: 'absolute', right: 0, top: '100%', marginTop: 4, zIndex: 40,
+                    background: T.bg, border: `1px solid ${T.border}`, borderRadius: R.btn,
+                    boxShadow: SH.pop, padding: 6, display: 'flex', flexDirection: 'column', gap: 4, minWidth: 156,
+                  }}
+                >
+                  <button onClick={() => void onExport('xlsx', 'year')} style={ghostBtn(T.emerald)} data-testid="batch-year-xlsx">{year} 年 XLSX</button>
+                  <button onClick={() => void onExport('csv', 'year')} style={ghostBtn(T.cyan)} data-testid="batch-year-csv">{year} 年 CSV</button>
+                  <button onClick={() => void onExport('xlsx', 'all')} style={ghostBtn(T.emerald)} data-testid="batch-all-xlsx">全部年份 XLSX</button>
+                  <button onClick={() => void onExport('csv', 'all')} style={ghostBtn(T.cyan)} data-testid="batch-all-csv">全部年份 CSV</button>
+                </div>
+              )}
+            </span>
+
+            <button
+              onClick={() => setToolsTab('import')}
+              style={ghostBtn(T.indigo)}
+              disabled={!study}
+              data-testid="open-import"
+              title="把医生改过的表格导回成人工标注（先预览差异，再确认写入）"
+            >导回…</button>
+            <button
+              onClick={() => setToolsTab('compare')}
+              style={ghostBtn(T.blue)}
+              disabled={!study}
+              data-testid="open-compare"
+              title="任选两组结果并排对比（机器 / 各位核对人 / 导入批次）"
+            >对比…</button>
             <button
               onClick={() => setReviewOpen((v) => !v)}
               style={ghostBtn(review.consensus.stats.disputed > 0 ? T.red : T.indigo)}
@@ -933,6 +991,19 @@ export default function App() {
       </aside>
 
       {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+
+      {toolsTab && (
+        <ReviewToolsPanel
+          year={year}
+          study={study}
+          reviewer={reviewer}
+          tab={toolsTab}
+          onTab={setToolsTab}
+          onClose={() => setToolsTab(null)}
+          onChanged={() => { void loadFields(year, study); void loadReview(year, study, reviewer); }}
+          notify={setNotice}
+        />
+      )}
     </div>
   );
 }

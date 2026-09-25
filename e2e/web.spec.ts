@@ -316,8 +316,94 @@ test.describe('前端交互（真实浏览器）', () => {
     // 必须有 UTF-8 BOM，否则 Excel 打开中文乱码
     expect([...csv.subarray(0, 3)]).toEqual([0xEF, 0xBB, 0xBF]);
     const text = csv.toString('utf8');
-    expect(text).toContain('工作表,所在行,字段');
+    expect(text).toContain('工作表,年份,研究,所在行,字段');
     expect(text).toContain('核对状态');
+  });
+
+  test('批量导出：整年 XLSX 能下载，文件名标出范围', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('[data-testid="batch-menu"]')).toBeEnabled();
+
+    await page.locator('[data-testid="batch-menu"]').click();
+    await expect(page.locator('[data-testid="batch-popup"]')).toBeVisible();
+
+    const [dl] = await Promise.all([
+      page.waitForEvent('download'),
+      page.locator(`[data-testid="batch-year-xlsx"]`).click(),
+    ]);
+    expect(dl.suggestedFilename()).toContain(`${YEAR}_全部`);
+    expect(dl.suggestedFilename()).toMatch(/\.xlsx$/);
+    const buf = readFileSync((await dl.path())!);
+    expect(buf.subarray(0, 2).toString('hex')).toBe('504b');
+    // 整年（6 篇）明显大于单篇导出，用来区分「真批量」和「只导了一篇」
+    expect(buf.length).toBeGreaterThan(60_000);
+  });
+
+  test('导回：导出 → 改一格 → 预览差异 → 确认写入', async ({ page, request }) => {
+    // 先让该核对人有一条记录，导出的表里才会有他的列
+    await request.post(annUrl(YEAR, STUDY, REVIEWER), {
+      data: {
+        reviewer: REVIEWER,
+        entry: { fieldPath: 'condition', action: 'override', value: { raw: 'E2E-改前', provenance: 'human', confidence: 1 } },
+      },
+    });
+
+    await page.goto('/');
+    await waitForPdf(page);
+    await signIn(page);
+
+    // 导出 CSV，把那一格改掉（模拟医生在 Excel 里改）
+    const csv = (await (await request.get(`/api/export?year=${YEAR}&study=${STUDY}&format=csv`)).body()).toString('utf8');
+    const edited = csv.replace('E2E-改前', 'E2E-改后');
+    expect(edited).not.toBe(csv);
+
+    await page.locator('[data-testid="open-import"]').click();
+    await expect(page.locator('[data-testid="review-tools"]')).toBeVisible();
+    await page.locator('[data-testid="import-file"]').setInputFiles({
+      name: 'edited.csv', mimeType: 'text/csv', buffer: Buffer.from(edited, 'utf8'),
+    });
+
+    // 预览：必须先把差异摊开给人看
+    await page.locator('[data-testid="import-preview"]').click();
+    await expect(page.locator('[data-testid="tools-status"]')).toContainText('预览完成');
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('E2E-改前');
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('E2E-改后');
+
+    // 预览阶段**不能**落盘
+    const before = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
+    expect((before.overlay?.entries ?? []).find((e: { fieldPath: string }) => e.fieldPath === 'condition')?.value?.raw)
+      .toBe('E2E-改前');
+
+    await page.locator('[data-testid="import-apply"]').click();
+    await expect(page.locator('[data-testid="tools-status"]')).toContainText('已写入 1 处');
+
+    await expect.poll(async () => {
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
+      return (d.overlay?.entries ?? []).find((e: { fieldPath: string }) => e.fieldPath === 'condition')?.value?.raw;
+    }).toBe('E2E-改后');
+  });
+
+  test('两组结果对比：机器 vs 核对人，列出不一致的字段', async ({ page, request }) => {
+    await request.post(annUrl(YEAR, STUDY, REVIEWER), {
+      data: {
+        reviewer: REVIEWER,
+        entry: { fieldPath: 'condition', action: 'override', value: { raw: 'E2E-人工值', provenance: 'human', confidence: 1 } },
+      },
+    });
+
+    await page.goto('/');
+    await waitForPdf(page);
+    await signIn(page);
+    await page.locator('[data-testid="open-compare"]').click();
+    await expect(page.locator('[data-testid="review-tools"]')).toBeVisible();
+
+    // B 组默认选中第一位核对人
+    await expect(page.locator('[data-testid="compare-b"]')).toHaveValue(`reviewer:${REVIEWER}`);
+    await page.locator('[data-testid="compare-run"]').click();
+
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('一致率');
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('condition');
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('E2E-人工值');
   });
 
   test('设置对话框：显示掩码密钥并可测试连通性', async ({ page }) => {
