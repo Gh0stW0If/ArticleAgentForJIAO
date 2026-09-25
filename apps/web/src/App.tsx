@@ -32,6 +32,9 @@ import { ExtractionPanel } from './ExtractionPanel.tsx';
 import { SettingsPanel } from './SettingsPanel.tsx';
 import { ReviewToolsPanel } from './ReviewToolsPanel.tsx';
 import { T, R, SH, tint, ghostBtn, primaryBtn, input as inputS } from './theme.ts';
+import {
+  FONT_SCALE_KEY, FONT_ZOOM, readFontScale, type FontScale,
+} from './theme.ts';
 import type { Bbox } from './geometry.ts';
 import type { FieldView, JobInfo, MiniDoc, SheetsPayload, StudyEntry } from './types.ts';
 
@@ -128,6 +131,13 @@ export default function App() {
   const [toolsTab, setToolsTab] = useState<'import' | 'compare' | null>(null);
   /** 批量导出菜单是否展开。 */
   const [batchOpen, setBatchOpen] = useState(false);
+  /** 界面字体档位（小/中/大）——纯前端偏好，存 localStorage，不走服务端。 */
+  const [fontScale, setFontScale] = useState<FontScale>(readFontScale);
+  const uiZoom = FONT_ZOOM[fontScale];
+
+  useEffect(() => {
+    try { window.localStorage.setItem(FONT_SCALE_KEY, fontScale); } catch { /* 隐私模式下不可用 */ }
+  }, [fontScale]);
   const [page, setPage] = useState(1);
   const [focusPage, setFocusPage] = useState<number | undefined>(undefined);
   const [focusToken, setFocusToken] = useState(0);
@@ -655,7 +665,19 @@ export default function App() {
   const currentStudy = studies.find((s) => s.studyId === study);
 
   return (
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: T.canvas }}>
+    /*
+     * ⚠️ 宽高要**除以** uiZoom：`zoom` 是布局级缩放，
+     * 会把 100% / 100vh 这类解析后的长度也一起放大——
+     * 直接写 100vh 的话，大档位下整个界面会变成 120vh、底部被裁掉。
+     */
+    <div data-testid="app-root" style={{
+      display: 'flex',
+      width: `${100 / uiZoom}%`,
+      height: `${100 / uiZoom}vh`,
+      overflow: 'hidden',
+      background: T.canvas,
+      zoom: uiZoom,
+    }}>
       {/* ============ 左：PDF ============ */}
       <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {/* 顶栏第 1 行：品牌 + 文章选择 + 导入/解析/抽取（左上角菜单） */}
@@ -799,6 +821,7 @@ export default function App() {
                 pdf={pdf}
                 doc={doc}
                 scale={scale}
+                uiZoom={uiZoom}
                 highlights={highlights}
                 showBlocks={showBlocks}
                 mode={mode}
@@ -1001,7 +1024,13 @@ export default function App() {
         </div>
       </aside>
 
-      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsPanel
+          onClose={() => setSettingsOpen(false)}
+          fontScale={fontScale}
+          onFontScale={setFontScale}
+        />
+      )}
 
       {toolsTab && (
         <ReviewToolsPanel

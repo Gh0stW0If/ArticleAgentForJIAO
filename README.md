@@ -48,6 +48,11 @@ Web/桌面端具备人工覆盖层（`add` / `override` / `confirm`，不改写�
   四态 `一致 / 不同 / 仅 A 有 / 仅 B 有`；
   「没表态」不算「一致」，一致率只在两组都表过态的字段上算。
 
+- **界面字体档位** —— 设置里「小 90% / 中 100% / 大 120%」三档，立即生效、本机记住
+  （`localStorage`，不进服务端配置）。实现是根容器 CSS `zoom`：
+  一次生效、行高间距一起变。⚠️ 两个已处理的副作用：容器宽高要除以倍数（否则 100vh 被放大裁底）、
+  框选 PDF 的坐标换算要除以倍数（Chromium 的 `getBoundingClientRect()` 返回缩放后坐标）。
+
 导出用零依赖自写 ZIP + OOXML（`tools/lib/zipwrite.mjs` / `xlsxwrite.mjs`），
 导回解析与差异计算在 `tools/import_review.mjs`（纯逻辑，可单测）。
 

@@ -467,6 +467,70 @@ test.describe('前端交互（真实浏览器）', () => {
     await expect(page.locator('[data-testid="import-signature"]')).toContainText('校验和');
   });
 
+  test('字体档位：小/中/大生效并持久化；放大后框选坐标仍与中档一致', async ({ page, request }) => {
+    await page.goto('/');
+    await waitForPdf(page);
+    await signIn(page);
+
+    /** 根容器的实际 CSS zoom。 */
+    const zoomOf = () => page.evaluate(() => {
+      const el = document.querySelector('[data-testid="app-root"]') as HTMLElement | null;
+      return el ? Number(getComputedStyle(el).zoom || '1') : -1;
+    });
+
+    const setScale = async (s: 'small' | 'medium' | 'large') => {
+      await page.locator('[data-testid="settings-btn"]').click();
+      await page.locator(`[data-testid="font-${s}"]`).click();
+      await page.locator('[data-testid="settings-dialog"] button:has-text("✕")').click();
+    };
+
+    /** 在标题上框选一次，取回写入的 canonical bbox，然后回滚。 */
+    const bboxOf = async (): Promise<number[]> => {
+      await page.locator('[data-field="title"] button:has-text("框选证据")').click();
+      await expect(page.getByText(/标注模式：.*拖拽框选/)).toBeVisible();
+      await dragOnPage(page, 1, { x: 0.15, y: 0.12 }, { x: 0.8, y: 0.30 });
+      await expect(page.getByText(/已为 title 写入证据/)).toBeVisible();
+
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
+      const e = (d.overlay?.entries ?? []).find((x: { fieldPath: string }) => x.fieldPath === 'title');
+      const bbox = e?.value?.evidence?.[0]?.bbox as number[];
+
+      await page.locator('[data-field="title"] button:has-text("回滚")').click();
+      await expect.poll(async () => {
+        const dd = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
+        return (dd.overlay?.entries ?? []).some((x: { fieldPath: string }) => x.fieldPath === 'title');
+      }).toBe(false);
+      return bbox;
+    };
+
+    // 默认中档
+    expect(await zoomOf()).toBe(1);
+    const atMedium = await bboxOf();
+
+    // 大档：界面确实被放大
+    await setScale('large');
+    await expect.poll(zoomOf).toBe(1.2);
+    await expect(page.locator('[data-testid="settings-btn"]')).toBeVisible();
+
+    // 关键：同一**相对区域**的框选，放大前后应得到几乎相同的 canonical bbox。
+    // 这条专门盯 CSS zoom 把 getBoundingClientRect 一起放大的坑——
+    // 不修的话这里的坐标会整体大 1.2 倍。
+    const atLarge = await bboxOf();
+    expect(atLarge.length).toBe(4);
+    for (let i = 0; i < 4; i++) {
+      expect(Math.abs(atLarge[i]! - atMedium[i]!)).toBeLessThan(3);
+    }
+
+    // 刷新后仍是 1.2（本机记住）
+    await page.reload();
+    await waitForPdf(page);
+    expect(await zoomOf()).toBe(1.2);
+
+    // 小档
+    await setScale('small');
+    await expect.poll(zoomOf).toBe(0.9);
+  });
+
   test('设置对话框：显示掩码密钥并可测试连通性', async ({ page }) => {
     await page.goto('/');
     await page.locator('[data-testid="settings-btn"]').click();

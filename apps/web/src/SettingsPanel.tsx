@@ -13,12 +13,18 @@
  */
 
 import { useEffect, useState } from 'react';
-import { T, R, SH, tint, ghostBtn, primaryBtn, input as inputS } from './theme.ts';
+import {
+  T, R, SH, tint, ghostBtn, primaryBtn, input as inputS,
+  FONT_SCALES, FONT_LABEL, FONT_ZOOM, type FontScale,
+} from './theme.ts';
 import type { SettingsInfo } from './types.ts';
 
 interface Props {
   onClose(): void;
   onSaved?: (s: Partial<SettingsInfo>) => void;
+  /** 当前界面字体档位（存在 App，写 localStorage）。 */
+  fontScale: FontScale;
+  onFontScale(v: FontScale): void;
 }
 
 const inp: React.CSSProperties = inputS({ width: '100%', fontSize: 12 });
@@ -27,7 +33,7 @@ const label: React.CSSProperties = {
   color: T.muted, fontSize: 11, marginTop: 12, marginBottom: 4, display: 'block', fontWeight: 600,
 };
 
-export function SettingsPanel({ onClose, onSaved }: Props) {
+export function SettingsPanel({ onClose, onSaved, fontScale, onFontScale }: Props) {
   const [info, setInfo] = useState<SettingsInfo | null>(null);
   const [form, setForm] = useState({
     baseUrl: '', model: '', apiKey: '', crossrefMailto: '', temperature: '0', maxTokens: '8000',
@@ -121,12 +127,41 @@ export function SettingsPanel({ onClose, onSaved }: Props) {
         }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <b style={{ fontSize: 14, color: T.ink }}>设置 · API 配置</b>
+          <b style={{ fontSize: 14, color: T.ink }}>设置</b>
           <button
             onClick={onClose}
             style={{ background: 'transparent', border: 'none', color: T.faint, cursor: 'pointer', fontSize: 16, lineHeight: 1 }}
           >✕</button>
         </div>
+
+        {/* ---------------- 界面 ---------------- */}
+        <label style={label}>界面字体</label>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }} data-testid="font-scale">
+          {FONT_SCALES.map((s) => (
+            <button
+              key={s}
+              onClick={() => onFontScale(s)}
+              data-testid={`font-${s}`}
+              title={`界面缩放 ${Math.round(FONT_ZOOM[s] * 100)}%`}
+              style={{
+                ...(fontScale === s ? primaryBtn(T.amber) : ghostBtn()),
+                minWidth: 44, fontSize: 12,
+              }}
+            >{FONT_LABEL[s]}</button>
+          ))}
+          <span style={{ fontSize: 11, color: T.faint, marginLeft: 4 }}>
+            当前 {Math.round(FONT_ZOOM[fontScale] * 100)}% ｜ 立即生效，本机记住
+          </span>
+        </div>
+        <div style={{ fontSize: 10.5, color: T.faint, marginTop: 5, lineHeight: 1.6 }}>
+          放大的是整套界面（含 PDF 阅读区），行距与面板宽度一起变；
+          PDF 自身还有独立的缩放滑块。这是本机偏好，与服务端配置无关。
+        </div>
+
+        <div style={{
+          margin: '16px 0 2px', paddingTop: 12, borderTop: `1px solid ${T.border}`,
+          fontSize: 12, fontWeight: 600, color: T.muted,
+        }}>API 配置</div>
 
         <label style={label}>Base URL</label>
         <input style={inp} value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.deepseek.com" />

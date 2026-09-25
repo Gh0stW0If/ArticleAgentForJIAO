@@ -131,3 +131,35 @@ export const PROVENANCE: Record<string, { color: string; label: string }> = {
   deterministic: { color: T.cyan, label: '编码推导' },
   external: { color: T.indigo, label: 'Crossref' },
 };
+
+/* ------------------------------ 界面字体档位 ------------------------------ */
+
+/**
+ * 字体档位 → CSS `zoom` 倍数。
+ *
+ * 为什么用 `zoom` 而不是逐个改字号：整套界面的字号散落在各组件的内联样式里
+ * （11px / 12px / 13px…），改成变量要动几十处且容易漏。
+ * `zoom` 是**布局级缩放**，一次生效，行高与间距一起跟着变，
+ * 不会出现"字大了但行距没变"的挤压。
+ *
+ * ⚠️ 两个必须知道的副作用（都已处理，见 App 与 PdfViewer）：
+ *   1. `100vh` / `100%` 这类长度也会被放大 —— 容器宽高要除以倍数；
+ *   2. Chromium 的 `getBoundingClientRect()` 返回**缩放后**坐标 ——
+ *      框选 PDF 的换算要除以倍数，否则证据框整体错位。
+ */
+export const FONT_SCALE_KEY = 'aa.fontScale';
+export type FontScale = 'small' | 'medium' | 'large';
+export const FONT_ZOOM: Record<FontScale, number> = { small: 0.9, medium: 1, large: 1.2 };
+export const FONT_LABEL: Record<FontScale, string> = { small: '小', medium: '中', large: '大' };
+export const FONT_SCALES: FontScale[] = ['small', 'medium', 'large'];
+
+/** 从 localStorage 读档位；读不到或值不可信就退回「中」。 */
+export function readFontScale(): FontScale {
+  try {
+    if (typeof window === 'undefined') return 'medium';
+    const v = window.localStorage.getItem(FONT_SCALE_KEY);
+    return v === 'small' || v === 'large' ? v : 'medium';
+  } catch {
+    return 'medium';
+  }
+}
