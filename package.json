@@ -15,6 +15,7 @@
     "build": "pnpm -r build",
     "check": "pnpm typecheck && pnpm test",
     "gold:normalize": "node tools/gold_normalize.mjs",
+    "gold:rebuild": "node tools/gold_normalize.mjs --apply-reconcile && node tools/gold_fix_units.mjs --apply",
     "gold:reconcile": "node tools/gold_reconcile.mjs",
     "mineru:batch": "node tools/mineru_batch.mjs",
     "mineru:clean": "node tools/mineru_clean.mjs",
