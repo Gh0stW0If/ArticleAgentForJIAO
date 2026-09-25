@@ -666,13 +666,18 @@ export default function App() {
 
   return (
     /*
-     * ⚠️ 宽高要**除以** uiZoom：`zoom` 是布局级缩放，
-     * 会把 100% / 100vh 这类解析后的长度也一起放大——
-     * 直接写 100vh 的话，大档位下整个界面会变成 120vh、底部被裁掉。
+     * ⚠️ 宽高在 zoom 下**单位解析方式不同**，不能一起除以 uiZoom（实测踩到）：
+     *
+     *   · `%` 宽：按**缩放后的**包含块解析 —— 写 100% 就已铺满，
+     *     再除一次反而只剩 83%，大档下右侧空出 245px。
+     *   · `vh` 高：按**真实视口**解析，再整体乘 zoom —— 所以必须除，
+     *     否则大档下变成 120vh，底部被裁掉 180px。
+     *
+     * 结论：宽用 `100%`，高用 `100/uiZoom vh`。两种写法在中小大三个档位都实测过。
      */
     <div data-testid="app-root" style={{
       display: 'flex',
-      width: `${100 / uiZoom}%`,
+      width: '100%',
       height: `${100 / uiZoom}vh`,
       overflow: 'hidden',
       background: T.canvas,

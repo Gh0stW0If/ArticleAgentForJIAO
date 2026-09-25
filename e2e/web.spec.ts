@@ -507,10 +507,25 @@ test.describe('前端交互（真实浏览器）', () => {
     expect(await zoomOf()).toBe(1);
     const atMedium = await bboxOf();
 
-    // 大档：界面确实被放大
+    // 大档：界面确实被放大，**且仍然铺满视口**
     await setScale('large');
     await expect.poll(zoomOf).toBe(1.2);
     await expect(page.locator('[data-testid="settings-btn"]')).toBeVisible();
+
+    // 这条盯的是 zoom 下 `%` 与 `vh` 解析方式不同这个坑：
+    // 宽度若也除以倍数，右侧会空出约 1/6 视口（实测 245/1470）。
+    const fill = await page.evaluate(() => {
+      const root = document.querySelector('[data-testid="app-root"]') as HTMLElement;
+      const aside = document.querySelector('aside') as HTMLElement;
+      return {
+        vw: window.innerWidth, vh: window.innerHeight,
+        rootW: Math.round(root.getBoundingClientRect().width),
+        rootH: Math.round(root.getBoundingClientRect().height),
+        asideRight: Math.round(aside.getBoundingClientRect().right),
+      };
+    });
+    expect(fill.asideRight).toBe(fill.vw);          // 右栏贴到视口右边，没有留白
+    expect(Math.abs(fill.rootH - fill.vh)).toBeLessThan(3);   // 也不溢出、不裁底
 
     // 关键：同一**相对区域**的框选，放大前后应得到几乎相同的 canonical bbox。
     // 这条专门盯 CSS zoom 把 getBoundingClientRect 一起放大的坑——
