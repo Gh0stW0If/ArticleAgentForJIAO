@@ -31,6 +31,7 @@
     "llm:eval": "node tools/llm_eval.mjs",
     "accuracy:overview": "node tools/accuracy_overview.mjs",
     "accuracy:diagnose": "node tools/accuracy_diagnose.mjs",
+    "accuracy:coverage": "node tools/coverage_eval.mjs",
     "fields:coverage": "node tools/field_coverage.mjs",
     "gold:anomalies": "node tools/gold_anomalies.mjs",
     "judge:report": "node tools/judge_report.mjs",
