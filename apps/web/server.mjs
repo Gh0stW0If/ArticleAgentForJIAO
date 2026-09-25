@@ -2,14 +2,21 @@
  * @aa/web — 本地 API 服务（仅用于开发/演示，绑定 127.0.0.1）
  *
  * 只服务于：
- *   GET /api/health                          健康检查
- *   GET /api/studies?year=2015               某年份可选的研究列表
- *   GET /api/minidoc?year&study              解析文档（blocks + pages，带 bbox）
- *   GET /api/pdf?year&study                  PDF 原始字节（供 pdf.js）
+ *   GET  /api/health                          健康检查
+ *   GET  /api/studies?year=2015               某年份可选的研究列表
+ *   GET  /api/minidoc?year&study              解析文档（blocks + pages，带 bbox）
+ *   GET  /api/pdf?year&study                  PDF 原始字节（供 pdf.js）
+ *   GET  /api/fields?year&study               字段视图（含 sheets 布局与逐字段核对状态）
+ *   GET  /api/annotation?year&study[&reviewer] 核对记录 + 全部核对人进度 + 分歧 + 两两一致率
+ *   POST /api/annotation                     写入某核对人的标注（reviewer 必填）
+ *   DELETE /api/annotation                   删某核对人的某字段 / 整份记录
+ *   GET  /api/export?year&study&format=      导出人工核对结果（xlsx / csv）
+ *   POST /api/import                         导入 PDF
+ *   POST /api/parse | /api/extract           后台任务（MinerU 解析 / LLM 抽取）
+ *   GET  /api/jobs                           任务状态与日志尾部
  *
- * 说明：抽取结果目前直接读取 `build/gold/<year>.json`（金标准），
- * 因此「框选比对」这一功能可以先跑起来——用金标准的字段与证据对照 PDF。
- * 待 LLM 接入后，再把 `/api/extraction` 指向流水线产物即可，接口形状不变。
+ * 说明：抽取结果读取 `build/extraction/<year>/<id>.json`（流水线产物），
+ * 缺失时退回 `build/gold/<year>.json`（金标准），仅用于演示界面。
  *
  * 安全：只允许读取 Datas/ 与 build/ 下的文件；路径参数经过白名单校验，
  * 防止目录穿越。
@@ -26,6 +33,8 @@ import {
   buildConsensus, consensusStats, pairwiseAgreement, reviewerSummaries,
   LEGACY_REVIEWER,
 } from '../../packages/core/dist/index.js';
+import { buildReviewExport, csvBuffer, exportFileName } from '../../tools/export_review.mjs';
+import { buildXlsx } from '../../tools/lib/xlsxwrite.mjs';
 
 const ROOT = resolve(process.env.AA_ROOT ?? process.cwd());
 const PORT = Number(process.env.AA_PORT ?? 43130);
@@ -1139,6 +1148,53 @@ const server = createServer(async (req, res) => {
       }
 
       return json(res, 405, { error: `不支持的方法 ${req.method}` });
+    }
+
+    /*
+     * 导出人工核对结果（XLSX / CSV）。
+     *
+     * 数据来源与界面**完全同一份**：buildFieldGroups（字段视图）+ reviewSummary（核对汇总）。
+     * 这样导出的内容必然与屏幕上看到的一致，不会出现"页面一个值、文件另一个值"。
+     *
+     *   GET /api/export?year=2015&study=2015-01&format=xlsx
+     *   GET /api/export?year=2015&study=2015-01&format=csv
+     */
+    if (p === '/api/export') {
+      if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
+      const format = (url.searchParams.get('format') ?? 'xlsx').toLowerCase();
+      if (!['xlsx', 'csv'].includes(format)) {
+        return json(res, 400, { error: `format 非法：${format}（只支持 xlsx / csv）` });
+      }
+
+      const built = await buildFieldGroups(year, study);
+      if (!built.groups?.length) {
+        return json(res, 409, { error: built.warning ?? '该研究没有可导出的字段' });
+      }
+
+      const summary = reviewSummary(year, study);
+      const { sheets, csv } = buildReviewExport({
+        year,
+        study,
+        groups: built.groups,
+        order: built.sheets?.order,
+        headerOf: built.sheets?.headerOf,
+        reviewers: summary.reviewers.map((r) => r.reviewer),
+        summary,
+      });
+
+      const name = exportFileName(year, study, format);
+      const bytes = format === 'csv' ? csvBuffer(csv) : buildXlsx(sheets);
+      res.writeHead(200, {
+        'content-type': format === 'csv'
+          ? 'text/csv; charset=utf-8'
+          : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'content-length': bytes.length,
+        'cache-control': 'no-store',
+        // 中文文件名必须用 RFC 5987 的 filename*，否则浏览器存下来是乱码
+        'content-disposition':
+          `attachment; filename="review-export.${format}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+      });
+      return res.end(bytes);
     }
 
     /* ------------------------------ 设置（API 配置） ------------------------------ */

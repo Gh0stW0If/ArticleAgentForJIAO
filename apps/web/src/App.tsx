@@ -11,6 +11,7 @@
  *   GET  /api/annotation?reviewer=…        → 某核对人的记录 + 全部核对人进度 + 分歧 + 两两一致率
  *   POST /api/annotation {reviewer,…}      → 写入某核对人的标注（confirm / override / add）
  *   DELETE /api/annotation?reviewer=…&fieldPath=… → 单字段回滚（按核对人）
+ *   GET  /api/export?format=xlsx|csv       → 导出人工核对结果（每个字段一行，每位核对人三列）
  *   POST /api/import                       → 导入 PDF（写入 build/imports，不动 Datas/）
  *   POST /api/parse | /api/extract         → 后台任务（MinerU 解析 / LLM 抽取）
  *   GET  /api/jobs                         → 任务状态与日志尾部
@@ -195,6 +196,44 @@ export default function App() {
   }, []);
 
   useEffect(() => { void loadReview(year, study, reviewer); }, [year, study, reviewer, loadReview]);
+
+  /**
+   * 导出人工核对结果。
+   *
+   * 服务端直接从**界面同一份数据**生成，所以文件与屏幕必然一致。
+   * 用 fetch + blob 而不是 `<a download>`：出错时（比如该篇没有可导出的字段）
+   * 能拿到中文错误信息显示出来，而不是把浏览器导航到一个 JSON 页面。
+   */
+  const onExport = useCallback(async (format: 'xlsx' | 'csv') => {
+    if (!study) { setStatus('请先选择一篇文章'); return; }
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/export?year=${year}&study=${encodeURIComponent(study)}&format=${format}`);
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({} as { error?: string }));
+        setStatus(`导出失败：${d.error ?? r.status}`);
+        return;
+      }
+      // 文件名在 content-disposition 里（中文名走 RFC 5987 的 filename*）
+      const cd = r.headers.get('content-disposition') ?? '';
+      const m = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+      const name = m?.[1] ? decodeURIComponent(m[1]) : `人工核对_${study}.${format}`;
+
+      const url = URL.createObjectURL(await r.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setStatus(`已导出 ${name}`);
+    } catch (e) {
+      setStatus(`导出失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [year, study]);
 
   /** 提交核对人改名（输入框失焦 / 回车）。 */
   const commitReviewer = useCallback(() => {
@@ -789,8 +828,8 @@ export default function App() {
             </span>
           </div>
 
-          {/* 多人机核对：核对人身份 + 汇总入口（202609） */}
-          <div style={{ display: 'flex', gap: 7, alignItems: 'center', fontSize: 11 }}>
+          {/* 多人机核对：核对人身份 + 汇总入口 + 导出（202609） */}
+          <div style={{ display: 'flex', gap: 7, alignItems: 'center', fontSize: 11, flexWrap: 'wrap' }}>
             <span style={{ color: T.faint }}>核对人</span>
             <input
               value={reviewerDraft}
@@ -803,8 +842,22 @@ export default function App() {
             />
             {!reviewer && <span style={{ color: T.red }}>未设置，暂不能提交</span>}
             <button
+              onClick={() => void onExport('xlsx')}
+              style={{ ...ghostBtn(T.emerald), marginLeft: 'auto' }}
+              disabled={busy || !study}
+              data-testid="export-xlsx"
+              title="导出人工核对结果（4 个工作表：核对汇总 + Sheet1/2/3）"
+            >导出 XLSX</button>
+            <button
+              onClick={() => void onExport('csv')}
+              style={ghostBtn(T.cyan)}
+              disabled={busy || !study}
+              data-testid="export-csv"
+              title="导出人工核对结果（CSV，三表拼成一张，带 UTF-8 BOM）"
+            >导出 CSV</button>
+            <button
               onClick={() => setReviewOpen((v) => !v)}
-              style={{ ...ghostBtn(review.consensus.stats.disputed > 0 ? T.red : T.indigo), marginLeft: 'auto' }}
+              style={ghostBtn(review.consensus.stats.disputed > 0 ? T.red : T.indigo)}
               data-testid="review-toggle"
             >
               核对 {review.consensus.stats.reviewed}/{review.consensus.stats.total}
@@ -841,7 +894,12 @@ export default function App() {
                     <div key={d.fieldPath} style={{ marginBottom: 4 }}>
                       <code style={{ fontSize: 10.5 }}>{d.fieldPath}</code>
                       <div style={{ color: T.faint }}>
-                        机器「{d.machineRaw ?? '（无）'}」／
+                        {/*
+                          机器值优先用汇总里的；汇总里没有就退回字段视图的当前值。
+                          汇总是在"没有机器值"的前提下算的（machineRaw 恒为 null），
+                          而分歧字段的当前值恰好就是机器原值（分歧不生效），所以这样回退是准确的。
+                        */}
+                        机器「{d.machineRaw ?? findField(d.fieldPath)?.raw ?? '（无）'}」／
                         {d.opinions.map((o) => `${o.reviewer}「${o.raw}」`).join('，')}
                       </div>
                     </div>

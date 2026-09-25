@@ -22,7 +22,7 @@ Web/桌面端具备人工覆盖层（`add` / `override` / `confirm`，不改写�
 
 ## 本分支新增（`feat/202609-prune-and-review-records`）
 
-按 202609 的新要求做了两件事：
+按 202609 的新要求做了三件事：
 
 - **提取项目删减** —— 按列规则退役 6 个 Sheet1 列（E/F/AW/BB/BC/BK）与 2 个 Sheet3 列（E/R）
   对应的字段，**抽取与评测同步移除**（只删抽取会让这些列被判成「漏抽」，白掉准确率）。
@@ -31,6 +31,11 @@ Web/桌面端具备人工覆盖层（`add` / `override` / `confirm`，不改写�
   （`build/annotations/<year>/<study>.<reviewer>.json`），支持多人独立盲评；
   逐字段给出「一致 / 分歧 / 仅一人 / 未核对」四态，
   **有分歧的字段不替人取值**（保留机器原值并标出），等第三方仲裁。
+- **导出人工核对结果** —— 界面右上「导出 XLSX / 导出 CSV」两个按钮。
+  XLSX 含 4 个工作表（`核对汇总` + `Sheet1/2/3`）：每个字段一行、每位核对人三列（值/动作/备注）、
+  **有分歧的行整行标红**；CSV 列结构相同、带 UTF-8 BOM 供 Excel/AI 读。
+  零依赖自写 ZIP + OOXML（`tools/lib/zipwrite.mjs` / `xlsxwrite.mjs`），
+  接口 `GET /api/export?year=&study=&format=xlsx|csv`。
 
 详见 `docs/26-202609-字段删减与多人核对.md`。
 

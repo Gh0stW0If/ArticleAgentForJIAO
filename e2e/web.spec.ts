@@ -291,6 +291,35 @@ test.describe('前端交互（真实浏览器）', () => {
     }
   });
 
+  test('导出人工结果：XLSX 与 CSV 都能下载且是合法文件', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('[data-testid="export-xlsx"]')).toBeEnabled();
+
+    /** 点按钮 → 等下载 → 读回字节。 */
+    const grab = async (testid: string, ext: string): Promise<Buffer> => {
+      const [dl] = await Promise.all([
+        page.waitForEvent('download'),
+        page.locator(`[data-testid="${testid}"]`).click(),
+      ]);
+      expect(dl.suggestedFilename()).toMatch(new RegExp(`\\.${ext}$`));
+      const p = await dl.path();
+      expect(p).toBeTruthy();
+      return readFileSync(p!);
+    };
+
+    const xlsx = await grab('export-xlsx', 'xlsx');
+    // xlsx 就是 ZIP：头两字节必须是 PK
+    expect(xlsx.subarray(0, 2).toString('hex')).toBe('504b');
+    expect(xlsx.length).toBeGreaterThan(1000);
+
+    const csv = await grab('export-csv', 'csv');
+    // 必须有 UTF-8 BOM，否则 Excel 打开中文乱码
+    expect([...csv.subarray(0, 3)]).toEqual([0xEF, 0xBB, 0xBF]);
+    const text = csv.toString('utf8');
+    expect(text).toContain('工作表,所在行,字段');
+    expect(text).toContain('核对状态');
+  });
+
   test('设置对话框：显示掩码密钥并可测试连通性', async ({ page }) => {
     await page.goto('/');
     await page.locator('[data-testid="settings-btn"]').click();
