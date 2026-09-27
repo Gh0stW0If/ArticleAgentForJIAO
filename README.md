@@ -155,10 +155,29 @@ pnpm accuracy:diagnose            # **失分归因**：分丢在哪、是漏抽�
 pnpm accuracy:coverage            # **覆盖率口径**：只问"金标准要的机器给了没有"
 pnpm report:clinicians            # 面向医生的讨论报告
 pnpm web:e2e                      # Playwright 端到端
-pnpm desktop:build                # 打包便携 exe
+pnpm desktop:build                # 打包便携 exe（不带数据，给开发者/演示）
+pnpm desktop:installer            # **医生安装包**：软件 + 抽取结果 + 原文 PDF → setup.exe
+pnpm desktop:installer:verify     # 安装包验收（拿它当工作区真跑一遍服务）
 ```
 
 完整清单见 `package.json` 的 `scripts`。
+
+## 给医生的安装包
+
+`pnpm desktop:installer` 产出 `build/desktop-installer/ArticleAgent-<版本>-setup.exe`
+（当前 11 年语料下约 **278 MB**）。**装完打开就能核对**：
+
+- 已内置 **11 个年份 / 235 篇**的机器抽取结果 + 原文 PDF + 金标准
+- **不需要配 API 密钥**（只有要重新跑抽取时才需要，在「设置」里填）
+- 桌面与开始菜单快捷方式；按用户安装到 `%LOCALAPPDATA%\Programs\Article Agent`（可写，
+  核对记录才存得下）
+- 包内附 `使用说明.txt`、`备份我的核对记录.bat`、`打开数据文件夹.bat`
+
+⚠️ **包里不含 API 密钥**：打包与验收都会用 `tools/lib/secret_scan.mjs` 扫一遍，
+`runtime/llm.local.json` 或任何 `sk-…` 命中就中止打包。
+⚠️ 卸载会连核对记录一起删（记录就在安装目录里）—— 先跑那个 .bat 备份。
+
+裁剪依据（为什么是 608 MB payload 而不是 2.2 GB）见 `docs/24-desktop-build.md` 第 6 节。
 
 ## 文档
 

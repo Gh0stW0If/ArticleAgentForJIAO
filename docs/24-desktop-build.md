@@ -131,3 +131,98 @@ studyPlan、outcomePlan、outcomeValues、outcomeAudit 五段统计）。
 - `apps/desktop/main.mjs`
 
 不影响的：`docs/`、`build/`（报告、评测、金标准产物）、`Datas/`。
+
+---
+
+## 6. 医生安装包（**带数据**，NSIS setup.exe）
+
+> 与上面 portable exe 的分工：
+> portable = 单文件、**不带数据**，给开发者/演示；
+> 安装包 = NSIS、**带最近一次抽取结果 + 原文 PDF**，给医生，**装完打开就能核对**。
+
+```powershell
+node tools/desktop_installer.mjs                    # 全部年份 + PDF → setup.exe
+node tools/desktop_installer.mjs --years 2025       # 只带某年
+node tools/desktop_installer.mjs --no-pdf           # 不带原文（最小，但点不了"定位证据"）
+node tools/desktop_installer.mjs --payload-only     # 只生成工作区，不打包
+node tools/desktop_installer_verify.mjs --root build/desktop-installer/win-unpacked
+```
+
+相关文件：`apps/desktop/electron-builder-installer.yml`、`tools/desktop_installer.mjs`、
+`tools/desktop_installer_verify.mjs`、`tools/lib/secret_scan.mjs`。
+
+### 6.1 装哪些数据：只带**服务端真正读的**
+
+实测 11 年语料的裁剪效果（608 MB payload → **278.5 MB 安装包**）：
+
+| 目录 | 原样 | 进包 | 依据 |
+|---|---|---|---|
+| `Datas/articles/<年>/*.pdf` | 436 MB | **261 MB** | 只取 `<年>/` 下的正文 PDF；根目录的 `2024.zip` 等**原件压缩包**（175 MB）运行时用不到 |
+| `build/mineru/` | **1303 MB** | **287 MB** | ⚠️ 服务端**只读 `<stem>/<sub>/*_middle.json`**（`mineruDirOf` + `loadMiniDoc`）。同目录的 `images/`、`*_span.pdf`、`*_layout.pdf`、`*_origin.pdf`、`*_model.json` 一个都不读 —— **裁掉它们省了 1 GB** |
+| `build/extraction/` | 55 MB | 55 MB | 界面显示的就是它 |
+| `build/gold/<年>.json` | 14 MB | ~5 MB | Sheet3「待人工裁定」要靠它算；`_reconcile.json`/`naive/` 是审计件，不带 |
+
+### 6.2 ⚠️ 三条不能想当然的地方
+
+**① 绝不能带 API key。** `runtime/llm.local.json` 里是真实密钥，塞进安装包等于
+发给每个拿到包的人。所以 payload 里只放**空的 `runtime/`**（`isWorkspace()` 要求它存在），
+密钥由医生在「设置」里自己填 —— **只想核对的话根本不用填**。
+打包脚本与验收脚本都会用 `tools/lib/secret_scan.mjs` 扫一遍，命中就直接失败。
+
+> 这个扫描器**只扫文本文件**（扩展名白名单）。第一版"除了大 json 之外全读成 utf8"，
+> 结果 Electron 的 `locales\nl.pak`（二进制）里恰好有一段字节构成 `sk-` + 16 位字母数字，
+> **打包被无谓拦住**；反过来 PDF 的压缩流同样会碰巧匹配，让人不敢相信这个检查。
+> 单测 `tools/secret_scan.test.mjs` 把两个方向都钉住了。
+
+**② 必须按用户安装（`perMachine: false`）。** 默认落到
+`%LOCALAPPDATA%\Programs\Article Agent`，**当前用户可写**。
+核对记录写在 `<安装目录>\build\annotations\`，装到 Program Files 下普通用户写不进去，
+一核对就报错。
+
+**③ 数据要落在 exe 旁边，用 `extraFiles` 而不是 `extraResources`。**
+主进程是按"exe 所在目录"（`dirname(app.getPath('exe'))`）认工作区的（见 `main.mjs`
+的 `resolveWorkspace`）。`extraResources` 会落进 `resources\`，认不出来；
+`extraFiles` 正好落在 exe 旁边，于是 `Datas/ build/ runtime/` 一眼就被认出来 ——
+**不需要改一行主进程代码**。
+
+### 6.3 验收不能只看"文件在不在"
+
+`desktop_installer_verify.mjs` 会**拿 payload（或解包出来的安装目录）当工作区，
+把服务真跑起来点一遍**：
+
+```
+✓ 服务已启动（AA_ROOT=payload）
+✓ 2025 年列出 32 篇研究
+✓ 2025-01 字段来自抽取产物（source=extraction）
+✓ Sheet3 有 8 个结局行
+✓ MiniDoc 有 151 个文本块 / 10 页   ← 证明 *_middle.json 的目录层级装对了
+✓ PDF 可下载（文件头 %PDF）
+✓ 「待人工裁定」可用（2025-01 有 4 条）
+✓ 未夹带 API 密钥
+```
+
+为什么必须真点：`build/mineru/` 每个目录有 8 个文件、服务端只读其中一个。
+**只要目录层级错一层，打包不报错、安装也正常，但医生一打开就是"定位证据没反应"。**
+
+### 6.4 医生看到的是什么
+
+安装目录根下：
+
+```
+Article Agent.exe            ← 桌面/开始菜单快捷方式指向它
+Datas/articles/<年>/*.pdf    ← 原文
+build/extraction/            ← 机器抽取结果
+build/mineru/                ← 只含 *_middle.json（定位证据用）
+build/gold/                  ← 金标准
+build/annotations/           ← 他的核对记录（★ 要备份的就是这里）
+build/adjudications/         ← 结局行裁定
+runtime/                     ← 空；填了 API key 才会出现 llm.local.json
+使用说明.txt                  ← 双击可读（UTF-8 **带 BOM**，防老记事本按 GBK 解）
+备份我的核对记录.bat           ← 一键把三类记录复制到带日期的文件夹
+打开数据文件夹.bat
+```
+
+> ⚠️ **卸载会连核对记录一起删掉**（记录就在安装目录里）。
+> 所以包里带了一键备份脚本，`使用说明.txt` 里也把这条写在最显眼的位置。
+> 这是"零配置安装"换来的代价：数据就在程序旁边，备份/迁移要靠那个 .bat。
+
