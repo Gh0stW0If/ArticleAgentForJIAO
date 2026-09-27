@@ -76,6 +76,9 @@ files:
     to: tools
     filter:
       - '**/*.mjs'
+      # ⚠️ 测试文件不进运行时包：它们不影响功能，但 `secret_scan.test.mjs` 里
+      # 有**假的 sk- 样本**，会被打包时的密钥扫描如实报出来（实测踩到）。
+      - '!**/*.test.mjs'
   - from: ../../packages/core/dist
     to: packages/core/dist
   - from: ../../packages/ingest/dist
