@@ -244,9 +244,25 @@ export function createDeepSeekLlm(opts: DeepSeekOptions): DeepSeekLlm {
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      const kind: DeepSeekErrorKind = res.status === 401 || res.status === 403 ? 'auth' : 'http';
+      /*
+       * ⚠️ 不要把 403 一律当成"key 不对"。
+       *
+       * 实测：某个 OpenAI 兼容端点**余额用尽**时也返回 403
+       * （`{"error":{"message":"insufficient balance","type":"billing_error"}}`），
+       * 而提示当时写的是"鉴权失败，请检查 API key"——会把人带去查错方向
+       * （真去换 key，而问题其实是充值）。
+       * 另外报错里也别写死 "DeepSeek"：这个客户端现在也用于别的兼容端点，
+       * 写死会让人以为是 DeepSeek 那边出的问题。用实际 host。
+       */
+      const host = (() => { try { return new URL(baseUrl).host; } catch { return baseUrl; } })();
+      const billing = /insufficient|balance|quota|billing|欠费|余额|配额/i.test(text);
+      const authish = !billing && (res.status === 401 || res.status === 403);
+      const kind: DeepSeekErrorKind = authish ? 'auth' : 'http';
+      const hint = billing
+        ? '（余额/配额不足，不是 key 的问题）'
+        : authish ? '（鉴权失败，请检查 API key）' : '';
       const msg = redact(
-        `DeepSeek HTTP ${res.status}${kind === 'auth' ? '（鉴权失败，请检查 API key）' : ''}：${text.slice(0, 300)}`,
+        `${host} HTTP ${res.status}${hint}：${text.slice(0, 300)}`,
       );
       record({ ...base, ms: Date.now() - started, ok: false, outputChars: 0, status: res.status, error: msg, kind });
       throw new DeepSeekError(msg, kind, { tag: req.tag, attempt, status: res.status, body: redact(text.slice(0, 500)) });

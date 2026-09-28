@@ -247,6 +247,17 @@ const runSummary = {
 for (const studyId of studies) {
   console.log(`\n──── ${studyId} ────`);
   const t0 = Date.now();
+  /**
+   * 本篇开始的调用计数。
+   *
+   * 用来判定"全盘失败"：`llm.calls` 每次请求都推一条带 `ok` 的记录。
+   * ⚠️ 光看"有没有抛异常"不够 —— 每个 SKILL 的失败都被 catch 住、记进 issues
+   * 后继续跑下一个，所以"余额用尽"这种全盘失败也会走完全程、写出几乎空的产物。
+   * 而且"所有 SKILL 都失败"这个判据也不够：实测 7 个 SKILL 里有 4 个"成功地"
+   * 跑出了 0 项（每次调用都失败但被吞掉），照样被判成成功。
+   * **调用级**才是准的。
+   */
+  const callsBefore = llm.calls.length;
 
   let ing;
   try {
@@ -550,13 +561,45 @@ for (const studyId of studies) {
 
   const errors = extraction.issues.filter((i) => i.severity === 'error').length;
   const warns = extraction.issues.filter((i) => i.severity === 'warning').length;
+
+  /*
+   * "跑完没抛异常" ≠ "抽成功了"（判据说明见 callsBefore 处）。
+   * ⚠️ 假成功比直接报错危险得多：实测 2015-06 的 14 次调用全 403，
+   * 产物只剩 149 个叶子（基线 434），跑批却报"成功 6 / 6 篇"。
+   */
+  const artCalls = llm.calls.slice(callsBefore);
+  const okCalls = artCalls.filter((c) => c.ok).length;
+  const failedCalls = artCalls.length - okCalls;
+  const skillNames = Object.keys(perSkill);
+  const skillFailed = skillNames.filter((n) => perSkill[n]?.error);
+
+  const catastrophic = fieldCount === 0
+    || (artCalls.length > 0 && okCalls === 0)
+    || (skillNames.length > 0 && skillFailed.length === skillNames.length);
+  const failure = catastrophic
+    ? (artCalls.length > 0 && okCalls === 0
+      ? `本篇 ${artCalls.length} 次 LLM 调用全部失败（首个：${artCalls.find((c) => !c.ok)?.error ?? '未知'}）`
+      : skillFailed.length
+        ? `全部 ${skillFailed.length} 个 SKILL 都失败（首个：${perSkill[skillFailed[0]].error}）`
+        : '没有抽到任何字段')
+    : null;
+
   console.log(`  → ${file.replace(ROOT + '\\', '')}`);
   console.log(`  字段 ${fieldCount} | 证据违规 ${violations.length} | issue error ${errors} / warn ${warns} | ${Date.now() - t0}ms`);
+  if (failedCalls > 0) {
+    // 部分失败也要看得见：以前只在上面逐行打 ✗，汇总里完全看不出来
+    const pct = ((failedCalls / artCalls.length) * 100).toFixed(0);
+    console.warn(`  ⚠ ${failedCalls}/${artCalls.length} 次调用失败（${pct}%）`
+      + (skillFailed.length ? `，涉及 SKILL：${skillFailed.join('、')}` : ''));
+  }
 
   runSummary.articles.push({
-    studyId: doc.articleId, ok: true, file: file.replace(ROOT + '\\', ''),
+    studyId: doc.articleId, ok: !catastrophic, file: file.replace(ROOT + '\\', ''),
     perSkill, fields: fieldCount, evidenceViolations: violations.length,
     errors, warns, ms: Date.now() - t0,
+    calls: artCalls.length, callsFailed: failedCalls,
+    skillsFailed: skillFailed.length, skillsTotal: skillNames.length,
+    ...(failure ? { error: failure } : {}),
     comparisons: extraction.comparisons.length, outcomes: extraction.outcomes.length,
   });
 }
@@ -590,5 +633,10 @@ if (gTot) {
 }
 const failed = runSummary.articles.filter((a) => !a.ok);
 console.log(`  成功 ${runSummary.articles.length - failed.length} / ${runSummary.articles.length} 篇`);
+if (failed.length) {
+  // 把失败原因一并打出来：以前只有一行"成功 N/M"，得往上翻几十行才知道为什么
+  console.error('\n  ✗ 失败的篇：');
+  for (const a of failed) console.error(`    ${a.studyId}  字段 ${a.fields}  —— ${a.error ?? '未知原因'}`);
+}
 console.log(`  报告 build/extraction/${args.year}/_run.json\n`);
 process.exit(failed.length ? 1 : 0);

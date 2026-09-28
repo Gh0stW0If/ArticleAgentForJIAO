@@ -98,6 +98,29 @@ describe('deepseek — 请求形状', () => {
     await expect(llm.invoke(req())).rejects.toThrow(/服务端上限截断/);
   });
 
+  it('403 + 余额不足：提示指向"余额"，不要误报成"检查 API key"', async () => {
+    /* 实测：某 OpenAI 兼容端点余额用尽时返回 403
+       （{"error":{"message":"insufficient balance","type":"billing_error"}}）。
+       当时提示写的是"鉴权失败，请检查 API key"，会把人带去换 key —— 而问题其实是充值。 */
+    const llm = createDeepSeekLlm({
+      apiKey: KEY, retries: 0,
+      fetchImpl: (async () => errResponse(403, '{"error":{"message":"insufficient balance","type":"billing_error"}}')) as unknown as typeof fetch,
+    });
+    const e = await llm.invoke(req()).catch((x: Error) => x);
+    expect(String(e)).toMatch(/余额\/配额不足/);
+    expect(String(e)).not.toMatch(/检查 API key/);
+  });
+
+  it('报错里用实际 host，不写死 "DeepSeek"（客户端也用于别的兼容端点）', async () => {
+    const llm = createDeepSeekLlm({
+      apiKey: KEY, baseUrl: 'https://api.example.com/v1', retries: 0,
+      fetchImpl: (async () => errResponse(500, 'boom')) as unknown as typeof fetch,
+    });
+    const e = await llm.invoke(req()).catch((x: Error) => x);
+    expect(String(e)).toMatch(/api\.example\.com HTTP 500/);
+    expect(String(e)).not.toMatch(/DeepSeek HTTP/);
+  });
+
   it('baseUrl 带 /v1 或尾斜杠时不会拼出双斜杠', async () => {
     const urls: string[] = [];
     const mk = (baseUrl: string) => createDeepSeekLlm({
