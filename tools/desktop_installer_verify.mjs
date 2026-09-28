@@ -27,6 +27,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findSecretLeaks } from './lib/secret_scan.mjs';
+import { scanRuntimeDeps } from './desktop_dep_scan.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -160,9 +161,33 @@ try {
   srv.kill();
 }
 
-/* ------------------------------ 3. 安装包文件 ------------------------------ */
+/* ------------------------------ 3. 运行时依赖是否都进包了 ------------------------------ */
 
-console.log('\n§3 安装包产物');
+/*
+ * 这条一定要查：打包只搬 `@aa/*` 与壳代码，**不搬第三方依赖**。
+ * 某个 `.mjs` 只要 import 了一个第三方包，开发机上永远发现不了
+ * （node_modules 就在旁边），一到干净机器就 ERR_MODULE_NOT_FOUND。
+ * 详见 tools/desktop_dep_scan.mjs 顶部说明。
+ */
+console.log('\n§3 运行时可达依赖');
+{
+  const appDir = existsSync(join(PAYLOAD, 'resources', 'app'))
+    ? join(PAYLOAD, 'resources', 'app')                          // 传进来的是解包后的安装目录
+    : join(PAYLOAD, 'win-unpacked', 'resources', 'app');         // 或仓库里的固定位置
+  if (!existsSync(appDir)) {
+    ok('跳过（当前只验 payload，没有壳代码可查）');
+  } else {
+    const r = scanRuntimeDeps(appDir);
+    check(r.missing.length === 0,
+      `可达 ${r.files} 个文件，裸依赖 ${r.bare.join('、') || '（无）'}，全部可解析`,
+      `有 ${r.missing.length} 个模块包内解析不到（干净机器会 ERR_MODULE_NOT_FOUND）：`
+        + r.missing.map((m) => `${m.spec} ← ${m.from}`).join('；'));
+  }
+}
+
+/* ------------------------------ 4. 安装包文件 ------------------------------ */
+
+console.log('\n§4 安装包产物');
 const outDir = join(ROOT, 'build', 'desktop-installer');
 const setups = existsSync(outDir)
   ? readdirSync(outDir).filter((f) => f.endsWith('.exe')).map((f) => join(outDir, f))

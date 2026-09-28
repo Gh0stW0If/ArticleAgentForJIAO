@@ -258,3 +258,69 @@ outcomes.3（health-related quality of life (mental component)）取值失败：
 > ⚠️ 这是**客户端行为**，服务端不一定认。实测 `https://api.lvping.cloud/v1`
 > 省略 `max_tokens` 正常工作。
 
+---
+
+## 8. 干净机器上什么能用、什么不能用
+
+> 结论：**核对全流程零依赖**；「抽取」也能用（不需要系统装 Node）；
+> **只有「解析」用不了**（要 MinerU 的 Python 环境，几 GB，没打进包）。
+
+### 8.1 逐项
+
+| 功能 | 干净机器 | 依据 |
+|---|---|---|
+| 打开界面、看 PDF、看抽取结果 | ✅ | Electron 自带 Chromium + Node，机器上**不用装 Node** |
+| 点字段定位证据 / 解析块 / 框选证据 | ✅ | 靠包内的 `*_middle.json` 与 PDF |
+| 编辑 / 确认 / 回滚 / 新增字段 | ✅ | 只写安装目录下的 `build/annotations` |
+| Sheet3「待人工裁定」保留 / 丢弃 | ✅ | 只写 `build/adjudications` |
+| 导出 XLSX / CSV、导回、两组对比 | ✅ | 零依赖自写的 ZIP/OOXML |
+| **重新抽取**（顶栏「抽取」） | ✅ | ⚠️ 见下：spawn 的是 **Electron 自带的 Node**，不需要系统 Node；只需在「设置」里填自己的 API key |
+| **重新解析 PDF**（顶栏「解析」） | ❌ | 需要 `runtime/mineru/Scripts/mineru.exe`；没装会返回**友好报错**（`MinerU 未安装：<路径>`），不会崩 |
+
+### 8.2 「抽取」为什么不需要系统 Node
+
+```js
+startJob('extract', …, process.execPath,
+  [join(APP_DIR,'tools','llm_run.mjs'), '--year', year, '--only', study],
+  { ELECTRON_RUN_AS_NODE: '1' })          // ← 关键
+```
+
+`process.execPath` 是 Electron 主程序本身；带上 `ELECTRON_RUN_AS_NODE=1` 它就**以 node 模式**
+跑那个脚本。所以不需要机器上有 node，也不需要 PATH 里有任何东西。
+
+### 8.3 「解析」为什么进不了包
+
+MinerU 是 Python 环境 + 数 GB 模型，塞进安装包会让体积翻好几倍。
+所以设计上就是：**解析与抽取在开发机做，医生只做核对**。
+包内已带 235 篇的解析与抽取结果，医生不需要自己跑。
+
+### 8.4 依赖完整性怎么保证
+
+打包只搬 `@aa/*`（各包 dist）+ 壳代码，**不搬第三方依赖**。因此只要哪个 `.mjs`
+import 了一个第三方包，开发机上永远发现不了（`node_modules` 就在旁边），
+一到干净机器就 `ERR_MODULE_NOT_FOUND`。
+
+用 `pnpm desktop:dep-scan` 从**两个真实入口**（`apps/web/server.mjs`、
+`tools/llm_run.mjs`）做可达性遍历，检查可达模块在包内是否都能解析。实测：
+
+```
+可达文件 65 个
+node 内置 7 个：child_process, crypto, fs, http, path, url, zlib
+裸包依赖 3 个：@aa/core, @aa/crossref, @aa/europepmc
+✓ 运行时用到的模块在包内全部可解析
+```
+
+> 为什么按**可达性**扫而不是扫全目录：`tools/` 里有一堆开发/审计脚本
+> （`deck_layout_check.mjs`、`_shot.mjs`…）import 了 `playwright` 这类打包不会带的依赖，
+> 全目录扫描会把它们误报成"缺依赖"，而服务端永远不会调用它们。
+> 这条检查已接进 `pnpm desktop:installer:verify`（§3）。
+
+### 8.5 干净机器上的两个实际提醒
+
+1. **安装包没有代码签名**（`forceCodeSigning: false`，本机自用）。
+   Windows SmartScreen 会拦一次：**「更多信息」→「仍要运行」**。
+   要消除得买代码签名证书。
+2. **系统要求**：Windows 10/11 64 位（Electron 44 不支持 Win7/8）。
+   安装后占用约 **994 MB**（程序 386 MB + 原文 260 MB + 产物 348 MB），
+   安装包本身 278 MB。
+

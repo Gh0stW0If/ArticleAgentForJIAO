@@ -62,6 +62,7 @@
     "desktop:installer": "node tools/desktop_installer.mjs",
     "desktop:installer:payload": "node tools/desktop_installer.mjs --payload-only",
     "desktop:installer:verify": "node tools/desktop_installer_verify.mjs",
+    "desktop:dep-scan": "node tools/desktop_dep_scan.mjs",
     "desktop:stage": "node tools/desktop_stage_modules.mjs",
     "icon": "node tools/make_icon.mjs build/icon.png",
     "deck": "node tools/make_deck.mjs && node tools/deck_preview.mjs",
