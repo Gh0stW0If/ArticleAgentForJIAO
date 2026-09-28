@@ -68,6 +68,36 @@ describe('deepseek — 请求形状', () => {
     expect(res.usage).toEqual({ inputTokens: 100, outputTokens: 20 });
   });
 
+  it('maxTokens 给 0 = 不限制：整个省略 max_tokens，由服务端用自己的上限', async () => {
+    /* 为什么要这个口子：实测 gpt-6-sol 在长输出上会顶到 8000 被截断，
+       回来的是不完整 JSON、整段字段白丢。而"该填多少"没人说得准，
+       所以支持"不填"比"拍一个数"可靠。 */
+    const calls: { init: RequestInit }[] = [];
+    const llm = createDeepSeekLlm({
+      apiKey: KEY,
+      maxTokens: 0,
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        calls.push({ init });
+        return okResponse('{"ok":true}');
+      }) as unknown as typeof fetch,
+    });
+    await llm.invoke(req());
+    const body = JSON.parse(String(calls[0]!.init.body));
+    expect('max_tokens' in body).toBe(false);   // 关键：字段不存在，而不是 null / 0
+    expect(body.temperature).toBe(0);           // 其余照旧
+    expect(body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('不限制时的截断提示不再谎报成 max_tokens 的锅', async () => {
+    const llm = createDeepSeekLlm({
+      apiKey: KEY,
+      maxTokens: 0,
+      retries: 0,
+      fetchImpl: (async () => okResponse('{"a":1}', { choices: [{ message: { content: '{"a":1}' }, finish_reason: 'length' }] })) as unknown as typeof fetch,
+    });
+    await expect(llm.invoke(req())).rejects.toThrow(/服务端上限截断/);
+  });
+
   it('baseUrl 带 /v1 或尾斜杠时不会拼出双斜杠', async () => {
     const urls: string[] = [];
     const mk = (baseUrl: string) => createDeepSeekLlm({

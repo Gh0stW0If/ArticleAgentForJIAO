@@ -191,8 +191,17 @@ export function SettingsPanel({ onClose, onSaved, fontScale, onFontScale }: Prop
           </div>
           <div style={{ flex: 1 }}>
             <label style={label}>maxTokens</label>
-            <input style={inp} value={form.maxTokens} onChange={(e) => setForm({ ...form, maxTokens: e.target.value })} />
+            <input
+              style={inp} value={form.maxTokens}
+              data-testid="max-tokens"
+              onChange={(e) => setForm({ ...form, maxTokens: e.target.value })}
+            />
           </div>
+        </div>
+        <div style={{ fontSize: 10.5, color: T.faint, marginTop: 5, lineHeight: 1.6 }}>
+          maxTokens 填 <b>0</b> = <b>不限制</b>：客户端会整个省略这个参数，交给服务端用它自己的上限。
+          长输出的模型（实测 gpt-6-sol 的 outcome-values / audit）会顶到 8000 被截断，
+          回来的是<b>不完整 JSON</b>、整段字段白丢 —— 拿不准就填 0。
         </div>
 
         <label style={label}>Crossref mailto（用于联网核验 meta，Crossref 要求带邮箱）</label>

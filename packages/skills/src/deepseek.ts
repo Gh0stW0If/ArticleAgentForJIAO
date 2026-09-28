@@ -164,6 +164,14 @@ export function createDeepSeekLlm(opts: DeepSeekOptions): DeepSeekLlm {
   const model = opts.model ?? 'deepseek-chat';
   const temperature = opts.temperature ?? 0;
   const maxTokens = opts.maxTokens ?? 8000;
+  /*
+   * `maxTokens` 给 0 或负数 = **不限制**：把 `max_tokens` 整个省略、由服务端用它自己的默认上限。
+   *
+   * 为什么要留这个口子：实测 gpt-6-sol 在 outcome-values/audit 这类长输出上会超过 8000，
+   * 结果 `finish_reason === 'length'`，回来的是**截断的 JSON**、整段字段白丢。
+   * 而"到底该填多少"没人说得准（不同模型上限不同），所以"不填"比"填一个拍脑袋的数"可靠。
+   */
+  const noMaxTokens = !(Number.isFinite(maxTokens) && maxTokens > 0);
   const timeoutMs = opts.timeoutMs ?? 300_000;
   const retries = opts.retries ?? 2;
   const jsonMode = opts.jsonMode ?? true;
@@ -203,7 +211,8 @@ export function createDeepSeekLlm(opts: DeepSeekOptions): DeepSeekLlm {
         { role: 'user', content: req.user },
       ],
       temperature: req.temperature ?? temperature,
-      max_tokens: maxTokens,
+      // 不限制时整个省略 —— 见上面 noMaxTokens 的说明
+      ...(noMaxTokens ? {} : { max_tokens: maxTokens }),
       stream: false,
       ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
     };
@@ -260,7 +269,9 @@ export function createDeepSeekLlm(opts: DeepSeekOptions): DeepSeekLlm {
       : undefined;
 
     if (finishReason === 'length') {
-      const msg = `输出被 max_tokens(${maxTokens}) 截断，JSON 必然不完整——请提高 maxTokens 或缩小材料`;
+      const msg = noMaxTokens
+        ? '输出被服务端上限截断（本次未限制 max_tokens），JSON 必然不完整——请缩小材料或换更短输出的模型'
+        : `输出被 max_tokens(${maxTokens}) 截断，JSON 必然不完整——请提高 maxTokens 或缩小材料`;
       record({ ...base, ms: Date.now() - started, ok: false, outputChars: text.length, ...(usage ? { usage } : {}), finishReason, error: msg, kind: 'truncated' });
       throw new DeepSeekError(msg, 'truncated', { tag: req.tag, attempt });
     }

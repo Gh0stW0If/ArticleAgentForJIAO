@@ -226,3 +226,35 @@ runtime/                     ← 空；填了 API key 才会出现 llm.local.jso
 > 所以包里带了一键备份脚本，`使用说明.txt` 里也把这条写在最显眼的位置。
 > 这是"零配置安装"换来的代价：数据就在程序旁边，备份/迁移要靠那个 .bat。
 
+---
+
+## 7. `maxTokens: 0` = 不限制（换长输出模型时必须知道）
+
+`runtime/llm.local.json` 与界面「设置」里的 `maxTokens`，填 **0** 表示**不限制**：
+客户端会**整个省略** `max_tokens` 参数（不是填 0、也不是填 null），
+由服务端用它自己的默认上限。实现在 `packages/skills/src/deepseek.ts` 的 `noMaxTokens`。
+
+**为什么需要这个口子**：默认 8000 对长输出模型不够。实测 `gpt-6-sol` 在
+`outcome-values` / `outcome-audit` 这类调用上会顶到 8000，`finish_reason === 'length'`，
+回来的是一段**被截断的 JSON**，解析失败 → **整段字段白丢**：
+
+```
+outcomes.3（health-related quality of life (mental component)）取值失败：
+输出被 max_tokens(8000) 截断，JSON 必然不完整——请提高 maxTokens
+```
+
+而"到底该填多少"没人说得准（各模型上限不同），所以**"不填"比"拍一个数"可靠**。
+
+截断的报错信息会区分两种情形（未限制时不再谎报成"max_tokens 的锅"）：
+
+| 情形 | 报错 |
+|---|---|
+| 设了 maxTokens | `输出被 max_tokens(8000) 截断…` |
+| 未限制（0） | `输出被服务端上限截断（本次未限制 max_tokens）…` |
+
+回归测试：`packages/skills/src/__tests__/deepseek.test.ts` 断言
+`maxTokens: 0` 时请求体里**没有** `max_tokens` 字段（而不是 0 或 null）。
+
+> ⚠️ 这是**客户端行为**，服务端不一定认。实测 `https://api.lvping.cloud/v1`
+> 省略 `max_tokens` 正常工作。
+
