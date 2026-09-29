@@ -403,27 +403,115 @@ mac 上的摆放方式（`main.mjs` 已按此改好，见 9.4）：
 
 ### 9.5 未签名会怎样、怎么绕过
 
-`electron-builder-mac.yml` 里 `identity: null` = 不签名（本机没有 Apple 开发者证书）。
-后果：从网上下载的 app 带 `com.apple.quarantine`，macOS 会拒绝打开
-（"无法验证开发者" / "已损坏"）。
+> ⚠️ 这一节我第一版写错过，已按 electron-builder 官方文档改正：
+> 原文说"arm64 上所有可执行代码至少要 ad-hoc 签名 → 未签名根本起不来（拒绝执行）"。
+> **这个说法太强**。官方文档明确：*"On Apple Silicon, unsigned apps can still be
+> run locally by approving them in System Settings → Privacy & Security."*
+> 未签名/未公证的 app 会被 **Gatekeeper 拦一次**，但用户批准后可以运行。
 
-**内部分发的绕法**（让医生做一次）：
+`mac.identity` 的四种取值（见 `electron-builder-mac.yml` 注释）：
+
+| 取值 | 行为 |
+|---|---|
+| 不设（本仓库当前） | 从钥匙串找证书；**找不到就跳过签名** |
+| `null` | 完全跳过签名 |
+| `"-"` | **ad-hoc 签名**（自签、无 Team ID）。electron-builder 会自动给 app 与嵌套二进制加上 `allow-jit` + `disable-library-validation` 两项 entitlement（因为 Electron 预编译框架带 Apple 的 Team ID，不关库校验会起不来） |
+| 证书名 | 用指定证书 |
+
+⚠️ 两个容易写错的地方：
+- 写 `identity: null` 是**错的默认** —— 它连 ad-hoc 都不做。想要 ad-hoc 必须显式 `"-"`。
+- 但 `identity: "-"` 也**不能写死在 yml 里**，否则会顶掉真证书。
+  所以本仓库的 yml **不写 identity**，由调用方决定：
+  CI 里导入了证书就自动发现，没有证书时由 workflow 传 `-c.mac.identity=-`。
+
+**医生拿到未签名包时的放行办法**（任选其一）：
 
 ```bash
 xattr -dr com.apple.quarantine "Article Agent.app"
 ```
 
-或右键 →「打开」→ 弹窗里再点「打开」。
-
-**正式分发**需要 Apple Developer 账号（$99/年）+ 证书 + 公证；
-工作流里已经把需要的步骤与 Secrets 清单写成注释了。
+- 右键点 app →「打开」→ 弹窗里再点「打开」
+- 「系统设置 → 隐私与安全性」→ 底下会出现"已阻止…"→ 点「仍要打开」
 
 ### 9.6 为什么不做"Windows 上交叉编译"
 
 能凑出一个 `.app` 目录结构，但：
-- **签不了名 → arm64 上根本起不来**（不是警告，是拒绝执行）
+- **签不了名** —— 可以本地批准运行，但每次都要人工放行，且没法公证
 - 做不了 dmg/pkg → 交到医生手里是压缩包，不是安装包
 - 每次都要手工对齐 Electron 运行时版本
 
 所以直接用 mac runner 最省事也最可靠。
+
+### 9.7 怎么拿到 Apple 开发者证书
+
+**先想清楚值不值**。三条路线：
+
+| 路线 | 成本 | 医生的体验 |
+|---|---|---|
+| **A. 不签**（现状） | ￥0 | 拿到后要跑一次 `xattr` 命令，或在系统设置里批准一次 |
+| **B. ad-hoc 签名** | ￥0 | **和 A 一样**仍要放行一次 —— ad-hoc 过不了 Gatekeeper/公证，只是保证包结构完整、能本地批准运行 |
+| **C. Developer ID 签名 + 公证** | **$99/年** | **双击就能开**，没有任何警告 |
+
+> 结论：**只是给几位合作医生用，走 A 就够了**（一条 `xattr` 命令，或右键→打开）。
+> 只有要"发给不熟电脑的人、且不想教他们跑命令"时才值得花 $99。
+
+#### 走 C 的完整步骤
+
+**① 注册 Apple Developer Program**
+
+- 用 Apple ID 到 <https://developer.apple.com/cn/programs/> 注册
+- **个人（Individual）**：实名验证（身份证/护照），通常 **1–2 天**通过
+- **组织（Organization）**：需要 **D-U-N-S（邓白氏）编码** 与法定实体名，
+  Apple 会核验；没有 D-U-N-S 要先免费申请，整体可能 **1–2 周**
+- 费用 **$99/年**（中国区结账页会显示人民币金额；以结账页为准）
+- ⚠️ 个人账号签名后显示的是**个人姓名**，不是机构名 —— 要显示机构名必须用组织账号
+
+**② 创建 Developer ID Application 证书**（这一步**必须在 Mac 上做**）
+
+> 为什么必须在 Mac：「证书助理」生成 CSR、以及与私钥配对导出 `.p12`，
+> 都依赖 macOS 的「钥匙串访问」。Windows 上用 OpenSSL 理论上能生成 CSR，
+> 但 Apple 的流程与文档都是围绕钥匙串的，容易在"私钥没配对"上翻车。
+> **借一台 Mac 做一次（约 30 分钟），之后证书可以长期在 CI 里复用。**
+
+1. Mac 上打开「钥匙串访问」→ 菜单「证书助理」→「从证书颁发机构请求证书」
+2. 填 Apple ID 邮箱；选「存储到磁盘」→ 得到 `CertificateSigningRequest.certSigningRequest`
+3. 到 <https://developer.apple.com/account/resources/certificates> →
+   新建 → 选 **Developer ID Application** → 上传刚才的 CSR
+4. 下载 `.cer` → 双击导入钥匙串（此时证书与私钥已配对）
+5. 在钥匙串里找到它 → 右键「导出」→ 存成 **`.p12`**，**设一个导出密码**
+
+**③ 配进 CI**
+
+```powershell
+# 把 .p12 转成 base64（Windows 上也能做）
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("cert.p12")) | Set-Clipboard
+```
+
+GitHub 仓库 → Settings → Secrets and variables → Actions，加：
+
+| Secret | 内容 |
+|---|---|
+| `MAC_CERT_P12` | 上面那串 base64 |
+| `MAC_CERT_PASSWORD` | 导出 `.p12` 时设的密码 |
+| `APPLE_ID` | Apple ID 邮箱（公证用） |
+| `APPLE_APP_SPECIFIC_PASSWORD` | 在 <https://appleid.apple.com> →「登录与安全」生成的 App 专用密码 |
+| `APPLE_TEAM_ID` | <https://developer.apple.com/account> → Membership 里的 Team ID（10 位） |
+
+然后把 `electron-builder-mac.yml` 里 `mac.notarize` 那段注释打开、填上 teamId。
+工作流会**自动判断**：配了 Secret 就用真证书 + 公证，没配就退化成 ad-hoc。
+
+**④ 公证要多久**
+
+Apple 的公证是自动化的，通常**几分钟**；偶尔排队到十几分钟。
+electron-builder 会等结果并把公证凭据 staple 进 dmg。
+
+#### 常见坑
+
+- **证书导出时没带私钥** → CI 里报"no identity found"。在钥匙串里展开证书，
+  确认下面挂着私钥再一起导出。
+- **`.p12` 密码里有特殊字符** → 塞进 Secret 没问题，但本地测试时记得加引号。
+- **公证一直失败** → 多半是 app 里有未签名的嵌套二进制（本仓库用 `asar: false`，
+  `tools/` 下全是 `.mjs`，不需要单独签；但如果你日后加了原生模块要注意）。
+- **账号一年不续费** → 证书失效，**已分发的 app 仍能打开**（公证凭据已 staple），
+  但重新打包需要续费。
 
