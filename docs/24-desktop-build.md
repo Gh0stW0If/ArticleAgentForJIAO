@@ -572,3 +572,104 @@ ArticleAgent/
 - **CI 未实测**：`.github/workflows/build-macos.yml` 只是写好并过了 YAML 校验，
   **还没真跑过**。第一次跑多半会暴露小问题（比如 mac 上某些单测的平台差异）。
 
+---
+
+## 10. 网页版部署（**不打 dmg**，Mac 用浏览器就能用）
+
+> 打 dmg 那条路上有打包、签名、公证三座山。而**这个工具的架构本来就是
+> "一个零依赖的本地 HTTP 服务 + 静态前端"，Electron 只是个壳**。
+> 把壳去掉，问题就少了一大半。
+
+### 10.1 为什么网页版更省事
+
+`apps/web/server.mjs` 只依赖 **node 内置模块 + 相对路径 import**
+（可达性扫描见 §8.4：65 个文件、7 个 node 内置、3 个 `@aa/*`，无第三方依赖），
+前端是静态 `dist`。于是：
+
+| | Electron 安装包 / dmg | **网页版** |
+|---|---|---|
+| 要在 macOS 上打包吗 | 要（electron-builder 拒绝跨平台） | **不用**，Windows 上就能产出 |
+| 要签名的吗 | 要（否则每次放行） | **不需要** —— Gatekeeper 完全不参与 |
+| 要公证吗 | 正式分发要 | **不需要** |
+| 体积 | 278.5 MB（含全部数据） | **4.8 MB**（含 2015 数据）/ 约 15 MB（含全部数据） |
+| 目标机器要装什么 | 什么都不用 | **Node.js**（官网安装包，官方签名，双击装） |
+
+**附带的好处**：网页版里 `process.execPath` 就是 `node` 本身，
+所以顶栏「**抽取**」按钮**能直接用**（在「设置」里填自己的 API key）。
+和 Electron 版一样，只有「解析」需要 MinerU 而用不了。
+
+### 10.2 怎么生成
+
+```powershell
+# 先只带 2015（4.8 MB），发过去冒烟测试
+node tools/desktop_web_bundle.mjs --years 2015 --skip-tsc --out build/web-test
+node tools/desktop_web_bundle_verify.mjs --root build/web-test     # 23 项
+tar -a -c -f build/ArticleAgent-网页版-2015.zip -C build/web-test .
+
+# 全部年份（11 年 235 篇）
+node tools/desktop_web_bundle.mjs --skip-tsc --out build/web-bundle
+node tools/desktop_web_bundle.mjs --no-data --out build/web-codeonly   # 只出程序
+```
+
+产物布局**刻意和仓库一致**，因为 `server.mjs` 里 `APP_DIR`/`ROOT` 是写死的：
+
+```
+web-test/
+├── apps/web/server.mjs + dist/    服务与界面
+├── tools/  packages/             抽取流程代码
+├── node_modules/@aa/             裸包名解析（0.9 MB 的廉价保险）
+├── Datas/  build/  runtime/      工作区数据（与仓库同布局）
+├── 启动.command                  Mac 双击启动
+├── 启动.bat                      Windows 双击启动
+└── 使用说明.txt                  给使用者看的（含 Mac 首次运行注意事项）
+```
+
+在包根执行 `node apps/web/server.mjs`，`ROOT` 就落在包根，不用配任何环境变量。
+
+### 10.3 走这条路的三个坑（都踩过）
+
+1. **不能把数据步骤指到已放好代码的目录**。`desktop_installer.mjs` 会**先清空**
+   输出目录，于是刚拷好的代码被整个删掉 —— 实测报"代码 519 个文件"，
+   但最终体积只有数据的 12.4 MB。现在数据先落 `build/_webbundle-data` 临时目录再合并。
+   （和 §9.8 "给 Mac 生成工作区必须用 `--out`" 是同一类坑，方向相反。）
+2. **`packages/` 只能带 `dist`，不能整个拷** —— `src/**/__tests__` 里有
+   有意写的假密钥 `sk-test-…`，密钥扫描会如实拦下来（拦对了，是该改复制范围）。
+3. **数"抽取结果 N 篇"要排除 `_run.json`**。抽取目录里每年还有一个运行报告，
+   用 `endsWith('.json')` 会把它算成文章 → 11 年合计显示 235 篇（实际 224），
+   并让"每篇都有 `*_middle.json`"的检查在单年 payload 上误报。
+
+### 10.4 另一个更省事的路子：Mac 什么都不装
+
+服务开在 Windows 上，Mac 用浏览器访问 —— **Mac 连 Node 都不用装**：
+
+```powershell
+$env:AA_HOST='0.0.0.0'; node apps/web/server.mjs
+```
+
+启动日志会直接打印同网段的访问地址，例如：
+
+```
+⚠️ 已对外监听（AA_HOST=0.0.0.0）：同网段的机器可以访问，且能读改本工作区
+   对方浏览器打开：http://10.128.63.108:43130/
+   本服务**没有鉴权**，用完请关掉；别在公共网络上这么开。
+```
+
+> ⚠️ **这个服务没有任何鉴权，而且能写文件**（核对记录、裁定、导入的 PDF）。
+> 绑 `0.0.0.0` 等于把工作区敞开给同网段任何人。**只在可信局域网临时这么做。**
+> 所以默认值必须是 `127.0.0.1`，而且真对外监听时要在日志里把话说明白。
+
+### 10.5 三条路怎么选
+
+| 场景 | 选哪条 |
+|---|---|
+| **只是想让人在 Mac 上快速试一下** | §10.4 —— Mac 什么都不装，最快 |
+| **Mac 上要长期用、能离线** | §10.2 网页版包 + Mac 装 Node —— 4.8 MB，无签名问题 |
+| **要发给不熟电脑的人、双击就用** | 只能走 dmg + 签名公证（§9.7，$99/年） |
+
+### 10.6 还没做的
+
+- 网页版的「启动.command」在 Windows 上打的 zip **可能丢可执行位**
+  （zip 的外部属性由 Windows 的 tar 决定，没实测过）。
+  所以 `使用说明.txt` 里同时给了"`chmod +x`"和"直接跑 `node`"两条路。
+- 网页版**不做端口回退**：43130 被占就直接报错（Electron 版会自动往后找）。
+

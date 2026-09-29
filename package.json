@@ -64,6 +64,8 @@
     "desktop:installer:verify": "node tools/desktop_installer_verify.mjs",
     "desktop:dep-scan": "node tools/desktop_dep_scan.mjs",
     "desktop:mac": "cd apps/desktop && electron-builder --mac --arm64 --config electron-builder-mac.yml",
+    "web:bundle": "node tools/desktop_web_bundle.mjs",
+    "web:bundle:verify": "node tools/desktop_web_bundle_verify.mjs",
     "desktop:stage": "node tools/desktop_stage_modules.mjs",
     "icon": "node tools/make_icon.mjs build/icon.png",
     "deck": "node tools/make_deck.mjs && node tools/deck_preview.mjs",

@@ -27,6 +27,7 @@
  */
 
 import { createServer } from 'node:http';
+import { networkInterfaces } from 'node:os';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -2167,11 +2168,34 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
+/*
+ * 监听地址默认**只绑本机**。`AA_HOST=0.0.0.0` 时才对外，用于
+ * "服务开在这台机器、让同事用浏览器访问"的场景（比如 Mac 上不想装 Node）。
+ *
+ * ⚠️ 这个服务**没有任何鉴权**，而且能写文件（核对记录、裁定、导入的 PDF）。
+ *    绑到 0.0.0.0 等于把工作区敞开给同网段的任何人。
+ *    只在**可信局域网**里临时这么做，用完就关。所以默认值必须是 127.0.0.1，
+ *    并且真的对外监听时要在启动日志里把话说明白。
+ */
+const HOST = process.env.AA_HOST ?? '127.0.0.1';
+const EXPOSED = HOST !== '127.0.0.1' && HOST !== 'localhost';
+
+server.listen(PORT, HOST, () => {
   console.log(`@aa/web API 已启动: http://127.0.0.1:${PORT}`);
   console.log(`  根目录: ${ROOT}`);
   console.log(`  前端页面: ${existsSync(DIST) ? `http://127.0.0.1:${PORT}/ （dist 已构建）` : '未构建，请先 pnpm web:build'}`);
   for (const [k, v] of Object.entries(DIRS)) {
     console.log(`  ${k.padEnd(9)} ${existsSync(v) ? '✓' : '✗'} ${v}`);
+  }
+  if (EXPOSED) {
+    /* 把同网段的访问地址直接打出来，省得对方问"我该输什么" */
+    const ips = Object.values(networkInterfaces()).flat()
+      .filter((i) => i && i.family === 'IPv4' && !i.internal)
+      .map((i) => i.address);
+    console.log('');
+    console.log(`  ⚠️ 已对外监听（AA_HOST=${HOST}）：同网段的机器可以访问，且能读改本工作区`);
+    for (const ip of ips) console.log(`     对方浏览器打开：http://${ip}:${PORT}/`);
+    if (!ips.length) console.log('     （没探测到局域网 IP，用 ipconfig / ifconfig 看一下）');
+    console.log('     本服务**没有鉴权**，用完请关掉；别在公共网络上这么开。');
   }
 });

@@ -175,7 +175,10 @@ for (const y of years) {
   const ebase = join(ROOT, 'build', 'extraction', y);
   for (const f of readdirSync(ebase).filter((x) => x.endsWith('.json'))) {
     copyInto(join(ebase, f), join('build', 'extraction', y));
-    nFiles++; nExtr++;
+    nFiles++;
+    // 只把**文章**产物计进"抽取结果 N 篇"：同目录的 `_run.json` 是运行报告，
+    // 算进去会让这个数比实际篇数多（验收脚本据此比对 middle.json 数量时会误报）
+    if (/^\d{4}-\d{1,2}\.json$/.test(f)) nExtr++;
   }
 }
 

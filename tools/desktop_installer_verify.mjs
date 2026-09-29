@@ -74,7 +74,14 @@ for (const y of years) {
       }
     }
   }
-  nExtr += readdirSync(join(PAYLOAD, 'build', 'extraction', y)).filter((f) => f.endsWith('.json')).length;
+  /*
+   * ⚠️ 只数**文章**产物：抽取目录里还有每年一个 `_run.json`（运行报告），
+   *    用 `f.endsWith('.json')` 会把它算进去，于是下面 `nMid >= nExtr` 的检查
+   *    误报"有 N 篇缺 *_middle.json"（实测在单年 payload 上踩到；
+   *    11 年合计时因为 237 ≥ 235 才凑巧没触发）。
+   */
+  nExtr += readdirSync(join(PAYLOAD, 'build', 'extraction', y))
+    .filter((f) => /^\d{4}-\d{1,2}\.json$/.test(f)).length;
   if (existsSync(join(PAYLOAD, 'build', 'gold', `${y}.json`))) nGold++;
 }
 
