@@ -1,0 +1,93 @@
+# electron-builder 配置：**macOS（Apple Silicon / arm64）**
+#
+# ⚠️ 先读这里再跑 —— 在 Windows 上打 mac 包有三个绕不过去的坎：
+#
+#   1. **签不了名**。arm64 的 macOS 要求所有可执行代码**至少 ad-hoc 签名**，
+#      而 `codesign` 是 macOS 专属工具，Windows 上没有。
+#      未签名 + 从网上下载（会带 quarantine 属性）的 app，macOS 会直接拒绝打开。
+#   2. **做不了"安装包"**。mac 的安装包就是 `.dmg` 或 `.pkg`，两者分别依赖
+#      `hdiutil` / `productbuild`，同样是 macOS 专属。
+#      跨平台最多只能产出 `.zip`（里面是 .app），那不算安装包。
+#   3. **工作区发现逻辑在 .app 里是错的**。`main.mjs` 靠
+#      `dirname(app.getPath('exe'))` 找 Datas/build/runtime；mac 上这个路径是
+#      `Article Agent.app/Contents/MacOS/`，数据放那儿既不合适也不可写。
+#      → 真要用 mac 版，must 先改 `resolveWorkspace()`（见 docs/24 第 9 节）。
+#
+# 所以这份配置的定位是：**在 macOS 上（或 CI 的 macos runner 上）用**，
+# 不是给 Windows 交叉编译用的。Windows 上跑它只是为了验证"能走到哪一步"。
+#
+# 正确做法见 `docs/24-desktop-build.md` 第 9 节：用 GitHub Actions 的
+# `macos-14`（Apple Silicon）runner 打包 + 签名 + 公证。
+
+appId: com.articleagent.desktop
+productName: Article Agent
+copyright: Article Agent
+electronVersion: 44.3.0
+
+directories:
+  output: ../../build/desktop-mac
+  buildResources: ../../build
+
+mac:
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
+  category: public.app-category.medical
+  icon: ../../build/icon.png
+  # 本机没有 Apple 开发者证书：显式声明"不签名"，否则会去找钥匙串然后报错。
+  # ⚠️ 未签名 + 从网上下载（带 quarantine）的 arm64 app，macOS 会拒绝打开。
+  #    本机自用 / 内部分发时：解压后跑一次
+  #      xattr -dr com.apple.quarantine "Article Agent.app"
+  #    或右键 →「打开」→ 确认一次。
+  #    要正式分发，把 identity 换成证书名、并打开 notarize（见 docs/24 第 9 节）。
+  identity: null
+  artifactName: ArticleAgent-${version}-arm64-mac.${ext}
+  hardenedRuntime: false
+  gatekeeperAssess: false
+
+dmg:
+  artifactName: ArticleAgent-${version}-arm64-mac.${ext}
+  # ⚠️ 想把**数据**（608 MB 工作区）一起塞进 dmg，先跑
+  #      node tools/desktop_installer.mjs --payload-only
+  #    再打开下面这段（把 Datas/build/runtime 与 .app 并排摆进 dmg，医生一起拖出来）：
+  #
+  # contents:
+  #   - { x: 140, y: 180, type: file, path: "../../build/desktop-payload/使用说明.txt" }
+  #   - { x: 400, y: 180, type: file, path: "../../build/desktop-mac/mac-arm64/Article Agent.app" }
+  #   - { x: 140, y: 360, type: file, path: "../../build/desktop-payload/Datas" }
+  #   - { x: 400, y: 360, type: file, path: "../../build/desktop-payload/build" }
+  #   - { x: 560, y: 360, type: file, path: "../../build/desktop-payload/runtime" }
+
+forceCodeSigning: false
+asar: false
+
+files:
+  - main.mjs
+  - package.json
+  - from: ../web/dist
+    to: apps/web/dist
+  - from: ../web
+    to: apps/web
+    filter:
+      - server.mjs
+  - from: ../../tools
+    to: tools
+    filter:
+      - '**/*.mjs'
+      - '!**/*.test.mjs'
+  - from: ../../packages/core/dist
+    to: packages/core/dist
+  - from: ../../packages/ingest/dist
+    to: packages/ingest/dist
+  - from: ../../packages/skills/dist
+    to: packages/skills/dist
+  - from: ../../packages/crossref/dist
+    to: packages/crossref/dist
+  - from: ../../packages/europepmc/dist
+    to: packages/europepmc/dist
+  - from: ../../build/desktop-stage/node_modules
+    to: node_modules
+
+compression: normal

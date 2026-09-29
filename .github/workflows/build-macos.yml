@@ -1,0 +1,116 @@
+# 在 **Apple Silicon** 上打 macOS 安装包（arm64 dmg）
+#
+# 为什么必须用 CI 而不能在开发机上打：
+#   electron-builder 明确拒绝跨平台构建 mac —— 实测在 Windows 上直接报
+#     ⨯ Build for macOS is supported only on macOS, please see
+#       https://electron.build/multi-platform-build
+#   而且 mac 的"安装包"是 .dmg/.pkg，分别依赖 `hdiutil`/`productbuild`，都是 macOS 专属；
+#   签名（codesign）同理。所以只能在 mac 上做，CI 的 `macos-14` 就是 Apple Silicon。
+#
+# ── 这个工作流能做什么、不能做什么 ──
+#
+#   能：打出 arm64 的 .app 与 .dmg（**不含数据**，见下）
+#   不能：把工作区数据（Datas/build/runtime，约 608 MB）一起打进去 ——
+#        它们在 .gitignore 里，**根本不在仓库里**，CI 拿不到。
+#        数据要单独拷给医生（见 docs/24 第 9 节）。
+#
+# ── 用法 ──
+#   GitHub → Actions → build-macos-arm64 → Run workflow
+#   产物在 Artifacts 里下载（默认保留 90 天）
+#
+# ── 要正式分发（不弹"无法验证开发者"）还需要 ──
+#   1. Apple Developer 账号（个人版 $99/年）
+#   2. 在仓库 Secrets 里配：MAC_CERT_P12（base64 的 .p12）、MAC_CERT_PASSWORD、
+#      APPLE_ID、APPLE_APP_SPECIFIC_PASSWORD、APPLE_TEAM_ID
+#   3. 把下面的"签名与公证"步骤取消注释，并把 electron-builder-mac.yml 里的
+#      identity 换成证书名、打开 notarize
+
+name: build-macos-arm64
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  mac:
+    # macos-14 = Apple Silicon（arm64）。用 macos-13 会是 Intel，架构不对。
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 启用 pnpm
+        run: corepack enable
+
+      - name: 安装依赖
+        run: corepack pnpm install --frozen-lockfile
+
+      # ⚠️ 本仓库的 pnpm 不在 PATH 上，`pnpm check` 这类**嵌套调用**会失败，
+      #    所以编译/测试都拆开单独跑（与 docs/24 一致）。
+      - name: 编译各包
+        run: corepack pnpm -r build
+
+      - name: 编译前端
+        run: corepack pnpm --filter @aa/web exec vite build
+
+      - name: 自检（typecheck + 单测）
+        run: |
+          corepack pnpm typecheck
+          corepack pnpm test
+
+      - name: 生成 staging（让 @aa/* 裸包名能解析）
+        run: node tools/desktop_stage_modules.mjs
+
+      - name: 生成图标
+        run: node tools/make_icon.mjs build/icon.png
+
+      # ---------- 以下两步需要 Apple 开发者证书，没有就保持注释 ----------
+      # - name: 导入签名证书
+      #   env:
+      #     MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+      #     MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+      #   run: |
+      #     echo "$MAC_CERT_P12" | base64 --decode > cert.p12
+      #     security create-keychain -p actions build.keychain
+      #     security default-keychain -s build.keychain
+      #     security unlock-keychain -p actions build.keychain
+      #     security import cert.p12 -k build.keychain -P "$MAC_CERT_PASSWORD" \
+      #       -T /usr/bin/codesign
+      #     security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+      #
+      # - name: 公证
+      #   env:
+      #     APPLE_ID: ${{ secrets.APPLE_ID }}
+      #     APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      #     APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      #   run: echo "electron-builder 会在 notarize 打开时自动处理"
+
+      - name: 打包 arm64 dmg + zip
+        working-directory: apps/desktop
+        run: npx electron-builder --mac --arm64 --config electron-builder-mac.yml
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'   # 没证书时别去翻钥匙串
+
+      - name: 列出产物
+        run: ls -lh build/desktop-mac/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArticleAgent-macOS-arm64
+          path: |
+            build/desktop-mac/*.dmg
+            build/desktop-mac/*.zip
+          if-no-files-found: error
+
+      # 想把**运行时依赖扫描**也跑一遍（确认包内没有缺失的第三方依赖）
+      - name: 校验包内运行时依赖
+        run: |
+          APP=$(ls -d build/desktop-mac/mac-arm64/*.app | head -1)
+          node tools/desktop_dep_scan.mjs "$APP/Contents/Resources/app"

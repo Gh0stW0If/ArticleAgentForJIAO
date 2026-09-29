@@ -107,17 +107,34 @@ function saveWorkspace(dir) {
 }
 
 function resolveWorkspace() {
+  const exeDir = dirname(app.getPath('exe'));
+  /*
+   * ⚠️ macOS 的目录布局和 Windows 完全不同，不能只按"exe 旁边"找：
+   *
+   *   Windows 安装版   <X>\Article Agent.exe
+   *                   → 数据放 <X>\
+   *   macOS           <X>/Article Agent.app/Contents/MacOS/Article Agent
+   *                   → `dirname(exe)` 是 **.app 内部**。数据放那儿不符合 mac 习惯
+   *                     （app 包应当可整体替换），也不便于备份。
+   *
+   * 所以 mac 上要多试**往上三级**——.app 所在的那一层，以及它下面的 `workspace/`。
+   * mac 的分发形态就是「.app 与数据文件夹并排放同一个目录」。
+   */
   const candidates = [
     process.env.AA_ROOT,
     readSavedWorkspace(),
     // 便携版会把"exe 实际所在目录"放在这个环境变量里（自解压到临时目录后，
     // app.getPath('exe') 指向临时目录，用户真正的 exe 位置得看这个）
     process.env.PORTABLE_EXECUTABLE_DIR,
-    dirname(app.getPath('exe')),
-    resolve(dirname(app.getPath('exe')), '..'),
+    exeDir,                                          // Windows 安装版：数据就在 exe 旁
+    resolve(exeDir, '..'),
+    resolve(exeDir, '..', '..', '..'),               // macOS：.app 所在的那一层
+    resolve(exeDir, '..', '..', '..', 'workspace'),  // macOS：.app 旁的 workspace/
     process.cwd(),
   ].filter(Boolean);
-  for (const c of candidates) {
+
+  // 去重：开发布局下 `..` 与 `../..` 会互相撞上，重复探测只会刷日志
+  for (const c of [...new Set(candidates.map((x) => resolve(x)))]) {
     const ok = isWorkspace(c);
     log('候选工作区', c, ok ? '✓' : '✗');
     if (ok) return c;

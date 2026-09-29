@@ -324,3 +324,106 @@ node 内置 7 个：child_process, crypto, fs, http, path, url, zlib
    安装后占用约 **994 MB**（程序 386 MB + 原文 260 MB + 产物 348 MB），
    安装包本身 278 MB。
 
+---
+
+## 9. macOS（Apple Silicon / arm64）
+
+> **⚠️ 结论先行：这台 Windows 开发机打不出 mac 包 —— electron-builder 直接拒绝。**
+
+### 9.1 为什么不能在本机打
+
+实测：
+
+```
+$ npx electron-builder --mac dir --arm64 --config electron-builder-mac.yml
+  • electron-builder  version=26.15.3 os=10.0.19045
+  ⨯ Build for macOS is supported only on macOS, please see
+    https://electron.build/multi-platform-build
+```
+
+三条硬约束，都不是配置能绕过的：
+
+| 需要什么 | 为什么 | 本机 |
+|---|---|---|
+| **macOS 系统** | electron-builder 明确只在 mac 上构建 mac 目标 | Windows ❌ |
+| **`hdiutil` / `productbuild`** | mac 的"安装包"就是 `.dmg` / `.pkg`，只存在于 macOS | 两个都没有 ❌ |
+| **`codesign`** | arm64 上**所有**可执行代码至少要 ad-hoc 签名 | 没有 ❌ |
+
+另外本机 `node_modules/electron/dist` 是 **win32-x64** 运行时（`path.txt = electron.exe`），
+electron-builder 缓存里也没有 darwin 的 Electron。
+
+### 9.2 正确做法：GitHub Actions 的 `macos-14`（就是 Apple Silicon）
+
+已加好 `.github/workflows/build-macos.yml`：
+
+```
+GitHub → Actions → build-macos-arm64 → Run workflow
+产物：Artifacts → ArticleAgent-macOS-arm64（.dmg + .zip）
+```
+
+`macos-14` 这个 runner 就是 arm64。流程：编译 → 跑测试 → `desktop_stage_modules`
+→ 生成图标 → `electron-builder --mac --arm64` → 最后**顺手跑一遍
+`desktop_dep_scan`** 确认包内没有缺失的第三方依赖。
+
+### 9.3 ⚠️ CI 打出来的包**不含数据**
+
+工作区数据（`Datas/` `build/` `runtime/`，约 608 MB）在 `.gitignore` 里，
+**根本不在仓库里**，CI 拿不到。所以：
+
+- CI 产出 = **只有程序**（约 400 MB 的 .app）
+- 数据要**另外拷给医生**（与 Windows 包用同一份 `build/desktop-payload`）
+
+mac 上的摆放方式（`main.mjs` 已按此改好，见 9.4）：
+
+```
+某个目录/
+├── Article Agent.app          ← 从 dmg 拖出来
+├── Datas/                     ← 数据与 .app **并排**
+├── build/
+└── runtime/
+```
+
+数据必须放在 `.app` **旁边**：mac 的 exe 实际在
+`Article Agent.app/Contents/MacOS/`，`dirname(exe)` 是 **.app 内部** ——
+数据放那儿不符合 mac 习惯（app 包应当可整体替换），也不便于备份。
+
+> 想把数据**一起**塞进 dmg：先 `node tools/desktop_installer.mjs --payload-only`，
+> 再打开 `electron-builder-mac.yml` 里 `dmg.contents` 那段注释
+> （把 `Datas`/`build`/`runtime` 与 `.app` 并排摆进 dmg，医生一起拖出来）。
+
+### 9.4 为 mac 改了什么代码
+
+| 文件 | 改动 | 为什么 |
+|---|---|---|
+| `apps/desktop/main.mjs` | `resolveWorkspace()` 增加 `.app` 所在层的候选路径（往上三级 + 其下的 `workspace/`），候选去重 | 见 9.3；不改的话 mac 版一启动就弹"选择工作区" |
+| `apps/web/server.mjs` | MinerU 路径按平台分（Windows `Scripts/mineru.exe` / mac-Linux `bin/mineru`），报错文案也说明"安装包不带解析环境" | 原来硬编码 Windows 路径，mac 上会报一个不存在的路径 |
+
+`process.execPath` + `ELECTRON_RUN_AS_NODE=1`（「抽取」用）在 mac 上同样成立，
+所以 **mac 版也不需要装 Node**。
+
+### 9.5 未签名会怎样、怎么绕过
+
+`electron-builder-mac.yml` 里 `identity: null` = 不签名（本机没有 Apple 开发者证书）。
+后果：从网上下载的 app 带 `com.apple.quarantine`，macOS 会拒绝打开
+（"无法验证开发者" / "已损坏"）。
+
+**内部分发的绕法**（让医生做一次）：
+
+```bash
+xattr -dr com.apple.quarantine "Article Agent.app"
+```
+
+或右键 →「打开」→ 弹窗里再点「打开」。
+
+**正式分发**需要 Apple Developer 账号（$99/年）+ 证书 + 公证；
+工作流里已经把需要的步骤与 Secrets 清单写成注释了。
+
+### 9.6 为什么不做"Windows 上交叉编译"
+
+能凑出一个 `.app` 目录结构，但：
+- **签不了名 → arm64 上根本起不来**（不是警告，是拒绝执行）
+- 做不了 dmg/pkg → 交到医生手里是压缩包，不是安装包
+- 每次都要手工对齐 Electron 运行时版本
+
+所以直接用 mac runner 最省事也最可靠。
+

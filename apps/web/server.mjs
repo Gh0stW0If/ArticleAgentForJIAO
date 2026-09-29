@@ -2095,8 +2095,21 @@ const server = createServer(async (req, res) => {
       if (!okYear(year)) return json(res, 400, { error: 'year 参数非法' });
       const hit = pdfPathOf(year, study);
       if (!hit) return json(res, 404, { error: `未找到 ${year} 下的 ${study}.pdf` });
-      const mineru = join(ROOT, 'runtime', 'mineru', 'Scripts', 'mineru.exe');
-      if (!existsSync(mineru)) return json(res, 500, { error: `MinerU 未安装：${mineru}` });
+      /*
+       * MinerU 是外部 Python 环境，**不在安装包里**（数 GB）。
+       * 路径按平台区分：Windows 是 venv 的 `Scripts/mineru.exe`，mac/Linux 是 `bin/mineru`。
+       * 装没装都返回友好报错 —— 医生只做核对，本来就不需要这一步。
+       */
+      const mineru = process.platform === 'win32'
+        ? join(ROOT, 'runtime', 'mineru', 'Scripts', 'mineru.exe')
+        : join(ROOT, 'runtime', 'mineru', 'bin', 'mineru');
+      if (!existsSync(mineru)) {
+        return json(res, 500, {
+          error: `本机未安装 MinerU：${mineru}\n`
+            + '（解析需要外部 Python 环境，安装包里不带。医生核对已有结果不需要这一步；'
+            + '要自己导入新 PDF，请在开发机上解析后再把 build/mineru 拷过来）',
+        });
+      }
       // 单篇解析：只把目标 PDF 放进暂存目录，避免整年重跑（MinerU 的 -p 只接受一个路径）
       const stage = join(ROOT, 'build', '_stage_web', year);
       mkdirSync(stage, { recursive: true });
