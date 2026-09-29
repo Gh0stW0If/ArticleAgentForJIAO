@@ -184,10 +184,14 @@ writeFileSync(join(OUT, '启动.command'), startSh.replace(/\n/g, '\n'), 'utf8')
 writeFileSync(join(OUT, '启动.bat'), startBat.replace(/\n/g, '\r\n'), 'utf8');
 
 const yearsLabel = YEARS === 'all' ? '全部年份' : YEARS;
+/*
+ * ⚠️ 这是**纯文本**（.txt），不要写 Markdown 的 `**加粗**` —— 使用者双击打开会看到一堆星号。
+ * 强调一律用中文书名号「」或方括号【】。
+ */
 const readme = `Article Agent · 网页版（Mac / Windows 通用）
 ==========================================
 
-这个版本**不用安装、不用签名**：装一个 Node.js，双击启动脚本，
+这个版本【不用安装、不用签名】：装一个 Node.js，双击启动脚本，
 浏览器里就能用完整界面。
 
 
@@ -195,14 +199,14 @@ const readme = `Article Agent · 网页版（Mac / Windows 通用）
 ----------------
 1. 装 Node.js
 
-   打开 https://nodejs.org/ ，下载 **LTS 版**的 macOS 安装包，
+   打开 https://nodejs.org/ ，下载【LTS 版】的 macOS 安装包，
    双击一路「继续」装完即可（官方安装包有 Apple 签名，不会有安全提示）。
 
    验证：打开「终端」，输入  node -v  回车，能打印出版本号就行。
 
 2. 把整个文件夹放到你喜欢的位置（比如「文稿」里）。
 
-3. 双击本文件夹里的 **启动.command**
+3. 双击本文件夹里的【启动.command】
 
    · 如果提示"无法打开，因为它来自身份不明的开发者"：
      在「终端」里 cd 到本文件夹，执行一次
@@ -213,17 +217,17 @@ const readme = `Article Agent · 网页版（Mac / Windows 通用）
          node apps/web/server.mjs
      然后浏览器打开 http://127.0.0.1:43130
 
-4. 浏览器会自动打开界面。**关掉终端窗口就停止服务**。
+4. 浏览器会自动打开界面。【关掉终端窗口就停止服务】。
 
 
 二、Windows 上怎么用
 --------------------
-同样装 Node.js，然后双击 **启动.bat**。
+同样装 Node.js，然后双击【启动.bat】。
 
 
 三、里面有什么
 --------------
-  ${yearsLabel} 的机器抽取结果 + 原文 PDF + 金标准（${WITH_DATA ? '已内置' : '⚠️ 未内置，需自己放'}）
+  ${yearsLabel} 的机器抽取结果 + 原文 PDF + 金标准（${WITH_DATA ? '已内置' : '⚠️ 未内置，需自己放'})
 
   布局（和仓库一致，不要改动层级）：
     apps/web/server.mjs     本地服务
@@ -247,7 +251,9 @@ const readme = `Article Agent · 网页版（Mac / Windows 通用）
   ❌ 顶栏「解析」—— 需要 MinerU 的 Python 环境（数 GB），没打进包。
      包里的 PDF 已经在开发机上解析好了。
 
-  ⚠️ 服务只监听 127.0.0.1，**同一局域网的其他电脑访问不了**（单机用）。
+  ⚠️ 服务只监听 127.0.0.1，【同一局域网的其他电脑访问不了】（单机用）。
+     确实要让别人访问，启动前设 AA_HOST=0.0.0.0，但那个服务没有鉴权，
+     只在可信局域网里临时这么做。
 
 
 五、出问题了看哪里
@@ -255,7 +261,7 @@ const readme = `Article Agent · 网页版（Mac / Windows 通用）
   · 界面打不开：确认终端窗口里没有报错；端口 43130 是否被别的程序占用。
   · 想换端口：启动前设环境变量，例如
         AA_PORT=43140 node apps/web/server.mjs
-  · 数据不对：确认是在**本文件夹根目录**里启动的（服务按当前目录找 Datas/build/runtime）。
+  · 数据不对：确认是在【本文件夹根目录】里启动的（服务按当前目录找 Datas/build/runtime）。
 
 
 生成时间：${new Date().toISOString().slice(0, 19).replace('T', ' ')}
