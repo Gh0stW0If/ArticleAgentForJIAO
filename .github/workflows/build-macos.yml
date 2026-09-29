@@ -9,31 +9,31 @@
 #
 # ── 这个工作流能做什么、不能做什么 ──
 #
-#   能：打出 arm64 的 .app 与 .dmg（**不含数据**，见下）
+#   能：打出 arm64 的 .app 与 .dmg
 #   不能：把工作区数据（Datas/build/runtime，约 608 MB）一起打进去 ——
 #        它们在 .gitignore 里，**根本不在仓库里**，CI 拿不到。
-#        数据要单独拷给医生（见 docs/24 第 9 节）。
+#        数据要单独拷给 Mac（见 docs/24 第 9 节）。
+#
+# ── 签名：配了证书就用真证书，没配就 ad-hoc ──
+#
+#   ⚠️ 判断"有没有配证书"必须**先取到 env 再在 if 里用 env.\***：
+#      GitHub Actions 的 `if:` 在 secrets 注入之前求值，写
+#      `if: ${{ secrets.FOO != '' }}` 是不行的。所以下面先用一个
+#      "探测"步骤把结果写进 outputs，后面按 outputs 分支。
+#
+#   没配 Secrets 也能跑：会自动退化成 ad-hoc 签名（`-c.mac.identity=-`）。
+#   产出的 dmg 仍可用，但拿到的 Mac 要手动放行一次。
 #
 # ── 用法 ──
-#   GitHub → Actions → build-macos-arm64 → Run workflow
-#   产物在 Artifacts 里下载（默认保留 90 天）
+#   推 tag（v*）或在 Actions 页面手动 Run workflow
 #
-# ── 要正式分发（双击就能开、不弹"无法验证开发者"）还需要 ──
-#
-#   1. **Apple Developer Program 会员**（$99/年；个人实名验证通常 1-2 天，
-#      组织需要 D-U-N-S 编码，可能 1-2 周）
-#   2. 一张 **Developer ID Application** 证书（做 .pkg 还要 Developer ID Installer）
-#   3. 在仓库 Secrets 里配：
-#        MAC_CERT_P12            base64 后的 .p12（证书+私钥）
-#        MAC_CERT_PASSWORD       .p12 的导出密码
-#        APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID   ← 公证用
+# ── 要正式分发（双击就能开、不弹"无法验证开发者"）──
+#   1. Apple Developer Program 会员（$99/年）
+#   2. Developer ID Application 证书（.p12）
+#   3. Secrets：MAC_CERT_P12 / MAC_CERT_PASSWORD /
+#      APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID
 #   4. 打开 electron-builder-mac.yml 里的 mac.notarize 段并填 teamId
-#
-#   ⚠️ 生成 CSR 与导出 .p12 需要**在 Mac 上**用「钥匙串访问」做（约 30 分钟，一次即可）。
-#      详见 docs/24 第 9.7 节。
-#
-#   没配 Secrets 也能跑：会自动退化成 ad-hoc 签名，产出的 dmg 仍可用，
-#   但拿到的医生要手动放行一次（xattr 或系统设置里批准）。
+#   完整步骤（含"必须在 Mac 上生成 CSR"这个约束）见 docs/24 第 9.7 节。
 
 name: build-macos-arm64
 
@@ -81,67 +81,77 @@ jobs:
       - name: 生成图标
         run: node tools/make_icon.mjs build/icon.png
 
-      # ---------- 签名：有证书就用真证书，没有就 ad-hoc ----------
-      #
-      # 两种情形一套配置。判定依据是 Secret 是否配了 —— 没配也能出包
-      # （ad-hoc / 未签名），配了就自动走真签名（并可公证）。
-      #
-      # ⚠️ 为什么不用 `mac.identity: null`：官方文档明确写了它**完全跳过签名**，
-      #    连 ad-hoc 都不做。想要 ad-hoc 必须显式 `-c.mac.identity=-`。
-
-      - name: 导入 Developer ID 证书（配了 Secret 才跑）
+      # ---------- 签名：先探测，再分支（原因见文件头注释）----------
+      - name: 探测是否配了签名证书
         id: cert
-        if: ${{ secrets.MAC_CERT_P12 != '' }}
+        env:
+          CERT: ${{ secrets.MAC_CERT_P12 }}
+        run: |
+          if [ -n "$CERT" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+            echo "✓ 检测到 MAC_CERT_P12，将走 Developer ID 签名"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ 未配置 MAC_CERT_P12，将走 ad-hoc 签名（Mac 需手动放行一次）"
+          fi
+
+      - name: 导入 Developer ID 证书
+        if: steps.cert.outputs.has == 'true'
         env:
           MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
         run: |
           set -euo pipefail
           echo "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
-          KEYCHAIN_PASS="$(openssl rand -hex 16)"
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+          KC="$RUNNER_TEMP/build.keychain-db"
+          KCP="$(openssl rand -hex 16)"
+          security create-keychain -p "$KCP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCP" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" \
             -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
-          # GitHub 的 mac runner 默认还有别的 keychain，必须把自己这个加进搜索列表
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          echo "sign_args=" >> "$GITHUB_OUTPUT"
-          echo "已导入证书，electron-builder 会自动发现"
+            -s -k "$KCP" "$KC" >/dev/null
+          # runner 上还有别的 keychain，得把自己这个加进搜索列表，否则找不到证书
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
 
-      # 没有证书 → ad-hoc 签名。
-      # 不是为了骗过 Gatekeeper（骗不过），而是保证 app 结构完整、能本地批准运行。
-      - name: 无证书 → 走 ad-hoc
-        id: adhoc
-        if: ${{ secrets.MAC_CERT_P12 == '' }}
-        run: echo "sign_args=-c.mac.identity=-" >> "$GITHUB_OUTPUT"
-
-      - name: 打包 arm64 dmg + zip
+      - name: 打包（有证书 → 真签名 + 公证）
+        if: steps.cert.outputs.has == 'true'
         working-directory: apps/desktop
         env:
-          # 有证书时不要设这个（它会让 electron-builder 不去翻钥匙串）
-          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.MAC_CERT_P12 != '' && 'true' || 'false' }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx electron-builder --mac --arm64 --config electron-builder-mac.yml
+
+      - name: 打包（无证书 → ad-hoc）
+        if: steps.cert.outputs.has == 'false'
+        working-directory: apps/desktop
+        env:
+          # 没有证书时别让 electron-builder 去翻钥匙串
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: |
           npx electron-builder --mac --arm64 \
             --config electron-builder-mac.yml \
-            ${{ steps.cert.outputs.sign_args }}${{ steps.adhoc.outputs.sign_args }}
+            -c.mac.identity=-
 
       - name: 签名结果自检
         working-directory: apps/desktop
         run: |
           APP=$(ls -d ../../build/desktop-mac/mac-arm64/*.app | head -1)
-          echo "── codesign 校验 ──"
+          echo "── 签名校验 ──"
           codesign --verify --deep --strict --verbose=2 "$APP" || true
           echo "── 签名身份 ──"
           codesign -dv --verbose=4 "$APP" 2>&1 | grep -E 'Authority|TeamIdentifier|Signature' || true
-          echo "── Gatekeeper 评估（未签名/未公证时非 0 属预期）──"
+          echo "── Gatekeeper 评估（未公证时非 0 属预期）──"
           spctl --assess --type execute --verbose=4 "$APP" || true
+
+      # 确认包内没有缺失的第三方依赖（打包只搬 @aa/*，见 docs/24 §8.4）
+      - name: 校验包内运行时依赖
+        run: |
+          APP=$(ls -d build/desktop-mac/mac-arm64/*.app | head -1)
+          node tools/desktop_dep_scan.mjs "$APP/Contents/Resources/app"
 
       - name: 列出产物
         run: ls -lh build/desktop-mac/
@@ -153,9 +163,3 @@ jobs:
             build/desktop-mac/*.dmg
             build/desktop-mac/*.zip
           if-no-files-found: error
-
-      # 想把**运行时依赖扫描**也跑一遍（确认包内没有缺失的第三方依赖）
-      - name: 校验包内运行时依赖
-        run: |
-          APP=$(ls -d build/desktop-mac/mac-arm64/*.app | head -1)
-          node tools/desktop_dep_scan.mjs "$APP/Contents/Resources/app"

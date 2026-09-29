@@ -53,10 +53,19 @@ import { fileURLToPath } from 'node:url';
 import { findSecretLeaks } from './lib/secret_scan.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const PAYLOAD = join(ROOT, 'build', 'desktop-payload');
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(`--${f}`);
 const arg = (n, d) => (argv.includes(`--${n}`) ? argv[argv.indexOf(`--${n}`) + 1] : d);
+
+/*
+ * 输出目录可覆盖（`--out`）。
+ *
+ * 为什么需要：默认的 `build/desktop-payload` 是 Windows 安装包在用的那一份，
+ * 而做"给 Mac 的冒烟测试用"的小工作区（比如只带 2015）会把它**整个清掉重建**，
+ * 于是刚打好的 Windows 安装包就和数据对不上了。
+ * 有了 `--out` 就能并存：`--years 2015 --out build/mac-workspace-2015`。
+ */
+const PAYLOAD = resolve(ROOT, arg('out', join('build', 'desktop-payload')));
 
 const WITH_PDF = !has('no-pdf');
 const PAYLOAD_ONLY = has('payload-only');

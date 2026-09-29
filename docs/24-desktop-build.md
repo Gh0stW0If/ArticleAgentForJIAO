@@ -515,3 +515,60 @@ electron-builder 会等结果并把公证凭据 staple 进 dmg。
 - **账号一年不续费** → 证书失效，**已分发的 app 仍能打开**（公证凭据已 staple），
   但重新打包需要续费。
 
+### 9.8 给 Mac 测试，到底发哪几个文件
+
+CI 跑完后，Mac 那边需要**两样东西**（程序 + 数据），**都是必须的**：
+
+| # | 文件 | 从哪来 | 体积 |
+|---|---|---|---|
+| 1 | `ArticleAgent-0.1.0-arm64-mac.dmg` | GitHub → Actions → 该次运行的 Artifacts | 约 130 MB |
+| 2 | 工作区（`Datas/` `build/` `runtime/`） | 本机生成，见下 | 12 MB（只 2015）/ 608 MB（全部 11 年） |
+
+**为什么数据必须单独发**：`Datas/` `build/` `runtime/` 都在 `.gitignore` 里，
+CI 拿不到（见 9.3）。所以 CI 只能出程序。
+
+#### 生成工作区压缩包
+
+```powershell
+# 冒烟测试：只带 2015（6 篇，12 MB）—— 第一次先发这个
+node tools/desktop_installer.mjs --payload-only --skip-tsc --years 2015 `
+  --out build/mac-workspace-2015
+# ⚠️ 必须用 --out，否则会把 Windows 安装包在用的 build/desktop-payload 整个清掉
+
+# 完整版：11 年 235 篇（608 MB）
+node tools/desktop_installer.mjs --payload-only --skip-tsc --out build/mac-workspace-all
+
+# 打包成一个文件（中文文件名没问题：zip 条目带 UTF-8 标志，macOS 能正确显示）
+tar -a -c -f build/ArticleAgent-mac-工作区-2015.zip -C build/mac-workspace-2015 .
+```
+
+⚠️ **Windows 专有的文件要删掉**再发（`使用说明.txt`、`备份我的核对记录.bat`、
+`打开数据文件夹.bat`）—— 在 Mac 上没用还让人困惑。
+（脚本目前不区分平台，这一步要手工做；见"还没做"。）
+
+#### Mac 那边的摆放
+
+```
+ArticleAgent/
+├── Article Agent.app      ← 从 dmg 拖出来
+├── Datas/
+├── build/
+└── runtime/               ← 三者与 .app **并排**
+```
+
+加一份 `使用说明-mac.txt`（内容与 Windows 版不同：讲清第一次怎么放行、
+哪些功能没有、请帮忙确认哪几件事）。
+
+#### 第一次测试先只发 2015 的理由
+
+12 MB vs 608 MB，传起来快得多，而"能不能开、能不能定位证据、待裁定在不在"
+这几件事用 6 篇就能验。**跑通再发完整版。**
+
+### 9.9 还没做的
+
+- **脚本不区分平台**：`desktop_installer.mjs` 生成的工作区一律带 Windows 的
+  `.bat` 与 `使用说明.txt`。给 mac 用时得手工删（见 9.8）。
+  要根治应加 `--platform mac`，让它改写 mac 版说明、不带 `.bat`。
+- **CI 未实测**：`.github/workflows/build-macos.yml` 只是写好并过了 YAML 校验，
+  **还没真跑过**。第一次跑多半会暴露小问题（比如 mac 上某些单测的平台差异）。
+
