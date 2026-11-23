@@ -68,6 +68,59 @@ describe('deepseek — 请求形状', () => {
     expect(res.usage).toEqual({ inputTokens: 100, outputTokens: 20 });
   });
 
+  it.each([[undefined, undefined], ['high', undefined], ['medium', 'high'], ['medium', null]] as const)(
+    'Responses 默认档 %s 和单次覆盖档 %s 均按配置发送',
+    async (reasoningEffort, override) => {
+    const request = vi.fn(async (_url: string, _init: RequestInit) => Response.json({
+      status: 'completed',
+      model: 'test-model',
+      output: [
+        { type: 'reasoning', content: [] },
+        { type: 'message', content: [{ type: 'output_text', text: '{"ok":true}' }] },
+      ],
+      usage: { input_tokens: 8, output_tokens: 4 },
+    }));
+    const llm = createDeepSeekLlm({
+      apiKey: KEY,
+      baseUrl: 'https://example.test/v1/',
+      model: 'test-model',
+      wireApi: 'responses',
+      httpHeaders: { 'x-test-header': 'test-value' },
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      maxTokens: 0,
+      fetchImpl: request as unknown as typeof fetch,
+    });
+    const response = await llm.invoke({ ...req(), ...(override !== undefined ? { reasoningEffort:override } : {}) });
+    const [url, init] = request.mock.calls[0]!;
+    expect(url).toBe('https://example.test/v1/responses');
+    expect(new Headers(init.headers).get('x-test-header')).toBe('test-value');
+    expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${KEY}`);
+    const effort = override === undefined ? reasoningEffort : override;
+    expect(JSON.parse(String(init.body))).toEqual({
+      model: 'test-model',
+      input: [{ role: 'system', content: req().system }, { role: 'user', content: req().user }],
+      store: false,
+      stream: false,
+      text: { format: { type: 'json_object' } },
+      ...(effort ? { reasoning: { effort } } : {}),
+    });
+    expect(response.json).toEqual({ ok: true });
+    expect(response.usage).toEqual({ inputTokens: 8, outputTokens: 4 });
+  });
+
+  it('识别 Responses 的截断，即使已经形成可解析的 JSON', async () => {
+    const llm = createDeepSeekLlm({
+      apiKey: KEY,
+      wireApi: 'responses',
+      fetchImpl: (async () => Response.json({
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [{ type: 'message', content: [{ type: 'output_text', text: '{"ok":true}' }] }],
+      })) as typeof fetch,
+    });
+    await expect(llm.invoke(req())).rejects.toMatchObject({ kind: 'truncated' });
+  });
+
   it('maxTokens 给 0 = 不限制：整个省略 max_tokens，由服务端用自己的上限', async () => {
     /* 为什么要这个口子：实测 gpt-6-sol 在长输出上会顶到 8000 被截断，
        回来的是不完整 JSON、整段字段白丢。而"该填多少"没人说得准，

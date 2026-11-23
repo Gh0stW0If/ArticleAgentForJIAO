@@ -51,7 +51,7 @@ const SPECS = [
 /** 合法模块说明符的形状（模块路径不含空格、不以标点开头）。 */
 const VALID_SPEC = /^[@a-zA-Z0-9._:][\w@./:-]*$/;
 
-const ENTRIES = ['apps/web/server.mjs', 'tools/llm_run.mjs'];
+const ENTRIES = ['apps/web/server.mjs', 'tools/llm_run.mjs', 'tools/workflow_run.mjs'];
 
 /**
  * @param {string} appDir 打包后的 app 目录

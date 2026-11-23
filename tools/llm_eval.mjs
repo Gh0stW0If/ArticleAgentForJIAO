@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { camelToSnake } from './lib/keys.mjs';
 import { numericEqual, quantityEqual } from '../packages/core/dist/index.js';
 import { judgePairs, VERDICT_LABEL, VERDICT_WEIGHT } from './lib/judge.mjs';
+import { loadLlmConfig } from './lib/llm-config.mjs';
 import { normText, normNum, tokensOf, dice, outcomeSimilarity, alignOutcomes, MIN_SCORE, isOutcomeCandidate } from './lib/align.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -661,18 +662,14 @@ function countFields(node) {
 
 let judgeResults = [];
 if (judgeQueue.length) {
-  const cfgPath = join(ROOT, 'runtime', 'llm.local.json');
-  let cfg = {};
-  if (existsSync(cfgPath)) { try { cfg = JSON.parse(readFileSync(cfgPath, 'utf8')); } catch { /* 忽略 */ } }
-  const apiKey = process.env.DEEPSEEK_API_KEY ?? cfg.apiKey;
-  if (!apiKey) {
+  const cfg = loadLlmConfig(ROOT, { optional: true });
+  if (!cfg.apiKey) {
     console.log(`\n  ⚠ ${judgeQueue.length} 组待语义判定，但未配置 API key（跳过，按"未判定"计）`);
   } else {
     process.stdout.write(`\n  语义判定 ${judgeQueue.length} 组（LLM 批量，带缓存）…`);
     judgeResults = await judgePairs(judgeQueue, {
-      apiKey,
-      ...(cfg.baseUrl ? { baseUrl: cfg.baseUrl } : {}),
-      model: process.env.AA_JUDGE_MODEL ?? cfg.model,
+      ...cfg,
+      model: cfg.reviewModel,
       batchSize: 8,
       onProgress: (m) => console.log(m),
     });

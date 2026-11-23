@@ -29,6 +29,10 @@
     "web:smoke": "node tools/web_smoke.mjs",
     "llm:run": "pnpm -r build && node tools/llm_run.mjs",
     "llm:eval": "node tools/llm_eval.mjs",
+    "precis2:gold": "node tools/lib/precis2_gold.mjs",
+    "precis2:run": "pnpm -r build && node tools/precis2_run.mjs",
+    "precis2:eval": "node tools/precis2_eval.mjs",
+    "precis2:export": "node tools/precis2_export.mjs",
     "accuracy:overview": "node tools/accuracy_overview.mjs",
     "accuracy:diagnose": "node tools/accuracy_diagnose.mjs",
     "accuracy:coverage": "node tools/coverage_eval.mjs",
@@ -102,7 +106,12 @@
     "gold:units": "node tools/gold_fix_units.mjs",
     "gold:units:apply": "node tools/gold_fix_units.mjs --apply",
     "gold:units:verify": "node tools/gold_fix_units_verify.mjs",
-    "gold:units:recon": "node tools/gold_fix_units_recon.mjs"
+    "gold:units:recon": "node tools/gold_fix_units_recon.mjs",
+    "workflow:run": "node tools/workflow_run.mjs",
+    "workflow:test": "node --test tools/workflow.test.mjs tools/workflow-candidates.test.mjs tools/workflow-api.test.mjs tools/workflow-units.test.mjs",
+    "desktop:workflow": "node tools/desktop_workflow_make.mjs",
+    "workflow:ui-check": "node tools/workflow_ui_check.mjs",
+    "workflow:desktop-check": "node tools/desktop_workflow_check.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

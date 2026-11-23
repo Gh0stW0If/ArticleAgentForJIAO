@@ -115,10 +115,15 @@ const stylesXml = `${XML_HEAD}<styleSheet xmlns="http://schemas.openxmlformats.o
   + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
   + '</styleSheet>';
 
-/** 一格：字符串或 { v, s }。 */
+/** 一格：字符串、数字槽 { v, s, t:'n' } 或普通对象 { v, s }。 */
 const cellXml = (ref, cell) => {
   const isObj = cell !== null && typeof cell === 'object';
   const raw = isObj ? cell.v : cell;
+  if (isObj && cell.t === 'n') {
+    const n = Number(raw);
+    const s = cell.s !== undefined ? cell.s : STYLE.DEFAULT;
+    return Number.isFinite(n) ? `<c r="${ref}" s="${s}"><v>${n}</v></c>` : '';
+  }
   const text = clamp(raw);
   if (text === '') return '';
   const s = isObj && cell.s !== undefined ? cell.s : STYLE.DEFAULT;

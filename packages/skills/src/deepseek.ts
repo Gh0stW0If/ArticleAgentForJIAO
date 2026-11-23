@@ -42,6 +42,7 @@ export interface DeepSeekCallInfo {
   /** 提示词与输出长度（字符数），用于粗看成本 */
   promptChars: number;
   outputChars: number;
+  reasoningEffort?: LlmRequest['reasoningEffort'];
   usage?: { inputTokens?: number; outputTokens?: number };
   finishReason?: string;
   error?: string;
@@ -50,6 +51,10 @@ export interface DeepSeekCallInfo {
 
 export interface DeepSeekOptions {
   apiKey: string;
+  wireApi?: 'chat_completions' | 'responses';
+  httpHeaders?: Record<string, string>;
+  /** Responses API. Omit to use the provider's default. */
+  reasoningEffort?: LlmRequest['reasoningEffort'];
   /** 默认 https://api.deepseek.com */
   baseUrl?: string;
   /** 默认 deepseek-chat */
@@ -161,6 +166,7 @@ export function createDeepSeekLlm(opts: DeepSeekOptions): DeepSeekLlm {
   if (!apiKey) throw new DeepSeekError('缺少 apiKey', 'config');
 
   const baseUrl = (opts.baseUrl ?? 'https://api.deepseek.com').replace(/\/+$/, '');
+  const responses = opts.wireApi === 'responses';
   const model = opts.model ?? 'deepseek-chat';
   const temperature = opts.temperature ?? 0;
   const maxTokens = opts.maxTokens ?? 8000;
@@ -199,17 +205,28 @@ export function createDeepSeekLlm(opts: DeepSeekOptions): DeepSeekLlm {
 
   async function once(req: LlmRequest, attempt: number): Promise<LlmResponse> {
     const started = Date.now();
+    const reasoningEffort = responses && req.reasoningEffort !== null ? req.reasoningEffort ?? opts.reasoningEffort : undefined;
     const base = {
       tag: req.tag, model, attempt,
       promptChars: req.system.length + req.user.length,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
     };
 
-    const body: Record<string, unknown> = {
+    const messages = [
+      { role: 'system', content: req.system },
+      { role: 'user', content: req.user },
+    ];
+    const body = responses ? {
       model,
-      messages: [
-        { role: 'system', content: req.system },
-        { role: 'user', content: req.user },
-      ],
+      input: messages,
+      store: false,
+      stream: false,
+      ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+      ...(noMaxTokens ? {} : { max_output_tokens: maxTokens }),
+      ...(jsonMode ? { text: { format: { type: 'json_object' } } } : {}),
+    } : {
+      model,
+      messages,
       temperature: req.temperature ?? temperature,
       // 不限制时整个省略 —— 见上面 noMaxTokens 的说明
       ...(noMaxTokens ? {} : { max_tokens: maxTokens }),
@@ -220,22 +237,32 @@ export function createDeepSeekLlm(opts: DeepSeekOptions): DeepSeekLlm {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     let res: Response;
+    let bodyData: unknown = null;
+    let errorText = '';
     try {
-      res = await doFetch(`${baseUrl}/chat/completions`, {
+      res = await doFetch(`${baseUrl}/${responses ? 'responses' : 'chat/completions'}`, {
         method: 'POST',
         headers: {
+          ...opts.httpHeaders,
           'content-type': 'application/json',
           authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
         signal: ac.signal,
       });
+      // Providers can send headers before generation finishes. Keep the timeout
+      // active until the response body has been consumed as well.
+      if (res.ok) bodyData = await res.json().catch((error: unknown) => {
+        if (ac.signal.aborted) throw error;
+        return null;
+      });
+      else errorText = await res.text();
     } catch (e) {
       const aborted = (e as Error)?.name === 'AbortError';
       const kind: DeepSeekErrorKind = aborted ? 'timeout' : 'network';
       const msg = aborted
         ? `请求超时（${timeoutMs}ms）`
-        : `网络错误：${(e as Error).message}`;
+        : redact(`网络错误：${(e as Error).message}`);
       record({ ...base, ms: Date.now() - started, ok: false, outputChars: 0, error: msg, kind });
       throw new DeepSeekError(msg, kind, { tag: req.tag, attempt });
     } finally {
@@ -243,7 +270,7 @@ export function createDeepSeekLlm(opts: DeepSeekOptions): DeepSeekLlm {
     }
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
+      const text = errorText;
       /*
        * ⚠️ 不要把 403 一律当成"key 不对"。
        *
@@ -268,28 +295,46 @@ export function createDeepSeekLlm(opts: DeepSeekOptions): DeepSeekLlm {
       throw new DeepSeekError(msg, kind, { tag: req.tag, attempt, status: res.status, body: redact(text.slice(0, 500)) });
     }
 
-    const data = (await res.json().catch(() => null)) as {
+    const data = bodyData as {
       choices?: { message?: { content?: string }; finish_reason?: string }[];
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
+      output?: { type?: string; content?: { type?: string; text?: string; refusal?: string }[] }[];
+      output_text?: string;
+      status?: string;
+      incomplete_details?: { reason?: string };
+      error?: { message?: string };
+      usage?: { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number };
       model?: string;
     } | null;
 
     const choice = data?.choices?.[0];
-    const text = choice?.message?.content ?? '';
-    const finishReason = choice?.finish_reason ?? undefined;
+    const content = responses ? data?.output?.flatMap((item) => item.type === 'message' ? item.content ?? [] : []) ?? [] : [];
+    const text = responses
+      ? data?.output_text || content.filter((part) => part.type === 'output_text').map((part) => part.text ?? '').join('')
+      : choice?.message?.content ?? '';
+    const finishReason = responses ? data?.incomplete_details?.reason ?? data?.status : choice?.finish_reason;
+    const inputTokens = responses ? data?.usage?.input_tokens : data?.usage?.prompt_tokens;
+    const outputTokens = responses ? data?.usage?.output_tokens : data?.usage?.completion_tokens;
     const usage = data?.usage
       ? {
-          ...(typeof data.usage.prompt_tokens === 'number' ? { inputTokens: data.usage.prompt_tokens } : {}),
-          ...(typeof data.usage.completion_tokens === 'number' ? { outputTokens: data.usage.completion_tokens } : {}),
+          ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
+          ...(typeof outputTokens === 'number' ? { outputTokens } : {}),
         }
       : undefined;
 
-    if (finishReason === 'length') {
+    if (finishReason === 'length' || finishReason === 'max_output_tokens') {
+      const limit = responses ? 'max_output_tokens' : 'max_tokens';
       const msg = noMaxTokens
-        ? '输出被服务端上限截断（本次未限制 max_tokens），JSON 必然不完整——请缩小材料或换更短输出的模型'
-        : `输出被 max_tokens(${maxTokens}) 截断，JSON 必然不完整——请提高 maxTokens 或缩小材料`;
+        ? `输出被服务端上限截断（本次未限制 ${limit}），JSON 必然不完整——请缩小材料或换更短输出的模型`
+        : `输出被 ${limit}(${maxTokens}) 截断，JSON 必然不完整——请提高 maxTokens 或缩小材料`;
       record({ ...base, ms: Date.now() - started, ok: false, outputChars: text.length, ...(usage ? { usage } : {}), finishReason, error: msg, kind: 'truncated' });
       throw new DeepSeekError(msg, 'truncated', { tag: req.tag, attempt });
+    }
+
+    const refusal = content.find((part) => part.type === 'refusal');
+    if (responses && (data?.error || (data?.status && data.status !== 'completed') || refusal)) {
+      const msg = redact(`Responses 请求未完成：${data?.error?.message ?? refusal?.refusal ?? finishReason ?? '未知原因'}`);
+      record({ ...base, ms: Date.now() - started, ok: false, outputChars: text.length, error: msg, kind: 'http' });
+      throw new DeepSeekError(msg, 'http', { tag: req.tag, attempt });
     }
 
     let json: unknown;

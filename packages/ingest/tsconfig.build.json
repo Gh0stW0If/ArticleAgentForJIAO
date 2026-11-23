@@ -5,8 +5,13 @@
     "allowImportingTsExtensions": false,
     "outDir": "./dist",
     "rootDir": "./src",
-    "paths": {},
-    "types": ["node"]
+    "paths": {
+      "@aa/core": ["./packages/core/dist/index.d.ts"],
+      "@aa/crossref": ["./packages/crossref/dist/index.d.ts"],
+      "@aa/europepmc": ["./packages/europepmc/dist/index.d.ts"]
+    },
+    "types": ["node"],
+    "lib": ["ES2022", "DOM"]
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/__tests__/**"]

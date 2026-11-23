@@ -35,6 +35,7 @@ import { PROMPTS, OUTCOME_TASKS } from './prompts.generated.ts';
 import { collectMaterials } from './materials.ts';
 import { groundNested, type GroundOptions } from './grounding.ts';
 import { decode } from './legend.ts';
+import { normalizeOutcomeMeasurementUnit } from './measurement-units.ts';
 import {
   TIMEPOINTS,
   type TimepointJsonKey,
@@ -515,6 +516,7 @@ export function createOutcomeSkill(opts: OutcomeSkillOptions = {}): Skill<Outcom
          */
         decodeTimepointCodes(rec.timepoints as TimepointBlocks | undefined, base, issues);
 
+        normalizeOutcomeMeasurementUnit(rec, base, issues);
         measures.push({ rec, name: identity.name || identity.instrument });
       }
 

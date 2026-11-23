@@ -182,4 +182,5 @@ pnpm desktop:installer:verify     # 安装包验收（拿它当工作区真跑�
 ## 文档
 
 从 `docs/10-roadmap.md`（路线图与现状）和 `docs/24-desktop-build.md`（交付）入手；
+第二篇（PRECIS-2）从 `docs/29-precis2-第一批实现.md` 入手；
 设计与实测细节见 `docs/04`–`docs/09`、`docs/20`–`docs/23`。

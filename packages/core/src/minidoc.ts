@@ -52,6 +52,8 @@ export interface MiniDocBlock {
   };
   /** 图片专用：切图路径（相对 MinerU 输出目录），供多模态使用 */
   imagePath?: string;
+  /** 流程图 OCR 转录，只有抽取运行时追加。 */
+  figureOcr?: string;
   /** 表头块等噪声已被上游剔除，这里保留标记以便审计 */
   dropped?: boolean;
 }

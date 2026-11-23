@@ -124,7 +124,7 @@ export const COMPARISON_FIELDS = [
   { key: 'randomizedN', label: '随机样本量', comment: 'CD2', source: 'llm', desc: '试验组随机例数+对照组随机例数（总随机例数）。' },
   { key: 'analyzedN', label: '主要结局时点样本量', comment: 'CE2', source: 'llm', desc: '主要结局采集时点的分析样本量。' },
   { key: 'dropoutTotal', label: '主要结局脱落总人数', comment: 'CI2', source: 'llm', desc: '两组脱落人数之和。' },
-  { key: 'missingDataRatio', label: '缺失数据比例', comment: 'CJ2', source: 'llm', desc: '缺失比例 = 缺失人数 / 随机人数。' },
+  { key: 'missingDataRatio', label: '缺失数据比例', comment: 'CJ2', source: 'llm', desc: '原文直接报告的主要结局缺失比例，0到1。仅在同一比较组、同一结局时点和同一人群内解释。原文未直接报告填 NR；原文百分比及人数放 missingDataEvidence 由程序规范或计算。ITT分析人数、停治或脱落人数不能自动当作实际观测人数或缺失人数。' },
   { key: 'missingDataReported', label: '是否报告了缺失数据(主要结局)', comment: 'CK2', source: 'llm', codes: { '1': 'Yes, state MPD occur (in the main text or in CONSORT flow diagram)', '2': 'Yes, state MPD did not occur (in the main text or in CONSORT flow diagram)', '3': 'No explicit statement' }, desc: '是否明确说明主要结局缺失数据情况。' },
   { key: 'primaryAnalysis', label: 'primary analysis', comment: 'CL2', source: 'llm', codes: { '1': 'Analysis described as intention to treat（含 modified ITT）', '2': 'Analyzed participants for whom outcome data were available in group to which they were randomized', '3': 'Per protocol analysis', '4': 'No explicit statement' }, requirement: '⚠️ 取值表共 4 项；只在论文完全没有交代分析人群时才填 4=No explicit statement。', desc: '主要分析人群。金标准按此 4 值编码。' },
   {
@@ -223,7 +223,7 @@ export const OUTCOME_TOP_FIELDS = [
   { key: 'instrument', label: '测量工具名称', code: 'INSTRU', source: 'llm', desc: '测量工具/量表名称（如 VAS、SF-12、HDRS）。' },
   { key: 'measurementRange', label: '测量范围', code: 'RANGE', comment: 'L3', source: 'llm', desc: '量表的取值范围（如 0-100）。如报告请填写；不适用填 NA；未报告填 NR。' },
   { key: 'measurementDirection', label: '测量方向', code: 'MDIRE', comment: 'M3', source: 'llm', codes: { '1': '数值越大，结果越好', '0': '数值越小，结果越好' }, desc: '量表方向。' },
-  { key: 'measurementUnit', label: '测量单位', code: 'MUNIT', source: 'llm', desc: '测量单位（如 分、人、mm）。无单位填 NA。' },
+  { key: 'measurementUnit', label: '测量单位', code: 'MUNIT', source: 'llm', desc: '先查本结局表头、行标题、脚注和方法段的原文单位，如 points、mL、VMS/day；保留原文，程序另存规范写法。原文确认为量表得分时，摘录 points、score 或分及出处，程序将规范单位记为 NA；若原文报告 mm 等单位则保留。仅明确无单位或不适用填 NA；找不到单位填 NR，材料缺失无法提取填 NE。不能把样本量 n 当作均值单位；不自行转换数值。' },
   { key: 'measurementType', label: '测量类型', code: 'MTYPE', comment: 'O1', source: 'llm', codes: { '1': '估计值', '2': '组间差值', '3': '发生事件数', '4': 'OR', '5': 'RR', '6': 'RD', '7': 'HR', '8': '等级资料' }, desc: '数值的报告形式。' },
   { key: 'baselineAdjusted', label: '基线是否调整', code: 'IFADJ', comment: 'P1', source: 'llm', codes: { '1': '是', '2': '否', '3': '不清楚' }, desc: '分析是否对基线做了调整。' },
   { key: 'primaryOutcomeTimepoint', label: '主要结局测量时点', code: 'POTIMPO', comment: 'Q1', source: 'llm', codes: { '0': '非主要结局', '1': '治疗结束后', '2': '随访', '3': '治疗结束后和随访都有', '4': '未报告' }, desc: '该结局的测量时点相对主要结局的关系。' },
@@ -240,7 +240,7 @@ export const TIMEPOINT_FIELDS = [
   {
     key: 'varianceType', code: 'TVARI', comment: 'T3', source: 'llm',
     codes: { '1': '标准误（SE）', '2': '95%可信区间（CI）', '3': '标准差（SD）', '4': '四分位间距（IQR）', '5': '全距（range）', '6': 'P值', '7': 'QR' },
-    requirement: '注意：1) 报告多个者只选 1 个；2) 按上述顺序依次优选。例如同时报告 SE 和 95%CI，只提取 SE。',
+    requirement: '同一均值有多种报告格式时，优先 SD，其次 95% CI。只有其他变异值可用时，按原文保留类型及数值。',
     desc: '变异值的类型。',
   },
   { key: 'experimentalEstimate', code: 'IESTI', source: 'llm', desc: '试验组估计值。' },

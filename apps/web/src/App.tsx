@@ -29,6 +29,7 @@ import * as pdfjs from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { PdfViewer, type Selection, type SelectMode } from './PdfViewer.tsx';
 import { ExtractionPanel } from './ExtractionPanel.tsx';
+import { WorkflowPanel, type WorkflowEvidence } from './WorkflowPanel.tsx';
 import { SettingsPanel } from './SettingsPanel.tsx';
 import { ReviewToolsPanel } from './ReviewToolsPanel.tsx';
 import { T, R, SH, tint, ghostBtn, primaryBtn, input as inputS } from './theme.ts';
@@ -111,7 +112,10 @@ const EMPTY_REVIEW: ReviewSummary = {
 const REVIEWER_KEY = 'aa.reviewer';
 
 export default function App() {
-  const [year, setYear] = useState('2015');
+  const [year, setYear] = useState(() => {
+    try { const value = window.localStorage.getItem('aa.lastYear'); return value && /^20\d{2}$/.test(value) ? value : '2015'; }
+    catch { return '2015'; }
+  });
   const [studies, setStudies] = useState<StudyEntry[]>([]);
   const [study, setStudy] = useState('');
   const [doc, setDoc] = useState<MiniDoc | null>(null);
@@ -159,6 +163,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [jobs, setJobs] = useState<JobInfo[]>([]);
+  const [panelMode, setPanelMode] = useState<'workflow' | 'review'>('workflow');
+  const [workflowDocumentId, setWorkflowDocumentId] = useState('');
+  const [workflowDoc, setWorkflowDoc] = useState<MiniDoc | null>(null);
   const [showJobLog, setShowJobLog] = useState(false);
   const pdfRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
   const [pdf, setPdf] = useState<pdfjs.PDFDocumentProxy | null>(null);
@@ -171,8 +178,16 @@ export default function App() {
       const d = await (await fetch(`/api/studies?year=${y}`)).json();
       const list: StudyEntry[] = d.studies ?? [];
       setStudies(list);
-      const next = keep && list.some((s) => s.studyId === keep) ? keep : (list[0]?.studyId ?? '');
+      let remembered = keep;
+      if (!remembered) {
+        try { remembered = window.localStorage.getItem('aa.lastStudy.' + y) ?? undefined; } catch {}
+      }
+      const next = remembered && list.some((s) => s.studyId === remembered) ? remembered : (list[0]?.studyId ?? '');
       setStudy(next);
+      try {
+        window.localStorage.setItem('aa.lastYear', y);
+        window.localStorage.setItem('aa.lastStudy.' + y, next);
+      } catch {}
       setStatus(list.length ? `${y}: ${list.length} 篇` : `${y} 下没有 PDF`);
       return next;
     } catch (e) {
@@ -311,6 +326,8 @@ export default function App() {
     return () => { cancelled = true; };
   }, [year, study, loadFields]);
 
+  useEffect(() => { setWorkflowDocumentId(''); setWorkflowDoc(null); }, [year, study]);
+
   /* ------------------------------ PDF ------------------------------ */
   useEffect(() => {
     if (!study) return;
@@ -319,9 +336,20 @@ export default function App() {
       try {
         const prev = pdfRef.current;
         const p = await pdfjs.getDocument({
-          url: `/api/pdf?year=${year}&study=${encodeURIComponent(study)}`,
+          url: workflowDocumentId
+            ? `/api/workflow/pdf?year=${year}&study=${encodeURIComponent(study)}&document=${encodeURIComponent(workflowDocumentId)}`
+            : `/api/pdf?year=${year}&study=${encodeURIComponent(study)}`,
         }).promise;
         if (cancelled) { void p.destroy(); return; }
+        {
+          const pages = await Promise.all(Array.from({ length: p.numPages }, async (_, index) => {
+            const pg = await p.getPage(index + 1);
+            const vp = pg.getViewport({ scale: 1 });
+            return { page: index + 1, width: vp.width, height: vp.height, rotate: pg.rotate };
+          }));
+          if (cancelled) { void p.destroy(); return; }
+          setWorkflowDoc({ year, studyId: study, sourcePdf: workflowDocumentId, pages, blocks: [], stats: { blocks: 0, pages: p.numPages } });
+        }
         pdfRef.current = p;
         setPdf(p);
         // 旧文档延后销毁：等 React 提交新文档后再释放，否则会打断旧页渲染，闪现"渲染失败"
@@ -331,7 +359,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [year, study]);
+  }, [year, study, workflowDocumentId]);
 
   /* ------------------------------ 后台任务 ------------------------------ */
   const refreshJobs = useCallback(async () => {
@@ -689,7 +717,15 @@ export default function App() {
     }
   }, [year, study]);
 
-  const totalPages = doc?.pages.length ?? 0;
+  const onWorkflowSource = useCallback((source: WorkflowEvidence) => {
+    if (source.documentId) setWorkflowDocumentId(source.documentId);
+    else { setWorkflowDocumentId(''); setWorkflowDoc(null); }
+    setFocusPage(source.page);
+    setFocusToken(token => token + 1);
+    setHighlights(source.bbox ? [{ page: source.page, bbox: source.bbox, label: '证据', color: T.amber }] : []);
+    setPage(source.page);
+  }, []);
+  const totalPages = pdf?.numPages ?? doc?.pages.length ?? 0;
   const currentStudy = studies.find((s) => s.studyId === study);
 
   return (
@@ -728,7 +764,10 @@ export default function App() {
             {YEARS.map((y) => <option key={y} value={y}>{y}</option>)}
           </select>
           <select
-            value={study} onChange={(e) => setStudy(e.target.value)}
+            value={study} onChange={(e) => {
+              setStudy(e.target.value);
+              try { window.localStorage.setItem('aa.lastStudy.' + year, e.target.value); } catch {}
+            }}
             style={inputS({ maxWidth: 240 })} data-testid="study-select"
           >
             {studies.map((s) => (
@@ -756,10 +795,11 @@ export default function App() {
             title="用 MinerU 解析该 PDF（写入 build/mineru）"
           >解析</button>
           <button
-            onClick={() => void startJob('extract')} style={ghostBtn(T.indigo)}
-            disabled={busy || Boolean(runningJob)} data-testid="extract-btn"
-            title="对该文章跑 LLM 抽取（tools/llm_run.mjs --only）"
-          >抽取</button>
+            onClick={() => setPanelMode('workflow')} style={ghostBtn(T.indigo)}
+            data-testid="extract-btn"
+            title="基础字段、候选结局、人工选择与结果汇总"
+          >提取工作流</button>
+          {workflowDocumentId && <button style={ghostBtn()} onClick={() => { setWorkflowDocumentId(''); setWorkflowDoc(null); }}>返回正文</button>}
 
           {/* 右上角：设置 */}
           <button
@@ -848,11 +888,11 @@ export default function App() {
         )}
 
         <main style={{ flex: 1, overflow: 'hidden', background: T.canvas }}>
-          {doc && pdf
+          {(doc || workflowDoc) && pdf
             ? (
               <PdfViewer
                 pdf={pdf}
-                doc={doc}
+                doc={(workflowDocumentId ? workflowDoc ?? doc : doc ?? workflowDoc)!}
                 scale={scale}
                 uiZoom={uiZoom}
                 highlights={highlights}
@@ -894,7 +934,7 @@ export default function App() {
 
       {/* ============ 右：字段详情（三张选项卡） ============ */}
       <aside style={{
-        width: 520, flexShrink: 0, borderLeft: `1px solid ${T.border}`,
+        width: 600, maxWidth: '50vw', flexShrink: 0, borderLeft: `1px solid ${T.border}`,
         background: T.panel, display: 'flex', flexDirection: 'column',
       }}>
         <div style={{
@@ -903,15 +943,19 @@ export default function App() {
         }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
             <span style={{ color: T.ink, fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              抽取字段{currentStudy?.imported ? '（导入件）' : ''}
+              {panelMode === 'workflow' ? '单篇提取工作流' : '历史字段核对'}{currentStudy?.imported ? '（导入件）' : ''}
             </span>
-            <span style={{ fontSize: 11, color: T.faint, whiteSpace: 'nowrap' }}>
+            {panelMode === 'review' && <span style={{ fontSize: 11, color: T.faint, whiteSpace: 'nowrap' }}>
               人工 {annStats.total}
               {annStats.overridden > 0 && <span style={{ color: T.amber }}> · 修改 {annStats.overridden}</span>}
               {annStats.confirmed > 0 && <span style={{ color: T.emerald }}> · 确认 {annStats.confirmed}</span>}
-            </span>
+            </span>}
           </div>
 
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button style={ghostBtn(panelMode === 'workflow' ? T.amber : T.muted)} onClick={() => setPanelMode('workflow')}>四步提取</button>
+            <button style={ghostBtn(panelMode === 'review' ? T.amber : T.muted)} onClick={() => setPanelMode('review')}>历史字段核对</button>
+          </div>
           {/* 多人机核对：核对人身份 + 汇总入口 + 导出（202609） */}
           <div style={{ display: 'flex', gap: 7, alignItems: 'center', fontSize: 11, flexWrap: 'wrap' }}>
             <span style={{ color: T.faint }}>核对人</span>
@@ -925,6 +969,7 @@ export default function App() {
               style={{ ...inputS(), width: 116, padding: '3px 8px', fontSize: 11 }}
             />
             {!reviewer && <span style={{ color: T.red }}>未设置，暂不能提交</span>}
+            {panelMode === 'review' && <>
             <button
               onClick={() => void onExport('xlsx')}
               style={{ ...ghostBtn(T.emerald), marginLeft: 'auto' }}
@@ -988,9 +1033,10 @@ export default function App() {
               核对 {review.consensus.stats.reviewed}/{review.consensus.stats.total}
               {review.consensus.stats.disputed > 0 ? ` · 分歧 ${review.consensus.stats.disputed}` : ''}
             </button>
+            </>}
           </div>
 
-          {reviewOpen && (
+          {panelMode === 'review' && reviewOpen && (
             <div
               data-testid="review-panel"
               style={{
@@ -1039,7 +1085,9 @@ export default function App() {
           )}
         </div>
         <div style={{ flex: 1, overflow: 'hidden' }}>
-          <ExtractionPanel
+          {panelMode === 'workflow'
+            ? <WorkflowPanel year={year} study={study} reviewer={reviewer} onSource={onWorkflowSource} />
+            : <ExtractionPanel
             sheets={sheets}
             markingFieldPath={markingField}
             hasSelection={Boolean(selection)}
@@ -1054,7 +1102,7 @@ export default function App() {
             onLocate={onLocate}
             onInclude={onInclude}
             onAdjudicate={onAdjudicate}
-          />
+          />}
         </div>
       </aside>
 

@@ -111,7 +111,7 @@ export interface SheetsPayload {
 /** 后台任务（MinerU 解析 / LLM 抽取）。 */
 export interface JobInfo {
   id: string;
-  kind: 'parse' | 'extract';
+  kind: 'parse' | 'extract' | 'workflow';
   state: 'running' | 'done' | 'failed';
   year: string;
   study: string;
@@ -122,10 +122,16 @@ export interface JobInfo {
 }
 
 /** 本地设置（密钥只回显掩码）。 */
+export type ReasoningStage = 'basic' | 'candidates' | 'summary' | 'difficult' | 'review';
+export type ReasoningStages = Record<ReasoningStage, string | null>;
+
 export interface SettingsInfo {
   provider: string;
   baseUrl: string;
   model: string;
+  wireApi: 'chat_completions' | 'responses';
+  reasoningEffort: string | null;
+  reasoningStages: ReasoningStages;
   temperature: number;
   maxTokens: number;
   crossrefMailto: string;

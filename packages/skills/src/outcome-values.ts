@@ -33,6 +33,9 @@
  */
 
 import {
+  type FieldValue,
+  type OutcomeContinuous,
+  type OutcomeTimepoint,
   type Issue,
   type Skill,
   type SkillContext,
@@ -41,14 +44,19 @@ import {
 } from '@aa/core';
 import { PROMPTS, OUTCOME_TASKS } from './prompts.generated.ts';
 import { collectMaterials } from './materials.ts';
-import { groundNested, type GroundOptions } from './grounding.ts';
+import { groundNested, numericTokens, type GroundOptions } from './grounding.ts';
 import {
   TIMEPOINTS,
   type TimepointJsonKey,
   type TimepointBlocks,
   addTimepointPaths,
   decodeTimepointCodes,
+  intervalProblem,
+  reportedNumber,
   validateTimepoints,
+  VARIANCE_PREFERENCE,
+  type DifferenceFields,
+  type PreferredResult,
 } from './timepoints.ts';
 
 /** 待取值的结局行（来自上一层的 outcomes，已带名称/工具）。 */
@@ -72,6 +80,7 @@ export interface OutcomeValueTarget {
 export interface OutcomeValueRecord {
   rowIndex: number;
   timepoints?: TimepointBlocks;
+  preferredResult?: PreferredResult;
 }
 
 export interface OutcomeValuesPayload {
@@ -100,13 +109,111 @@ export function buildOutcomeValuePathMap(idx: number, keys: readonly TimepointJs
   return map;
 }
 
+function hasBothEstimates(continuous?: OutcomeContinuous): boolean {
+  return reportedNumber(continuous?.experimental?.estimate) !== undefined
+    && reportedNumber(continuous?.control?.estimate) !== undefined;
+}
+
+function selectionRank(value: OutcomeContinuous | undefined, at: TimepointJsonKey): number {
+  if (!value) return -1;
+  const type = value.estimateType?.code;
+  const variance = value.varianceType?.code;
+  const isChange = type === '3';
+  const complete = [value.experimental, value.control].every(group => {
+    const lower = reportedNumber(group?.ciLower);
+    if (lower === undefined) return false;
+    if (variance === '2') {
+      return reportedNumber(group?.ciUpper) !== undefined
+        && !intervalProblem(group?.estimate, group?.ciLower, group?.ciUpper, true);
+    }
+    if (variance === '3' || variance === '1') return lower >= 0 && reportedNumber(group?.ciUpper) === undefined;
+    return true;
+  });
+  const format = variance ? VARIANCE_PREFERENCE[variance] ?? 9 : 9;
+  return (hasBothEstimates(value) ? 100 : 0)
+    + (at === 'endOfTreatment' && !isChange ? 30 : 0)
+    + (complete ? 10 - format : 0);
+}
+
+function preferredOutcome(tps: TimepointBlocks): PreferredResult | undefined {
+  const hasEventOrCategory = Object.values(tps).some(block => block.categorical
+    || reportedNumber(block.binary?.experimental?.events) !== undefined
+    || reportedNumber(block.binary?.control?.events) !== undefined);
+  if (hasEventOrCategory) return undefined;
+  const end = tps.endOfTreatment?.continuous;
+  if (hasBothEstimates(end) && ['1', '2'].includes(end?.estimateType?.code ?? '')) return 'postTreatment';
+  const hasDifference = [tps.endOfTreatment, tps.followUpEnd].some(block => {
+    const field = (block?.binary as DifferenceFields | undefined)?.differenceEstimate;
+    const n = reportedNumber(field);
+    return n !== undefined && Boolean(field?.evidence.some(item => numericTokens(item.quote).includes(n)));
+  });
+  if (hasDifference) return 'betweenGroupDifference';
+  if (hasBothEstimates(tps.baseline?.continuous) && hasBothEstimates(end) && end?.estimateType?.code !== '3') return 'prePost';
+  return undefined;
+}
+
+export function validateExtractedIntervals(
+  timepoints: TimepointBlocks, prefix: string, issues: Issue[], unresolved: SkillOutput<OutcomeValuesPayload>['unresolved'],
+  requireCell = true,
+): void {
+  for (const [timepoint, data] of Object.entries(timepoints)) {
+    const block = data as OutcomeTimepoint;
+    const check = (scope: string, estimate: FieldValue | undefined, lower: FieldValue | undefined, upper: FieldValue | undefined,
+      discard: () => void, varianceKnown = true) => {
+      const problem = !varianceKnown && (reportedNumber(lower) !== undefined || reportedNumber(upper) !== undefined)
+        ? { code: 'VARIANCE_TYPE_UNVERIFIED', message: '变异值的类型缺少可靠证据，请查原表' }
+        : intervalProblem(estimate, lower, upper, requireCell);
+      if (!problem) return;
+      const path = `${prefix}.timepoints.${timepoint}.${scope}`;
+      const evidence = [estimate, lower, upper].flatMap(field => field?.evidence ?? []);
+      issues.push(warn(problem.message, problem.code, { path, evidence }));
+      unresolved.push({
+        reason: problem.message, evidence,
+        raw: [estimate?.raw, lower?.raw, upper?.raw].filter(Boolean).join(' | '), confidence: 0,
+      });
+      discard();
+    };
+    const varianceType = block.continuous?.varianceType?.code;
+    if (varianceType === '1' || varianceType === '3') {
+      for (const side of ['experimental', 'control'] as const) {
+        const group = block.continuous?.[side];
+        if (!group?.ciUpper) continue;
+        const path = `${prefix}.timepoints.${timepoint}.continuous.${side}.ciUpper`;
+        const upper = group.ciUpper;
+        delete group.ciUpper;
+        if (reportedNumber(upper) === undefined || reportedNumber(upper) === reportedNumber(group.ciLower)) continue;
+        const message = 'SD/SE 仅使用一个变异值，上限已移入待核对';
+        issues.push(warn(message, 'SINGLE_VARIANCE_UPPER', { path, evidence: upper.evidence }));
+        unresolved.push({ reason: message, evidence: upper.evidence, raw: upper.raw, confidence: 0 });
+      }
+    }
+    if (block.continuous && (varianceType === '2' || !varianceType)) {
+      for (const side of ['experimental', 'control'] as const) {
+        const group = block.continuous[side];
+        if (!group) continue;
+        check(`continuous.${side}`, group.estimate, group.ciLower, group.ciUpper, () => {
+          delete group.ciLower;
+          delete group.ciUpper;
+        }, Boolean(varianceType));
+      }
+    }
+    const difference = block.binary as DifferenceFields | undefined;
+    if (difference) {
+      check('binary.differenceEstimate', difference.differenceEstimate, difference.differenceCiLower, difference.differenceCiUpper, () => {
+        delete difference.differenceCiLower;
+        delete difference.differenceCiUpper;
+      });
+    }
+  }
+}
+
 export function createOutcomeValuesSkill(opts: OutcomeValuesSkillOptions): Skill<OutcomeValuesPayload> {
   const includeTables = opts.includeTables ?? true;
   const targets = opts.targets;
 
   const skill: Skill<OutcomeValuesPayload> = {
     id: 'outcome-values',
-    version: '0.1.0',
+    version: '0.2.0',
     level: 'outcome',
     description: '逐结局抽取「结局 × 时点」的数值块（效应量/变异值/例数），只做数值不做结局元信息',
     needs: ['results', 'abstract'],
@@ -139,6 +246,7 @@ export function createOutcomeValuesSkill(opts: OutcomeValuesSkillOptions): Skill
         pages: [1],
         tables: includeTables,
         figures: false,
+        numberTableCells: true,
         maxCharsPerBlock: 6000,
         ...(opts.maxTotalChars !== undefined ? { maxTotalChars: opts.maxTotalChars } : {}),
       });
@@ -159,6 +267,7 @@ export function createOutcomeValuesSkill(opts: OutcomeValuesSkillOptions): Skill
 
       const groundOpts: GroundOptions = {
         kinds: includeTables ? ['text', 'title', 'table'] : ['text', 'title'],
+        verifyNumericSource: true,
       };
       const allUnresolved: SkillOutput<OutcomeValuesPayload>['unresolved'] = [];
 
@@ -173,7 +282,7 @@ export function createOutcomeValuesSkill(opts: OutcomeValuesSkillOptions): Skill
         const base = `values.${i}`;
         const comparisonLabel = t.comparison
           ? `${t.comparison.intervention || '（未报告）'} VS ${t.comparison.control || '（未报告）'}`
-          : '（全文只有一个比较组）';
+          : '（未提供比较组标签，请按原文确认）';
 
         try {
           const task = OUTCOME_TASKS.value
@@ -182,7 +291,7 @@ export function createOutcomeValuesSkill(opts: OutcomeValuesSkillOptions): Skill
             .replace('{{UNIT}}', t.unit?.trim() || '（未报告）')
             .replace('{{COMPARISON}}', comparisonLabel);
           const res = await ctx.llm.invoke({
-            system: PROMPTS.outcomeValue,
+            system: PROMPTS.outcomeValue + '\n多臂试验只使用本行指定试验臂和指定对照臂，禁止跨臂合并分子和分母。按本结局表格单元格里的分子/分母记数，例数可随结局变化。比较变化量时，沿用结果行的起止周和各自的区间。',
             user: userMessage(task),
             temperature: 0,
             tag: `${skill.id}@${skill.version}:${ctx.doc.articleId}:value${i + 1}`,
@@ -208,9 +317,33 @@ export function createOutcomeValuesSkill(opts: OutcomeValuesSkillOptions): Skill
           for (const g of grounded.issues) {
             issues.push(warn(g.reason, 'GROUNDING_FAILED', { path: `${base}.${g.field}` }));
           }
-          const tps = (grounded.payload as { timepoints?: TimepointBlocks }).timepoints;
-          const rec: OutcomeValueRecord = { rowIndex: t.rowIndex, ...(tps ? { timepoints: tps } : {}) };
-          if (!tps) {
+          const tps = (grounded.payload as { timepoints?: TimepointBlocks }).timepoints ?? {};
+          decodeTimepointCodes(tps, `outcomes.${t.rowIndex}`, issues);
+          for (const at of present) {
+            const block = json[at] as Record<string, unknown>;
+            if (!Array.isArray(block.continuousCandidates)) continue;
+            let rank = selectionRank(tps[at]?.continuous, at);
+            let chosen: typeof grounded | undefined;
+            for (const candidate of block.continuousCandidates.slice(0, 6)) {
+              const alternative = groundNested<Record<string, unknown>>(
+                ctx.doc, { [at]: { continuous: candidate } }, buildOutcomeValuePathMap(i, [at]), groundOpts, base,
+              );
+              const times = alternative.payload.timepoints as TimepointBlocks | undefined;
+              decodeTimepointCodes(times, `outcomes.${t.rowIndex}`, []);
+              const continuous = times?.[at]?.continuous;
+              const score = selectionRank(continuous, at);
+              if (continuous && score > rank) {
+                tps[at] = { ...tps[at], continuous };
+                chosen = alternative;
+                rank = score;
+              }
+            }
+            if (chosen) allUnresolved.push(...chosen.unresolved);
+          }
+          validateExtractedIntervals(tps, `outcomes.${t.rowIndex}`, issues, allUnresolved);
+          const preferredResult = preferredOutcome(tps);
+          const rec: OutcomeValueRecord = { rowIndex: t.rowIndex, timepoints: tps, ...(preferredResult ? { preferredResult } : {}) };
+          if (!Object.keys(tps).length) {
             issues.push(warn(
               `${base}（${t.name || t.instrument}）：没有定位成功的时点数值`,
               'NO_TIMEPOINT_DATA',
@@ -227,11 +360,6 @@ export function createOutcomeValuesSkill(opts: OutcomeValuesSkillOptions): Skill
           ));
           values.push({ rowIndex: t.rowIndex });
         }
-      }
-
-      // 编码推导（estimateType / varianceType）：逐个结果做，与 outcome 的技能内校验用同一实现
-      for (const v of values) {
-        decodeTimepointCodes(v.timepoints, `outcomes.${v.rowIndex}`, issues);
       }
 
       values.sort((a, b) => a.rowIndex - b.rowIndex);

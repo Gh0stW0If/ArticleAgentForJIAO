@@ -39,6 +39,8 @@ export interface MaterialOptions {
   tables?: boolean;
   /** 是否需要图（返回切图路径，供多模态） */
   figures?: boolean;
+  /** 保留网格行号与列号，供数值层引用指定单元格。 */
+  numberTableCells?: boolean;
   /** 额外包含的页码（如首页取 meta） */
   pages?: readonly number[];
   /** 单块最大字符数，超出截断（默认 2500） */
@@ -130,7 +132,9 @@ export function collectMaterials(doc: MiniDoc, opts: MaterialOptions = {}): Mate
       && (looksLikeRealTable(b) || !NON_CONTENT_SECTIONS.has(b.section));
 
     // 章节或页码任一命中即可（页码用于"首页 meta"这类需求）
-    if (!sectionOk && !pageOk && !tableKept) { trimmed++; continue; }
+    if (!sectionOk && !pageOk && !tableKept && !(opts.figures && b.type === 'figure' && b.figureOcr)) {
+      trimmed++; continue;
+    }
 
     let text = b.text;
     if (text.length > maxPerBlock) text = text.slice(0, maxPerBlock) + ' …[截断]';
@@ -142,7 +146,12 @@ export function collectMaterials(doc: MiniDoc, opts: MaterialOptions = {}): Mate
       section: b.section,
       text,
       ...(b.type === 'table' && b.table?.grid?.length
-        ? { markdown: gridToMarkdown(b.table.grid), hasGrid: true }
+        ? { markdown: opts.numberTableCells
+          ? gridToMarkdown([
+              ['行号', ...Array.from({ length: Math.max(...b.table.grid.map(row => row.length)) }, (_, i) => `列 ${i + 1}`)],
+              ...b.table.grid.map((row, i) => [String(i + 1), ...row]),
+            ])
+          : gridToMarkdown(b.table.grid), hasGrid: true }
         : {}),
     };
     picked.push(mb);

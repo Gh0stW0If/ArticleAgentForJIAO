@@ -35,6 +35,8 @@ export interface RawFieldClaim {
   value?: string | null;
   /** 支撑该值的原文片段，必须逐字来自文档 */
   quote?: string | null;
+  /** 源块编号及表格单元格（1-based）。 */
+  source?: { block: number; row?: number; column?: number };
   /** 模型自评置信度 0~1 */
   confidence?: number;
   /** 受控编码（若模型能确定，如 "1"、"2/5"）；通常留空由本地解码器补 */
@@ -55,6 +57,8 @@ export interface GroundOptions {
   minConfidence?: number;
   /** 找不到 quote 时是否仍以"整块"作为证据。默认 false（严格） */
   allowBlockFallback?: boolean;
+  /** 对显式引用估计值/端点的声明，要求数值出现在该引文里。 */
+  verifyNumericSource?: boolean;
 }
 
 export interface GroundResult<TPayload> {
@@ -94,6 +98,55 @@ function toEvidence(block: MiniDocBlock, quote: string, kind: Evidence['kind']):
     quote: normalizeWhitespace(quote),
     blockId: `b${block.index}`,
   };
+}
+
+/** 在数字取值中保留正负号，兼容 PDF 常见的 Unicode 减号和千分位。 */
+export function numericTokens(text: string): number[] {
+  const normalized = text.replace(/[−–﹣－]/g, '-').replace(/(?<=\d)-(?=\d)/g, ' ')
+    .replace(/(?<=\d),(?=\d{3}(?:\D|$))/g, '');
+  return (normalized.match(/[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?/g) ?? []).map(Number);
+}
+
+function tableCellHeadings(grid: readonly (readonly string[])[], row: number, column: number) {
+  const startsWithNumber = (cell: string) => /^[<>≤≥+\p{Pd}]?\s*(?:\d|\.\d)/u.test(cell.trim())
+    && !/\b(?:weeks?|months?|days?|years?|hours?|ci|cl|confidence)\b/i.test(cell);
+  const before = grid.slice(0, Math.min(row - 1, 8));
+  const firstData = before.findIndex(line => line.filter(startsWithNumber).length >= 2);
+  const headers = firstData < 0 ? before : before.slice(0, firstData);
+  const groups = headers.slice(0, -1).map(line =>
+    line.slice(0, column).reverse().find(value => value.trim())?.trim() ?? '',
+  );
+  const heading = headers.at(-1)?.[column - 1]?.trim();
+  return { ...(heading ? { heading } : {}), ...(groups.some(Boolean) ? { groupHeadings: groups } : {}) };
+}
+
+function locateClaimSource(doc: MiniDoc, claim: RawFieldClaim, quote: string, opts: GroundOptions) {
+  const source = claim.source;
+  if (!source) {
+    return locateWithFallback(doc, quote, {
+      ...(opts.kinds ? { kinds: opts.kinds } : {}),
+      ...(opts.preferPages ? { preferPages: opts.preferPages } : {}),
+    });
+  }
+
+  const block = doc.blocks.find(item => item.index === source.block);
+  if (!block || block.dropped || (opts.kinds && !opts.kinds.includes(block.type))) return null;
+  const excerpt = normalizeWhitespace(quote);
+  if (!excerpt) return null;
+  if (source.row === undefined && source.column === undefined) {
+    if (block.type === 'figure' && normalizeWhitespace(block.figureOcr ?? '').includes(excerpt)) {
+      return { block, exact: true, usedQuote: excerpt };
+    }
+    if (!verifyQuoteInBlock(block, excerpt)) return null;
+    return { block, exact: true, usedQuote: excerpt };
+  }
+  if (block.type !== 'table' || !Number.isInteger(source.row) || !Number.isInteger(source.column)) return null;
+  const row = source.row!;
+  const column = source.column!;
+  const grid = block.table?.grid;
+  const cell = grid?.[row - 1]?.[column - 1];
+  if (!grid || typeof cell !== 'string' || !normalizeWhitespace(cell).includes(excerpt)) return null;
+  return { block, exact: true, usedQuote: excerpt, tableCell: { row, column, ...tableCellHeadings(grid, row, column) } };
 }
 
 function evidenceKindOf(block: MiniDocBlock): Evidence['kind'] {
@@ -186,8 +239,8 @@ export function groundField(
   claim: RawFieldClaim,
   opts: GroundOptions = {},
 ): { field?: FieldValue; unresolved?: UnresolvedItem; issue?: string } {
-  const rawValue = claim.value ?? '';
-  const quote = claim.quote ?? '';
+  const rawValue = typeof claim.value === 'string' || typeof claim.value === 'number' ? String(claim.value) : '';
+  const quote = typeof claim.quote === 'string' ? claim.quote : '';
   const confidence = typeof claim.confidence === 'number' ? Math.min(1, Math.max(0, claim.confidence)) : 0.5;
 
   // 无 quote：直接拒绝（核心不变量）
@@ -207,10 +260,7 @@ export function groundField(
     return { issue: `${fieldPath}: 缺少 quote 且未启用块回退` };
   }
 
-  const found = locateWithFallback(doc, quote, {
-    ...(opts.kinds ? { kinds: opts.kinds } : {}),
-    ...(opts.preferPages ? { preferPages: opts.preferPages } : {}),
-  });
+  const found = locateClaimSource(doc, claim, quote, opts);
 
   if (!found) {
     return {
@@ -226,6 +276,16 @@ export function groundField(
 
   // 用实际命中的片段作为证据原文（保证 quote 真的在文档里）
   const evidenceQuote = found.usedQuote;
+  const evidence = toEvidence(found.block, evidenceQuote, evidenceKindOf(found.block));
+  if ('tableCell' in found && found.tableCell) evidence.tableCell = found.tableCell;
+  if (opts.verifyNumericSource && claim.source && /(?:estimate|ciLower|ciUpper)$/i.test(fieldPath)) {
+    const declared = numericTokens(rawValue);
+    if (declared.length === 1 && !numericTokens(evidenceQuote).includes(declared[0]!)) {
+      return {
+        unresolved: { skillId: fieldPath, reason: '源单元格或原文引文不含该数值', raw: rawValue, evidence: [evidence], confidence },
+      };
+    }
+  }
 
   if (opts.minConfidence !== undefined && confidence < opts.minConfidence) {
     return {
@@ -233,13 +293,11 @@ export function groundField(
         skillId: fieldPath,
         reason: `置信度 ${confidence} 低于阈值 ${opts.minConfidence}`,
         raw: rawValue || quote,
-        evidence: [toEvidence(found.block, evidenceQuote, evidenceKindOf(found.block))],
+        evidence: [evidence],
         confidence,
       },
     };
   }
-
-  const evidence = toEvidence(found.block, evidenceQuote, evidenceKindOf(found.block));
 
   const field = makeField(fieldPath, {
     raw: rawValue || evidenceQuote,

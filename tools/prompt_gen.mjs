@@ -136,6 +136,10 @@ const COMMON_PREAMBLE = `你是一名循证医学系统评价的数据抽取员�
 
 /* ---------------------------- 各层级提示词 ---------------------------- */
 
+function comparisonJsonTemplate() {
+  return JSON.stringify({ ...JSON.parse(jsonTemplate(COMPARISON_FIELDS)), missingDataEvidence: [] }, null, 2);
+}
+
 function articlePrompt() {
   return `${COMMON_PREAMBLE}
 
@@ -270,6 +274,46 @@ function comparisonPrompt() {
 材料含方法学与结果章节，并且**包含基线特征表（Table 1 等）**：
 性别人数、各组例数、基线均值、既往针刺史等常只出现在表格里——请读表，不要因为没有正文描述就填 NR。
 
+## 样本量与受试者流程图
+如果材料包含流程图 OCR，先用随机分配、随访和分析方框分别定位每个试验臂，再核对正文及表格。
+用材料里的图块号作为 \`source.block\`，\`quote\` 逐字抄录框内文字。OCR 行首的 x/y 只用于识别框和分支。
+按本次比较组选取两臂，保留以下三套人数口径：
+- 随机分配人数：各组写 \`priorAcupunctureExperimental\` / \`priorAcupunctureControl\`，两组总数写 \`randomizedN\`。
+- 主要结局采集时点人数：各组写 \`randomizedNExperimental\` / \`randomizedNControl\`，两组总数写 \`analyzedN\`。核对是哪个时点、哪个分析集；基线表人数只支持基线。
+- 主要结局脱落人数：各组写 \`analyzedNExperimental\` / \`analyzedNControl\`，两组总数写 \`dropoutTotal\`。流程图中的停治、失访、排除、实际分析人数有不同含义，按原文区分。
+只在来源对应同一比较组、同一时点和同一分析集时比较数值。有多来源时，把逐条可定位的候选放在当前比较组对象的
+\`sampleSizeEvidence\` 里，键用上面对应的字段名。例如
+\`"sampleSizeEvidence":{"priorAcupunctureExperimental":[{"value":"80","quote":"Allocated to acupuncture (n=80)","source":{"block":24},"confidence":0.95}]}\`。
+如有冲突，把各来源值都放入候选。论文未给两组总数而各臂人数证据齐全时，先填各臂人数。
+
+## 缺失数据：直接报告和人数推导分开
+
+missingDataRatio 仅填写原文明示的主要结局缺失比例，输出0到1；没有直接报告时填 NR，禁止从“随机人数－分析人数”自行推算。missingDataReported 仍按是否直接报告编码，不能因为程序可计算就改为“已报告”。
+NR=未报告；NA=确实不适用；NE=存在所需材料但无法提取。禁止用 NA 表示“没找到”。
+必须区分 randomized（随机人数）、observed（该结局该时点真实观测人数）、analyzed（纳入分析人数）、imputed（插补人数）、dropout（退出/失访人数）、missing（该结局缺失人数）。
+ITT、MI、LOCF使 analyzed 可能等于 randomized，但 observed 仍可更少；dropout 与 missing 也不必相等。
+
+在每个 comparison 对象另外返回 missingDataEvidence 数组。有依据时填写，没依据返回[]。
+每个元素形如：
+{
+ "role":"experimental 或 control 或 overall",
+ "group":{"value":"原文组名","quote":"原文组名片段","source":{"block":24}},
+ "outcome":{"value":"具体结局及分域","quote":"原文片段","source":{"block":24}},
+ "time":{"value":"原文时点","quote":"原文片段","source":{"block":24}},
+ "population":{"value":"这些人数所对应的队列/人群","quote":"原文片段","source":{"block":24}},
+ "primary":{"value":"1","quote":"说明该结局为 primary outcome 的原文声明","source":{"block":12}},
+ "randomized":{"value":"40","quote":"该组随机人数原文","source":{"block":24}},
+ "observed":{"value":"35","quote":"该组该结局该时点实际有观测值的原文","source":{"block":24}},
+ "analyzed":{"value":"40","quote":"ITT分析人数原文","source":{"block":24}},
+ "imputed":{"value":"5","quote":"插补人数原文","source":{"block":24}},
+ "dropout":{"value":"3","quote":"退出人数原文","source":{"block":24}},
+ "missing":{"value":"5","quote":"缺失该结局的人数原文","source":{"block":24}},
+ "reportedRatio":{"value":"12.5%","quote":"原文直接报告的百分比，保留百分号","source":{"block":24}}
+}
+示例数字只是形状，不能复制。省略没有证据的键。primary 仅在明确声明为主要结局时给出；不同结局、时点、人群分成不同元素。只有两臂同口径时 overall 才能表示合计；不能把多臂试验整篇总人数当成当前比较组总人数。
+程序仅用有来源的 missing/randomized 或 (randomized-observed)/randomized 计算，并记录依据；不会用 analyzed、imputed 或 dropout 自动替代 missing。
+不要为了补全计算链而猜测任何人数。
+
 ## 一致性的硬要求
 - \`randomizationClass\` 必须与 \`randomizationMethod\` 的原文一致：原文提到 computer/software/
   telephone/web-based/central randomisation service → 选 \`2\`（计算机随机）；提到 random number
@@ -347,7 +391,7 @@ ${OUTPUT_RULES}
 \`\`\`json
 {
   "comparisons": [
-${jsonTemplate(COMPARISON_FIELDS).split('\n').map((l, i) => (i === 0 ? l : '    ' + l)).join('\n')}
+${comparisonJsonTemplate().split('\n').map((l, i) => (i === 0 ? l : '    ' + l)).join('\n')}
   ]
 }
 \`\`\`
@@ -423,6 +467,13 @@ function outcomeValuePrompt() {
 - \`follow_up_end\`（随访结束时）：≥80% 数据的最长随访时间点，JSON 键写 \`followUpEnd\`
 
 **每个时点单独输出**。若某时点无数据，省略该键（不要编造）。
+
+以同一结局、比较组和主要分析集为单位，优先寻找疗程结束时各组的测量值，缺失时找论文直接报告的组间差异。
+若两者都不足以选取，保留可核对的治疗前、治疗后原始值。基线和随访保留各自的时点；治疗后测量值、
+组内相对基线变化和组间效应各按其原文类型输出。
+同一时点存在不同可用格式时，把有证据的连续型候选放在 \`continuousCandidates\` 数组，每个元素与 \`continuous\`
+字段结构相同，包括估计类型、变异值类型、各组估计值和各组变异值。程序会优先选完整的均值 ± SD，再选均值和 95% CI。
+只报告一种连续型结果时，可直接用 \`continuous\`。各组数值、变异值和人数必须使用一致的时点和分析集。
 
 ## 时点块内的字段（每个时点都适用）
 
@@ -530,7 +581,7 @@ function outcomeItemTaskPrompt() {
 - ⚠️ **不要因为"表格里没有单独一列写范围"就填 NR**——论文里给了就必须填；
 - 确实全篇未给 → \`NR\`；不适用（事件计数、率）→ \`NA\`。
 
-**\measurementUnit\（测量单位）**——同样主动找：\`0-100 mm\` → \`mm\`；无单位 → \`NA\`。
+**\measurementUnit\（测量单位）**——同样主动找：\`0-100 mm\` → \`mm\`；原文明确以量表得分报告时，保留 points、score 或分等字样及原文证据，程序将规范单位记为 NA；若论文明确报告 mm、cm 等单位，保留相应单位。原文明示无单位/不适用才在原始值填 NA；未找到填 NR；材料不足无法提取填 NE。
 
 ## ⚠️ 编码字段必须填编码，不要填文字
 
@@ -671,10 +722,13 @@ PainVAS (T0–T1)     78  −41.2  −47.6 to −34.9   81  −27.0  −33.2 to 
 把括号里的 SD 整个丢掉——这是本层最大的一块漏（2015-03 的 \`52.3 (15.7)\` 就该填
 \`ciLower=15.7\`，我们填成了空）。**看到括号里的离散度就必须填，不管它是不是 CI。**
 
-**③ CI 要读该组该时点那一列，不要串到相邻列。**
-表里 CI 常与「均数、SD、范围、p 值」并排。实测 2015-03 把别的列当成 CI 下限
-（金 19.3 / 我 3.2）。取数时确认列头：**上下限必须来自同一列组的同一个离散度**，
-且当它是 95%CI 时应满足 \`下限 < 估计值 < 上限\`——不满足就说明取错了列，请回表核对。
+**③ 将估计值、CI 下限、CI 上限视为一组数值。**
+表格单元格已注明行号和列号。凡估计值和端点来自表格，对这三个字段分别附
+\`"source":{"block":63,"row":4,"column":10}\` 及该单元格内逐字的 \`quote\`。
+核对表块和完整的上层表头，确保三者对应同一结局行、同一组或对比、同一时点、同一分析集。
+论文在正文中报告三项时，三个字段使用同一个包含估计值和两个端点的原文片段，并给出 \`source.block\`。
+95% CI 下限不高于估计值，上限不低于估计值。SD 只有一项，填入历史下限列，上限省略。
+上下限缺失或来源不明确时，保留有证据的估计值，将可疑端点交核对。
 
 **④ 别把「组间差值」当成「组内估计值」。**
 表格里常并排给出「各组自己的变化值」与「两组之差」。\`experimentalEstimate\`/\`controlEstimate\`
@@ -804,7 +858,7 @@ function comparisonTaskPrompt() {
 \`\`\`json
 {
   "comparison": {
-${jsonTemplate(COMPARISON_FIELDS).split('\n').slice(1, -1).join('\n')}
+${comparisonJsonTemplate().split('\n').slice(1, -1).join('\n')}
   }
 }
 \`\`\`

@@ -123,10 +123,10 @@ describe('comparison / outcome — 提示词与路径映射同步', () => {
     expect(map['outcomes.1.followUpEnd.continuous.estimateType']).toBeUndefined();
   });
 
-  it('变异值优先级顺序与金标准 T3 批注一致（SE < CI < SD < IQR < 全距）', () => {
-    expect(VARIANCE_PREFERENCE['1']).toBeLessThan(VARIANCE_PREFERENCE['2']!);
-    expect(VARIANCE_PREFERENCE['2']).toBeLessThan(VARIANCE_PREFERENCE['3']!);
-    expect(VARIANCE_PREFERENCE['3']).toBeLessThan(VARIANCE_PREFERENCE['4']!);
+  it('变异值优先级遵循11月修正（SD < CI < SE < IQR < 全距）', () => {
+    expect(VARIANCE_PREFERENCE['3']).toBeLessThan(VARIANCE_PREFERENCE['2']!);
+    expect(VARIANCE_PREFERENCE['2']).toBeLessThan(VARIANCE_PREFERENCE['1']!);
+    expect(VARIANCE_PREFERENCE['1']).toBeLessThan(VARIANCE_PREFERENCE['4']!);
   });
 });
 
@@ -205,8 +205,8 @@ describe.skipIf(!hasData)('SKILL: comparison', () => {
           intervention: { raw: 'same', evidence: ev, provenance: 'model', confidence: 0.9 },
           control: { raw: 'same', evidence: ev, provenance: 'model', confidence: 0.9 },
           randomizedN: { raw: '164', evidence: ev, provenance: 'model', confidence: 0.9 },
-          randomizedNExperimental: { raw: '80', evidence: ev, provenance: 'model', confidence: 0.9 },
-          randomizedNControl: { raw: '82', evidence: ev, provenance: 'model', confidence: 0.9 },
+          priorAcupunctureExperimental: { raw: '80', evidence: ev, provenance: 'model', confidence: 0.9 },
+          priorAcupunctureControl: { raw: '82', evidence: ev, provenance: 'model', confidence: 0.9 },
         }],
       },
       unresolved: [], issues: [],
@@ -225,13 +225,38 @@ describe.skipIf(!hasData)('SKILL: comparison', () => {
         comparisons: [{
           studyId: '2015-01',
           randomizedN: { raw: '162', evidence: ev, provenance: 'model', confidence: 0.9 },
-          randomizedNExperimental: { raw: '80', evidence: ev, provenance: 'model', confidence: 0.9 },
-          randomizedNControl: { raw: '82', evidence: ev, provenance: 'model', confidence: 0.9 },
+          priorAcupunctureExperimental: { raw: '80', evidence: ev, provenance: 'model', confidence: 0.9 },
+          priorAcupunctureControl: { raw: '82', evidence: ev, provenance: 'model', confidence: 0.9 },
+          randomizedNExperimental: { raw: '78', evidence: ev, provenance: 'model', confidence: 0.9 },
+          randomizedNControl: { raw: '81', evidence: ev, provenance: 'model', confidence: 0.9 },
         }],
       },
       unresolved: [], issues: [],
     }, { doc, llm: createStubLlm(), log: () => {} });
     expect(issues.filter((i) => i.code === 'SAMPLE_SIZE_INCONSISTENT')).toEqual([]);
+  });
+
+  it('流程图与正文报告不同的同口径人数时，保留两处证据并交人工复核', async () => {
+    const text = 'We allocated 80 participants to acupuncture';
+    const figureOcr = 'Allocated to acupuncture (n=79)';
+    const doc: MiniDoc = {
+      ...getDoc(),
+      blocks: [
+        { type: 'text', section: 'results', text, page: 2, index: 1, bbox: null },
+        { type: 'figure', section: 'results', text: figureOcr, figureOcr, page: 3, index: 2, bbox: [0, 0, 100, 100] },
+      ],
+    };
+    const output = await createComparisonSkill().run(ctxOf(doc, fakeLlm({
+      comparisons: [{
+        sampleSizeEvidence: { priorAcupunctureExperimental: [
+          { value: '80', quote: text, source: { block: 1 } },
+          { value: '79', quote: figureOcr, source: { block: 2 } },
+        ] },
+      }],
+    })));
+    expect(output.payload.comparisons[0]?.priorAcupunctureExperimental).toBeUndefined();
+    expect(output.issues.find(issue => issue.code === 'SAMPLE_SIZE_SOURCE_CONFLICT')?.evidence
+      ?.map(source => [source.kind, source.page])).toEqual([['text', 2], ['figure', 3]]);
   });
 
   it('validate：不适用场景填 NR 会被提示应填 NA', async () => {
@@ -499,6 +524,70 @@ describe.skipIf(!hasData)('SKILL: outcome', () => {
     expect(out.issues.some((i) => i.code === 'OUTCOME_UNIDENTIFIED')).toBe(true);
   });
 
+  it('outcome-values：区间数值即使合理，也拦下来自同一行另一组的列', async () => {
+    const doc: MiniDoc = {
+      ...getDoc(),
+      blocks: [{
+        type: 'table', page: 2, index: 17, bbox: null, section: 'results', text: 'Table 2 Results',
+        table: { html: '', grid: [
+          ['Outcome', 'Acupuncture ITT', '', 'Sham ITT', ''],
+          ['', 'Mean', '95% CI', 'Mean', '95% CI'],
+          ['Pain', '10', '8 to 12', '11', '9 to 13'],
+        ] },
+      }],
+    };
+    const cell = (value: string, quote: string, row: number, column: number) => ({
+      value, quote, source: { block: 17, row, column },
+    });
+    const skill = createOutcomeValuesSkill({ targets: [{ rowIndex: 0, name: 'pain', instrument: 'VAS' }] });
+    const evaluate = (column: number, lower: string, upper: string) => skill.run(ctxOf(doc, fakeLlm({
+      endOfTreatment: { continuous: {
+        varianceType: cell('2', '95% CI', 2, 3),
+        experimentalEstimate: cell('10', '10', 3, 2),
+        experimentalCiLower: cell(lower, `${lower} to ${upper}`, 3, column),
+        experimentalCiUpper: cell(upper, `${lower} to ${upper}`, 3, column),
+      } },
+    })));
+    const wrong = await evaluate(5, '9', '13');
+    expect(wrong.issues.some(issue => issue.code === 'CI_SOURCE_MISMATCH')).toBe(true);
+    expect(wrong.payload.values[0]?.timepoints?.endOfTreatment?.continuous?.experimental?.ciLower).toBeUndefined();
+    const right = await evaluate(3, '8', '12');
+    expect(right.payload.values[0]?.timepoints?.endOfTreatment?.continuous?.experimental?.ciLower?.raw).toBe('8');
+  });
+
+  it('outcome-values：同口径的疗程后均值同时报告 SD 和 CI 时，选 SD', async () => {
+    const grid = [
+      ['结局', '试验组', '', '对照组', ''],
+      ['', 'Mean (SD)', 'Mean (95% CI)', 'Mean (SD)', 'Mean (95% CI)'],
+      ['VAS', '10 (2)', '10 (8 to 12)', '12 (3)', '12 (9 to 15)'],
+    ];
+    const doc: MiniDoc = { ...getDoc(), blocks: [{
+      type: 'table', page: 2, index: 17, bbox: null, section: 'results', text: 'Table 2 Results',
+      table: { html: '', grid },
+    }] };
+    const cell = (value: string, row: number, column: number) => ({
+      value, quote: grid[row - 1]![column - 1]!, source: { block: 17, row, column },
+    });
+    const sdOrCi = (sd: boolean) => {
+      const a = sd ? 2 : 3;
+      const b = sd ? 4 : 5;
+      return {
+        estimateType: cell('1', 2, a), varianceType: cell(sd ? '3' : '2', 2, a),
+        experimentalEstimate: cell('10', 3, a), controlEstimate: cell('12', 3, b),
+        experimentalCiLower: cell(sd ? '2' : '8', 3, a), controlCiLower: cell(sd ? '3' : '9', 3, b),
+        ...(sd ? {} : { experimentalCiUpper: cell('12', 3, a), controlCiUpper: cell('15', 3, b) }),
+      };
+    };
+    const skill = createOutcomeValuesSkill({ targets: [{ rowIndex: 0, name: 'pain', instrument: 'VAS' }] });
+    const output = await skill.run(ctxOf(doc, fakeLlm({
+      endOfTreatment: { continuousCandidates: [sdOrCi(false), sdOrCi(true)] },
+    })));
+    const selected = output.payload.values[0];
+    expect(selected?.preferredResult).toBe('postTreatment');
+    expect(selected?.timepoints?.endOfTreatment?.continuous?.varianceType?.code).toBe('3');
+    expect(selected?.timepoints?.endOfTreatment?.continuous?.experimental?.ciUpper).toBeUndefined();
+  });
+
   it('outcome-values：validate 按变异值类型判定上下限（SD 单值不算残缺）', () => {
     const ev = [{ kind: 'text' as const, page: 1, bbox: null, quote: 'x' }];
     const fv = (raw: string) => ({ raw, evidence: ev, provenance: 'model' as const, confidence: 0.9 });
@@ -599,6 +688,7 @@ describe.skipIf(!hasData)('SKILL: outcome', () => {
           timepoints: {
             endOfTreatment: {
               continuous: {
+                varianceType: { ...fv('2'), code: '2' },
                 experimental: { estimate: fv('10'), ciLower: fv('20'), ciUpper: fv('5'), n: fv('78.5') },
               },
             },

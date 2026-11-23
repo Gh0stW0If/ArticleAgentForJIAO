@@ -45,6 +45,10 @@ import { verifySignature } from '../../tools/export_review.mjs';
 import { labelOutcomeField } from '../../tools/outcome-field-map.mjs';
 import { RETIRED_KEYS } from '../../tools/canonical-field-map.mjs';
 import { isOutcomeCandidate, outcomeSimilarity } from '../../tools/lib/align.mjs';
+import { llmConfigPath, loadLlmConfig, REASONING_SETTINGS, validReasoningStages } from '../../tools/lib/llm-config.mjs';
+import { canReviewSummary, isFinalReviewCurrent } from '../../tools/lib/workflow-final-review.mjs';
+import { readWorkflow, selectOutcomes, addCandidate, updateCandidate, editResult, safeSourcePath, effectiveRecords } from '../../tools/lib/workflow-store.mjs';
+import { workflowExportSheets, workflowCsv } from '../../tools/lib/workflow-export.mjs';
 
 const ROOT = resolve(process.env.AA_ROOT ?? process.cwd());
 const PORT = Number(process.env.AA_PORT ?? 43130);
@@ -717,27 +721,8 @@ const studyOk = (year, study) => (okYear(year) && okStudy(study)) || Boolean(pdf
 
 /* ------------------------------ 本地配置（设置菜单） ------------------------------ */
 
-const CONFIG_FILE = () => process.env.AA_LLM_CONFIG ?? join(DIRS.runtime, 'llm.local.json');
-
-/** 读取本地配置；不存在时回落到默认值。 */
-function readConfig() {
-  const p = CONFIG_FILE();
-  let file = {};
-  if (existsSync(p)) {
-    try { file = JSON.parse(readFileSync(p, 'utf8')); } catch { file = {}; }
-  }
-  return {
-    file,
-    // 环境变量优先（与 tools/llm_run.mjs 的取值顺序一致）
-    apiKey: process.env.DEEPSEEK_API_KEY ?? file.apiKey ?? '',
-    baseUrl: process.env.AA_LLM_BASE_URL ?? file.baseUrl ?? 'https://api.deepseek.com',
-    model: process.env.AA_LLM_MODEL ?? file.model ?? 'deepseek-chat',
-    provider: file.provider ?? 'deepseek',
-    temperature: file.temperature ?? 0,
-    maxTokens: file.maxTokens ?? 8000,
-    crossrefMailto: file.crossrefMailto ?? '',
-  };
-}
+const CONFIG_FILE = () => llmConfigPath(ROOT);
+const readConfig = () => loadLlmConfig(ROOT, { optional: true });
 
 /**
  * 掩码：只回显前 3 位与后 4 位。
@@ -1443,6 +1428,75 @@ const server = createServer(async (req, res) => {
     const year = url.searchParams.get('year') ?? '';
     const study = url.searchParams.get('study') ?? '';
 
+    if (p.startsWith('/api/workflow')) {
+      if (!okYear(year) || !okImportId(study)) {
+        return json(res, 400, { error: '论文编号或年份非法' });
+      }
+      try {
+        if (p === '/api/workflow' && req.method === 'GET') {
+          const state = readWorkflow(ROOT, year, study);
+          const records = effectiveRecords(state);
+          return json(res, 200, { ...state, effectiveRecords: records, reviewCurrent: isFinalReviewCurrent(state, records) });
+        }
+        if (p === '/api/workflow/select' && req.method === 'POST') {
+          const state = await selectOutcomes(ROOT, year, study, await readBody(req));
+          return json(res, 200, state);
+        }
+        if (p === '/api/workflow/candidate' && req.method === 'POST') {
+          return json(res, 200, await addCandidate(ROOT, year, study, await readBody(req)));
+        }
+        if (p === '/api/workflow/candidate' && req.method === 'PATCH') {
+          return json(res, 200, await updateCandidate(ROOT, year, study, await readBody(req)));
+        }
+        if (p === '/api/workflow/edit' && req.method === 'POST') {
+          return json(res, 200, await editResult(ROOT, year, study, await readBody(req)));
+        }
+        if (p === '/api/workflow/run' && req.method === 'POST') {
+          const input = await readBody(req);
+          const stage = input.stage;
+          if (!['basic', 'candidates', 'summary', 'review'].includes(stage)) return json(res, 400, { error: '未知工作流阶段' });
+          const active = [...jobs.values()].find(j => j.year === year && j.study === study && j.state === 'running');
+          if (active) return json(res, 409, { error: '该论文已有任务运行，请等待完成', job: jobView(active) });
+          const state = readWorkflow(ROOT, year, study);
+          if (Object.values(state.stages).some(s => s.status === 'running')) return json(res, 409, { error: '该论文已有任务运行' });
+          if (stage !== 'basic' && !state.basic) return json(res, 409, { error: '请先提取基础字段' });
+          if (stage === 'summary' && (!state.selection.candidateIds.length || input.selectionRevision !== state.selection.revision)) {
+            return json(res, 409, { error: '请先保存结局选择，再运行汇总' });
+          }
+          if (stage === 'review' && (!canReviewSummary(state) || input.selectionRevision !== state.selection.revision)) {
+            return json(res, 409, { error: '请先汇总当前所选结局，再运行最终复核' });
+          }
+          const args = [join(APP_DIR, 'tools', 'workflow_run.mjs'), '--year', year, '--study', study, '--stage', stage];
+          if (stage === 'summary' || stage === 'review') args.push('--selection-revision', String(state.selection.revision));
+          if (input.fresh === true) args.push('--fresh');
+          const job = startJob('workflow', year, study, process.execPath, args, { ELECTRON_RUN_AS_NODE: '1', AA_ROOT: ROOT });
+          return json(res, 200, { ok: true, job: jobView(job) });
+        }
+        if (p === '/api/workflow/pdf' && req.method === 'GET') {
+          const state = readWorkflow(ROOT, year, study);
+          const source = state.sources?.find(s => s.id === url.searchParams.get('document'));
+          if (!source) return json(res, 404, { error: '找不到正文或附件' });
+          const bytes = readFileSync(safeSourcePath(ROOT, source));
+          res.writeHead(200, { 'content-type': 'application/pdf', 'content-length': bytes.length, 'cache-control': 'no-store' });
+          return res.end(bytes);
+        }
+        if (p === '/api/workflow/export' && req.method === 'GET') {
+          const state = readWorkflow(ROOT, year, study);
+          const csv = url.searchParams.get('format') === 'csv';
+          const body = csv ? Buffer.from(workflowCsv(state), 'utf8') : buildXlsx(workflowExportSheets(state));
+          res.writeHead(200, {
+            'content-type': csv ? 'text/csv; charset=utf-8' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'content-disposition': 'attachment; filename="' + study + '-workflow.' + (csv ? 'csv' : 'xlsx') + '"',
+            'content-length': body.length, 'cache-control': 'no-store',
+          });
+          return res.end(body);
+        }
+        return json(res, 404, { error: '未知工作流接口' });
+      } catch (error) {
+        return json(res, 409, { error: redact(error.message, readConfig().apiKey) });
+      }
+    }
+
     if (p === '/api/health') {
       return json(res, 200, {
         ok: true,
@@ -1986,14 +2040,17 @@ const server = createServer(async (req, res) => {
           provider: c.provider,
           baseUrl: c.baseUrl,
           model: c.model,
+          wireApi: c.wireApi,
+          reasoningEffort: c.reasoningSetting ?? null,
+          reasoningStages: c.reasoningStages,
           temperature: c.temperature,
           maxTokens: c.maxTokens,
-          crossrefMailto: c.crossrefMailto,
+          crossrefMailto: c.crossrefMailto ?? '',
           /** 只回显掩码；前端留空即"不修改" */
           apiKeyMasked: maskKey(c.apiKey),
           hasKey: Boolean(c.apiKey),
           /** 密钥来自环境变量时，界面上说明"改文件不生效" */
-          keyFromEnv: Boolean(process.env.DEEPSEEK_API_KEY),
+          keyFromEnv: c.keyFromEnv,
           configPath: CONFIG_FILE().replace(`${ROOT}${sep}`, ''),
         });
       }
@@ -2001,8 +2058,24 @@ const server = createServer(async (req, res) => {
         const body = await readBody(req);
         const path = CONFIG_FILE();
         let cur = {};
-        if (existsSync(path)) { try { cur = JSON.parse(readFileSync(path, 'utf8')); } catch { cur = {}; } }
+        if (existsSync(path)) { try { cur = JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')); } catch { cur = {}; } }
         const next = { ...cur };
+        if (Object.hasOwn(body, 'reasoningEffort')) {
+          const effort = body.reasoningEffort;
+          if (effort === null) {
+            delete next.reasoningEffort;
+          } else if ((cur.wireApi ?? 'chat_completions') !== 'responses' || !REASONING_SETTINGS.includes(effort)) {
+            return json(res, 400, { error: 'Responses 思考强度可选择按字段分配、自动、低、中、高或极高' });
+          } else {
+            next.reasoningEffort = effort;
+          }
+        }
+        if (Object.hasOwn(body, 'reasoningStages')) {
+          if ((cur.wireApi ?? 'chat_completions') !== 'responses' || !validReasoningStages(body.reasoningStages)) {
+            return json(res, 400, { error: '各阶段思考强度需从自动、低、中、高或极高选择' });
+          }
+          next.reasoningStages = { ...readConfig().reasoningStages, ...body.reasoningStages };
+        }
         for (const k of ['provider', 'baseUrl', 'model', 'crossrefMailto']) {
           if (typeof body[k] === 'string' && body[k].trim()) next[k] = body[k].trim();
         }
@@ -2011,20 +2084,21 @@ const server = createServer(async (req, res) => {
         }
         // 密钥：空字符串/缺省 = 保留原值（避免"只改模型"时把 key 抹掉）
         if (typeof body.apiKey === 'string' && body.apiKey.trim()) next.apiKey = body.apiKey.trim();
-        next._note ??= '本地私有配置，不要提交/外发。也可用环境变量 DEEPSEEK_API_KEY / AA_LLM_MODEL 覆盖 apiKey 与 model。';
+        next._note ??= '本地私有配置。环境变量 AA_LLM_API_KEY / AA_LLM_MODEL 可覆盖 apiKey 与 model。';
         mkdirSync(DIRS.runtime, { recursive: true });
         writeFileSync(path, JSON.stringify(next, null, 2), { encoding: 'utf8', mode: 0o600 });
         const c = readConfig();
         return json(res, 200, {
           ok: true,
-          baseUrl: c.baseUrl, model: c.model, apiKeyMasked: maskKey(c.apiKey), hasKey: Boolean(c.apiKey),
+          baseUrl: c.baseUrl, model: c.model, reasoningEffort: c.reasoningSetting ?? null, reasoningStages: c.reasoningStages,
+          apiKeyMasked: maskKey(c.apiKey), hasKey: Boolean(c.apiKey),
         });
       }
       return json(res, 405, { error: `不支持的方法 ${req.method}` });
     }
 
     /*
-     * 连通性测试：优先 GET /models（不花 token），失败再退回一次最小的 chat 调用。
+     * 连通性测试：GET /models（不花 token）。
      * 响应里**只回状态与耗时**，任何错误都过 redact()，绝不回显密钥。
      */
     if (p === '/api/settings/test' && req.method === 'POST') {
@@ -2036,12 +2110,17 @@ const server = createServer(async (req, res) => {
       if (!apiKey) return json(res, 400, { error: '尚未配置 API Key' });
       const t0 = Date.now();
       try {
-        const r = await fetch(`${baseUrl}/models`, { headers: { authorization: `Bearer ${apiKey}` } });
+        const r = await fetch(`${baseUrl}/models`, {
+          headers: { ...c.httpHeaders, authorization: `Bearer ${apiKey}` },
+          signal: AbortSignal.timeout(15_000),
+        });
         const text = await r.text();
         if (r.ok) {
           let ids = [];
-          try { ids = (JSON.parse(text).data ?? []).map((m) => m.id).slice(0, 20); } catch { /* 忽略 */ }
-          return json(res, 200, { ok: true, via: '/models', ms: Date.now() - t0, models: ids, modelInList: ids.includes(model) });
+          try { ids = (JSON.parse(text).data ?? []).map((m) => m.id); } catch { /* 忽略 */ }
+          return json(res, 200, {
+            ok: true, via: '/models', ms: Date.now() - t0, models: ids.slice(0, 20), modelInList: ids.includes(model),
+          });
         }
         return json(res, 200, {
           ok: false, via: '/models', status: r.status, ms: Date.now() - t0,
