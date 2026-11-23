@@ -43,8 +43,6 @@ export interface LlmRequest {
   schema?: unknown;
   /** 温度等采样参数 */
   temperature?: number;
-  /** 单次 Responses 请求可覆盖全局思考强度。 */
-  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | null;
   /** 归属标识，便于计费与复现 */
   tag: string;
 }

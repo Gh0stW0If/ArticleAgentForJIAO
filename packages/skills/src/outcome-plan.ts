@@ -87,7 +87,7 @@ const RESOURCE_USE_RE = /\b(medication|drug|analgesic|rescue|visit|admission|hos
 /** 量表的形态特征：常见量表后缀或全大写缩写（VAS、HDRS、SF-12、FIQ、RQLQ…）。 */
 const INSTRUMENT_RE = /\b(scale|questionnaire|index|score|inventory|questionnaire|VAS|HDRS|HADS|SF-?12|SF-?36|FIQ|RQLQ|BDI|BAI|FSS|EQ-?5D|NRS|MBI|SSA|SWAL|WHOQOL)\b/i;
 
-export function createOutcomePlanSkill(options: { primaryHint?: FieldValue; explicitChange?: PlannedOutcome } = {}): Skill<OutcomePlanPayload> {
+export function createOutcomePlanSkill(): Skill<OutcomePlanPayload> {
   const skill: Skill<OutcomePlanPayload> = {
     id: 'outcome-plan',
     version: '0.1.0',
@@ -117,9 +117,8 @@ export function createOutcomePlanSkill(options: { primaryHint?: FieldValue; expl
       }
 
       const res = await ctx.llm.invoke({
-        system: PROMPTS.outcomePlan + '\n逐项覆盖论文明确声明的主要结局。若声明比较“相对基线变化”，保留变化口径和主分析时间窗。可从声明中确认同一指标的缩写和全名。',
-        user: `以下是该论文的摘要与方法学材料（不含表格）。请找出论文自己声明的结局指标清单。\n\n${materials.text}`
-          + (options.explicitChange?.name ? `\n\n重点核对原文明确声明的变化量结局：${options.explicitChange.name.raw}` : ''),
+        system: PROMPTS.outcomePlan,
+        user: `以下是该论文的摘要与方法学材料（不含表格）。请找出论文自己声明的结局指标清单。\n\n${materials.text}`,
         temperature: 0,
         tag: `${skill.id}@${skill.version}:${ctx.doc.articleId}`,
       });
@@ -359,51 +358,6 @@ export function createOutcomePlanSkill(options: { primaryHint?: FieldValue; expl
         deduped.push(o);
       }
       payload.outcomes = deduped;
-
-      const hint = options.primaryHint?.raw.trim() ?? '';
-      const aliases = hint.split(':').map(part => part.replace(/\s*\([^)]+\)\s*$/, '').trim())
-        .filter(part => part.length >= 3 && !/^(?:NR|NA|NE)$/i.test(part));
-      const hasAlias = (label: string) => aliases.some(alias => {
-        const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
-        return new RegExp(`(?:^|[^\\p{L}\\p{N}])${escaped}(?:s\\b|$|[^\\p{L}\\p{N}])`, 'iu').test(label);
-      });
-      const primaryBlocks = declBlocks.filter(block =>
-        /\bprimary\s+(?:outcome|end\s*point|measure)/i.test(block.text) && hasAlias(block.text.replace(/-\s*\r?\n/g, '')));
-      const covered = deduped.some(outcome => hasAlias(`${outcome.name?.raw ?? ''} ${outcome.instrument?.raw ?? ''}`));
-      if (!covered && primaryBlocks.length && !options.explicitChange && !RESOURCE_USE_RE.test(hint)) {
-        const labels = ctx.doc.blocks.flatMap(block => (block.table?.grid ?? []).slice(1).flatMap(row =>
-          (row.slice(0, 2).some(hasAlias) && row.some(cell => /\d/.test(cell))) ? [row.join(' | ')] : [],
-        )).slice(0, 12);
-        let recovered = false;
-        if (labels.length) {
-          try {
-            const result = await ctx.llm.invoke({
-              system: '只核对一个遗漏的主要结局。根据声明段和结果行确认该结局，保留原文统计口径和时间窗。输出 JSON，其中 outcomeName、instrument（如有）、anchor、outcomeClass 与结局清单使用相同的 {value,quote} 格式，outcomeClass 取 1–6，无法确认则输出 {}。',
-              user: `主要结局候选：${hint}\n原文声明：\n${primaryBlocks.slice(0, 3).map(block => block.text).join('\n\n')}\n相关结果行：\n${labels.join('\n')}\n分类：${JSON.stringify(OUTCOME_CLASSES)}`,
-              temperature: 0,
-              tag: `${skill.id}@${skill.version}:${ctx.doc.articleId}:primary-coverage`,
-            });
-            const candidate = (result.json ?? {}) as Record<string, unknown>;
-            const name = claim('outcomePlan.primaryCoverage.name', candidate.outcomeName);
-            const instrument = claim('outcomePlan.primaryCoverage.instrument', candidate.instrument);
-            const anchor = claim('outcomePlan.primaryCoverage.anchor', candidate.anchor);
-            const outcomeClass = claim('outcomePlan.primaryCoverage.outcomeClass', candidate.outcomeClass);
-            const declared = anchor && primaryBlocks.some(block => `b${block.index}` === anchor.evidence[0]?.blockId);
-            const label = `${name?.raw ?? ''} ${instrument?.raw ?? ''}`;
-            if (name && declared && hasAlias(label) && /^[1-6]$/.test(outcomeClass?.raw ?? '') && !RESOURCE_USE_RE.test(label)) {
-              payload.outcomes.push({ name, ...(instrument ? { instrument } : {}), anchor, ...(outcomeClass ? { outcomeClass } : {}) });
-              recovered = true;
-            }
-          } catch (error) {
-            issues.push(warn(`主要结局定向复核失败：${(error as Error).message}`, 'PRIMARY_COVERAGE_CALL_FAILED'));
-          }
-        }
-        if (!recovered) {
-          const reason = '主要结局声明尚未与结果行形成可验证的对应，请核对论文';
-          issues.push(warn(reason, 'PRIMARY_COVERAGE_UNRESOLVED'));
-          unresolved.push({ skillId: skill.id, raw: hint, evidence: options.primaryHint?.evidence ?? [], reason, confidence: 0 });
-        }
-      }
 
       if (payload.outcomes.length === 0) {        issues.push(warn(
           `未产出任何"可锚定"的结局指标（被丢弃 ${rejected.length} 条）；下游将无法抽取结局层`,
