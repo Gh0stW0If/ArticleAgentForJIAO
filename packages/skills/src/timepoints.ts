@@ -19,7 +19,6 @@ import {
   warn,
 } from '@aa/core';
 import { decode } from './legend.ts';
-import { numericTokens } from './grounding.ts';
 
 /* ------------------------------ 时点定义 ------------------------------ */
 
@@ -101,11 +100,11 @@ export const TIMEPOINT_FIELD_MAP: Readonly<Record<string, string>> = {
 /** 时点块内需要确定性编码的字段。 */
 export const TIMEPOINT_CODE_TARGETS: readonly string[] = ['estimateType', 'varianceType'];
 
-/** 11 月修正规则：均值同口径时优先 SD，其次 95% CI。编码值沿用工作簿。 */
+/** 变异值类型偏好顺序（金标准 T3 批注）：数值越小越优先。 */
 export const VARIANCE_PREFERENCE: Readonly<Record<string, number>> = {
-  '1': 3, // 标准误 SE
+  '1': 1, // 标准误 SE
   '2': 2, // 95% CI
-  '3': 1, // 标准差 SD
+  '3': 3, // 标准差 SD
   '4': 4, // 四分位间距 IQR
   '5': 5, // 全距
   '6': 6, // P 值
@@ -132,57 +131,6 @@ export const TWO_BOUND_VARIANCE: ReadonlySet<string> = new Set(['2', '4', '5']);
  * （含测试）拿到的 `experimental`/`varianceType` 都是 `unknown`，取个字段就要强转。
  */
 export type TimepointBlocks = NonNullable<OutcomeLevel['timepoints']>;
-export type PreferredResult = NonNullable<OutcomeLevel['preferredResult']>;
-
-export interface DifferenceFields {
-  differenceEstimate?: FieldValue;
-  differenceCiLower?: FieldValue;
-  differenceCiUpper?: FieldValue;
-}
-
-export function reportedNumber(field?: FieldValue): number | undefined {
-  const value = field?.raw.trim().replace(/[−–﹣－]/g, '-').replace(/,/g, '');
-  if (!value || !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) return undefined;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : undefined;
-}
-
-export function intervalProblem(estimate?: FieldValue, lower?: FieldValue, upper?: FieldValue, requireCell = false):
-  { code: string; message: string } | undefined {
-  const point = reportedNumber(estimate);
-  const lo = reportedNumber(lower);
-  const hi = reportedNumber(upper);
-  const present = (field?: FieldValue) => Boolean(field?.raw.trim() && !/^(NR|NA|NE)$/i.test(field.raw.trim()));
-  if (!present(lower) && !present(upper)) return undefined;
-  if (lo === undefined || hi === undefined || point === undefined) {
-    return { code: 'CI_INCOMPLETE', message: '区间需要同一估计值及两个可识别的端点' };
-  }
-  if (lo > hi) return { code: 'CI_INVERTED', message: `区间下限 ${lo} 高于上限 ${hi}` };
-  if (point < lo || point > hi) {
-    return { code: 'ESTIMATE_OUTSIDE_CI', message: `估计值 ${point} 不在区间 [${lo}, ${hi}] 内` };
-  }
-  if (!requireCell) return undefined;
-
-  const sources = [estimate, lower, upper].map(field => field?.evidence[0]);
-  const [source] = sources;
-  const hasValues = [point, lo, hi].every((value, i) => numericTokens(sources[i]?.quote ?? '').includes(value));
-  const sameRow = sources.every(item => item?.kind === 'table' && item.tableCell?.row !== undefined
-    && item.tableCell.row === source?.tableCell?.row && item.blockId === source?.blockId);
-  const alignsColumns = sources.slice(1).every(item => {
-    const pointCell = source?.tableCell;
-    const boundCell = item?.tableCell;
-    if (!pointCell || !boundCell) return false;
-    if (boundCell.column === pointCell.column) return true;
-    const sameGroup = JSON.stringify(boundCell.groupHeadings ?? []) === JSON.stringify(pointCell.groupHeadings ?? []);
-    const hasGroup = Boolean(pointCell.groupHeadings?.some(Boolean));
-    return sameGroup && (hasGroup || Math.abs(boundCell.column - pointCell.column) <= 2)
-      && /\b(?:ci|cl|confidence interval|lower|upper|lcl|ucl|lci|uci)\b|置信|下限|上限/i.test(boundCell.heading ?? '');
-  });
-  const sameText = sources.every(item => item?.kind === 'text' && item.blockId === source?.blockId
-    && item.quote === source?.quote);
-  if (hasValues && ((sameRow && alignsColumns) || sameText)) return undefined;
-  return { code: 'CI_SOURCE_MISMATCH', message: '估计值与两个端点需要来自同一表格行或同一段包含三项数值的引文' };
-}
 
 /* ------------------------------ 路径映射 ------------------------------ */
 
@@ -283,12 +231,9 @@ export function inferMeasurementType(tps: TimepointBlocks | undefined): string |
  * 收紧后 2015-01/2015-05 那 3 行被误标的 `2` 就再也退不回来了（实测踩到）。
  */
 export function applyMeasurementType(row: OutcomeLevel, tps: TimepointBlocks | undefined): string | undefined {
-  const inferred = inferMeasurementType(tps);
-  const preferred = row.preferredResult;
+  const code = inferMeasurementType(tps);
   const cur = row.outcome?.measurementType;
   const curCode = cur?.code ?? cur?.raw;
-  const continuousPreference = preferred && (!inferred || inferred === '2') && (!curCode || ['1', '2'].includes(curCode));
-  const code = continuousPreference ? (preferred === 'betweenGroupDifference' ? '2' : '1') : inferred;
 
   const write = (next: string, evidence: FieldValue['evidence'], alternatives?: FieldValue['alternatives']): string => {
     const d = decode('measurementType', next);
@@ -311,7 +256,7 @@ export function applyMeasurementType(row: OutcomeLevel, tps: TimepointBlocks | u
     kind: 'external',
     page: 1,
     bbox: null,
-    quote: `由已抽取的${code === '1' ? '各组估计值' : code === '2' ? '组间差值' : code === '3' ? '事件数' : '等级资料'}确定`,
+    quote: `由已抽取的数值形态确定性推导（存在${code === '2' ? '组间差值' : code === '3' ? '事件数' : '等级资料'}字段）`,
   }];
 
   if (code) {
@@ -320,15 +265,7 @@ export function applyMeasurementType(row: OutcomeLevel, tps: TimepointBlocks | u
     const alts = cur?.raw
       ? [...(cur.alternatives ?? []), { raw: cur.raw, confidence: cur.confidence }]
       : cur?.alternatives;
-    const selectedEvidence = continuousPreference && preferred === 'betweenGroupDifference'
-      ? [tps?.endOfTreatment, tps?.followUpEnd]
-          .map(block => (block?.binary as DifferenceFields | undefined)?.differenceEstimate?.evidence)
-          .find(evidence => evidence?.length)
-      : continuousPreference
-        ? [tps?.endOfTreatment?.continuous?.experimental?.estimate, tps?.endOfTreatment?.continuous?.control?.estimate]
-            .flatMap(field => field?.evidence ?? [])
-        : undefined;
-    return write(code, selectedEvidence?.length ? selectedEvidence : cur?.evidence?.length ? cur.evidence : derivedEvidence, alts);
+    return write(code, cur?.evidence?.length ? cur.evidence : derivedEvidence, alts);
   }
 
   // 判据不再成立：只回退"我们自己写过"的值
@@ -374,7 +311,7 @@ export function decodeTimepointCodes(
     if (vt && VARIANCE_PREFERENCE[vt] !== undefined && VARIANCE_PREFERENCE[vt] > 3) {
       issues.push(warn(
         `${base}.${tpName}.varianceType = ${vt}（${vtf?.legend ?? '?'}）。` +
-        `请确认相同统计口径下是否另有 SD 或 95% CI`,
+        `按金标准应优先取标准误(1)或 95%CI(2)，请确认是否确实只有该值可用`,
         'VARIANCE_TYPE_LOW_PRIORITY',
         { path: `${base}.${tpName}.varianceType`, ...(vtf && vtf.evidence.length ? { evidence: vtf.evidence } : {}) },
       ));
@@ -399,11 +336,6 @@ export function validateTimepoints(
   issues: Issue[],
 ): void {
   for (const [tpName, block] of Object.entries(timepoints ?? {})) {
-    const difference = block.binary as DifferenceFields | undefined;
-    const differenceIssue = intervalProblem(difference?.differenceEstimate, difference?.differenceCiLower, difference?.differenceCiUpper);
-    if (differenceIssue) {
-      issues.push(warn(differenceIssue.message, differenceIssue.code, { path: `${base}.${tpName}.binary.differenceEstimate` }));
-    }
     const cont = (block as { continuous?: Record<string, FieldValue> & { experimental?: GroupStats; control?: GroupStats } })
       ?.continuous;
     if (!cont) continue;
@@ -456,9 +388,10 @@ export function validateTimepoints(
      * 实测 2015-05：`differenceEstimate` 填成了 31.5，而该行各组自己的估计值也正是 31.5——
      * 模型把组内值抄进了差值格。真差值（LSMD / mean difference / 率差）不会恰好等于组内估计值。
      */
-    const dEst = reportedNumber(difference?.differenceEstimate);
-    const eEst = reportedNumber(cont.experimental?.estimate);
-    if (dEst !== undefined && eEst !== undefined && Math.abs(dEst - eEst) < 1e-9) {
+    const bin = (block as { binary?: Record<string, FieldValue | undefined> }).binary;
+    const dEst = Number(bin?.differenceEstimate?.raw);
+    const eEst = Number(cont.experimental?.estimate?.raw);
+    if (Number.isFinite(dEst) && Number.isFinite(eEst) && Math.abs(dEst - eEst) < 1e-9) {
       issues.push(warn(
         `${base}.${tpName}：differenceEstimate(${dEst}) 与试验组自己的估计值相同，疑似把组内值当成了组间差值`,
         'DIFFERENCE_EQUALS_GROUP_ESTIMATE',
@@ -468,13 +401,24 @@ export function validateTimepoints(
 
     // 估计值与 95%CI 的数值合理性：仅当变异值**确实是 95%CI** 时才检查
     // （SD 的数值比估计值小，套用"估计值必须落在区间内"必然误报）
-    if (vtCode !== '2') continue;
-    for (const side of ['experimental', 'control'] as const) {
-      const group = cont[side];
-      const issue = intervalProblem(group?.estimate, group?.ciLower, group?.ciUpper);
-      if (issue && issue.code !== 'CI_INCOMPLETE') {
-        issues.push(warn(issue.message, issue.code, { path: `${base}.${tpName}.continuous.${side}` }));
+    const vtIsCi = vtCode === undefined || vtCode === '2';
+    if (!vtIsCi) continue;    const exp = cont.experimental as GroupStats | undefined;
+    const ctrl = cont.control as GroupStats | undefined;
+    const est = Number(exp?.estimate?.raw);
+    const lo = Number(exp?.ciLower?.raw);
+    const hi = Number(exp?.ciUpper?.raw);
+    if ([est, lo, hi].every(Number.isFinite)) {
+      if (lo > hi) {
+        issues.push(warn(`${base}.${tpName}: 试验组 CI 下限(${lo})大于上限(${hi})`, 'CI_INVERTED', { path: `${base}.${tpName}.experimental` }));
+      } else if (est < lo || est > hi) {
+        issues.push(warn(`${base}.${tpName}: 试验组估计值(${est})未落在 CI [${lo}, ${hi}] 内`, 'ESTIMATE_OUTSIDE_CI', { path: `${base}.${tpName}.experimental.estimate` }));
       }
+    }
+    const cest = Number(ctrl?.estimate?.raw);
+    const clo = Number(ctrl?.ciLower?.raw);
+    const chi = Number(ctrl?.ciUpper?.raw);
+    if ([cest, clo, chi].every(Number.isFinite) && (clo > chi || cest < clo || cest > chi)) {
+      issues.push(warn(`${base}.${tpName}: 对照组的估计值/CI 关系不合理`, 'CONTROL_ESTIMATE_INCONSISTENT', { path: `${base}.${tpName}.control` }));
     }
   }
 }

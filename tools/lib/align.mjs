@@ -133,38 +133,6 @@ export function outcomeSimilarity(g, p) {
 export const MIN_SCORE = 0.34;
 
 /**
- * 覆盖率口径下的**候选边**：这个产物行算不算金标准那一行的对应结局。
- *
- * 判据：`score ≥ MIN_SCORE` **且**（有词面对上 或 数值佐证 ≥2）。
- *
- * 为什么这么绕——这里踩过两个坑，两边都不能走：
- *
- * ① **只看 `score ≥ MIN_SCORE` 太宽**。score 里含 `sameConstruct +0.25` /
- *    `sameSub +0.15`，光靠这两项就有 0.40，已经越过 0.34 —— 于是每个同 construct
- *    的产物行都成了候选。1:1 贪心里这不过是排序偏好，但换成**多对一**（覆盖率口径）
- *    就是灾难：所有结局行的叶子路径结构相同，只要有一行是候选，
- *    "候选行里有这个路径"就恒成立，漏抽**退化成 0**（实测 2015 年 Sheet3 虚高到 77%）。
- *
- * ② **只看 `textScore ≥ MIN_SCORE || corr ≥ 2` 又太窄**。金标准的名字又短又常把量表名
- *    塞在名字里（`BI score change`），产物写的是描述（`activities of daily living /
- *    BI: Barthel Index`）—— 实测这一对的文本分只有 **0.33，差 0.01 够不到 0.34**，
- *    于是明显是同一个结局却被判成"没抽到"（2025-01 四个结局全部落空、8 个产物行
- *    全进人工裁定队列）。
- *
- * 所以取中间：**construct/subconstruct 只能加权，不能凭空造边**——
- * 至少得有一个词面上对得上（`textScore > 0`），或者数值确实重合 ≥2。
- *
- * 实测四种规则在覆盖率口径下准确率都落在 40.5%~41.2%（差别很小），
- * 但"交人工裁定"的行数差很多（328 vs 445），所以按**哪条更讲得通**来选，
- * 而不是按分数高低。评测（`tools/llm_eval.mjs`）与网页端「待人工裁定的结局行」
- * 共用这一个函数，避免两边各写一份又漂移。
- */
-export function isOutcomeCandidate(g, p) {
-  const s = outcomeSimilarity(g, p);
-  return s.score >= MIN_SCORE && (s.textScore > 0 || s.corr >= 2);
-}
-
-/**
  * 结局行贪心配对。返回 { goldToPred: Map<gi, pi>, alignments }，
  * alignments 里每项带 textScore/corr，供调用方披露对齐口径。
  */

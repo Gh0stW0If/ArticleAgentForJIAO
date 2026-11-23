@@ -23,7 +23,6 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normText, normNum } from './lib/align.mjs';
 import { judgePairs, VERDICT_LABEL, VERDICT_WEIGHT } from './lib/judge.mjs';
-import { loadLlmConfig } from './lib/llm-config.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -90,16 +89,20 @@ for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1
 const sample = pool.slice(0, Math.min(N, pool.length));
 
 /* ---------- 语义判定（批量 + 缓存） ---------- */
-const cfg = loadLlmConfig(ROOT, { optional: true });
-if (!cfg.apiKey) {
-  console.error('\n缺少 API Key，请填写 runtime/llm.local.json 的 apiKey');
+const cfgPath = join(ROOT, 'runtime', 'llm.local.json');
+let cfg = {};
+if (existsSync(cfgPath)) { try { cfg = JSON.parse(readFileSync(cfgPath, 'utf8')); } catch { /* 忽略 */ } }
+const apiKey = process.env.DEEPSEEK_API_KEY ?? cfg.apiKey;
+if (!apiKey) {
+  console.error('\n缺少 API key：把 key 放进 runtime/llm.local.json（或设 DEEPSEEK_API_KEY）。');
   process.exit(2);
 }
 const pairs = sample.map((s, i) => ({ key: `${s.id}/${s.field}#${i}`, field: `${SCOPE}.${s.field}`, gold: s.gold, pred: s.pred }));
 console.log(`【${SCOPE}】当前判错的描述性字段 ${wrong.length} 组，抽样 ${pairs.length} 组送语义判定…`);
 const results = await judgePairs(pairs, {
-  ...cfg,
-  model: cfg.reviewModel,
+  apiKey,
+  ...(cfg.baseUrl ? { baseUrl: cfg.baseUrl } : {}),
+  model: process.env.AA_JUDGE_MODEL ?? cfg.model,
   batchSize: 8,
   onProgress: (m) => console.log(m),
 });

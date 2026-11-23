@@ -101,15 +101,10 @@ export const indexToCol = (i) => {
 
 /**
  * 读取 xlsx。
- *
- * `pathOrBuf` 既可以是路径，也可以是**内存里的字节**——后者用于"写完立刻读回"的往返测试
- * （见 tools/export_review.test.mjs），免得为了验证一个 Buffer 先落盘再删。
- *
- * @param {string | Buffer} pathOrBuf
  * @returns {{ sheetNames: string[], sheets: {name:string, rows:{r:number,cells:string[]}[], comments: Record<string,string>}[], workbookParts: string[] }}
  */
-export function readWorkbook(pathOrBuf) {
-  const buf = Buffer.isBuffer(pathOrBuf) ? pathOrBuf : readFileSync(pathOrBuf);
+export function readWorkbook(path) {
+  const buf = readFileSync(path);
   const entries = zipEntries(buf);
   const get = (n) => (entries.has(n) ? entryData(buf, entries.get(n)) : null);
 
@@ -189,21 +184,6 @@ export function readWorkbook(pathOrBuf) {
 }
 
 /* ---------------------------- 网格工具 ---------------------------- */
-
-/**
- * 取 ZIP 内某个条目的原始字节（`tools/lib/xlsxwrite.mjs` 的往返测试用它看工作表 XML）。
- * 条目不存在返回 null。
- *
- * @param {string | Buffer} pathOrBuf
- * @param {string} name  如 `xl/worksheets/sheet1.xml`
- * @returns {Buffer | null}
- */
-export function readZipEntry(pathOrBuf, name) {
-  const buf = Buffer.isBuffer(pathOrBuf) ? pathOrBuf : readFileSync(pathOrBuf);
-  const e = zipEntries(buf).get(name);
-  return e ? entryData(buf, e) : null;
-}
-
 
 /** 二维网格 → 以 (row, col0) 取值的访问器。 */
 export function makeGrid(rows) {

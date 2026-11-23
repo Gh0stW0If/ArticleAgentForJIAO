@@ -35,7 +35,6 @@ import { PROMPTS, OUTCOME_TASKS } from './prompts.generated.ts';
 import { collectMaterials } from './materials.ts';
 import { groundNested, type GroundOptions } from './grounding.ts';
 import { decode } from './legend.ts';
-import { normalizeOutcomeMeasurementUnit } from './measurement-units.ts';
 import {
   TIMEPOINTS,
   type TimepointJsonKey,
@@ -64,6 +63,7 @@ export type { TimepointJsonKey } from './timepoints.ts';
 /** 结局自身的字段：JSON 键 → 规范路径（阶段 1：枚举时填）。 */
 const OUTCOME_META_MAP: Readonly<Record<string, string>> = {
   armNumber: 'armNumber',
+  specialDataFlag: 'outcome.specialCategory',
   construct: 'outcome.constructCode',
   subconstruct: 'outcome.subconstructCode',
   pValueRange: 'outcome.pValueRange',
@@ -93,7 +93,7 @@ const OUTCOME_TOP_MAP: Readonly<Record<string, string>> = {
 
 /** 需要确定性编码的结局元字段。 */
 const OUTCOME_CODE_TARGETS: readonly string[] = [
-  'armNumber', 'construct', 'subconstruct', 'pValueRange',
+  'armNumber', 'specialDataFlag', 'construct', 'subconstruct', 'pValueRange',
   'measurementDirection', 'measurementType', 'baselineAdjusted', 'primaryOutcomeTimepoint',
 ];
 
@@ -516,7 +516,6 @@ export function createOutcomeSkill(opts: OutcomeSkillOptions = {}): Skill<Outcom
          */
         decodeTimepointCodes(rec.timepoints as TimepointBlocks | undefined, base, issues);
 
-        normalizeOutcomeMeasurementUnit(rec, base, issues);
         measures.push({ rec, name: identity.name || identity.instrument });
       }
 

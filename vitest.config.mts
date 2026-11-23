@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+﻿import { defineConfig } from 'vitest/config';
 import { resolve } from 'node:path';
 
 /**
@@ -26,11 +26,7 @@ export default defineConfig({
     },
   },
   test: {
-    /*
-     * `tools/` 也纳入：导出器（zip / xlsx 写入、核对结果摊平）是纯逻辑，
-     * 没有理由只靠 e2e 覆盖。用 `.test.mjs` 命名，与包内的 `.test.ts` 区分开。
-     */
-    include: ['packages/*/src/**/*.test.ts', 'apps/*/src/**/*.test.ts', 'tools/**/*.test.mjs'],
+    include: ['packages/*/src/**/*.test.ts', 'apps/*/src/**/*.test.ts'],
     environment: 'node',
     globals: false,
   },

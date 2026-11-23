@@ -22,7 +22,7 @@ import { join } from 'node:path';
 import { indexToCol } from './xlsx.mjs';
 
 /** 块内路径 → 中文列名（Sheet3 的列码是缩写，医生看不懂 IESTI 这类字符）。 */
-export const BLOCK_FIELD_ZH = {
+const BLOCK_FIELD_ZH = {
   'continuous.estimate_type': '效应量类型',
   'continuous.variance_type': '变异值类型',
   'continuous.experimental.estimate': '试验组效应量',
@@ -63,8 +63,8 @@ const TOP_FIELD_ZH = {
   'outcome.measurement_unit': '测量单位',
   'outcome.baseline_adjusted': '是否对基线做调整',
   'outcome.primary_outcome_timepoint': '主要结局测量时点',
-  // `outcome.special_data_flag`（Sheet3 E）与 `outcome.special_category`（Sheet3 R）
-  // 已按 202609 规则退役，不再给出中文标签 —— 见 tools/canonical-field-map.mjs 的 RETIRED_FIELDS。
+  'outcome.special_data_flag': '特殊数据情况',
+  'outcome.special_category': '特殊数据分类',
   'follow_up.description': '最长随访时间（描述）',
   'follow_up.value': '最长随访时间（数值）',
   'follow_up.unit': '最长随访时间（单位）',
@@ -309,7 +309,7 @@ export function createFieldLabels(rootDir) {
     if (key.startsWith('outcome.') || alias.startsWith('follow_up.')) {
       const k = alias;
       /*
-       * `outcome_top_map` 里的路径**不完全带 `outcome.` 前缀**（如 ARMNU → `arm_number`），
+       * `outcome_top_map` 里的路径**不完全带 `outcome.` 前缀**（如 STDATA → `special_data_flag`），
        * 所以两种写法都要试，否则这一列会显示成没有列名的裸键。
        */
       const code = [...topMap.entries()].find(([, p]) => p === k)?.[0]

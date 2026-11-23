@@ -16,14 +16,9 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDeepSeekLlm } from '../../packages/skills/dist/index.js';
-import { llmCacheSuffix } from './llm-config.mjs';
 
-const ROOT = process.env.AA_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-
-export function judgeCachePath(root, opts) {
-  const reasoningEffort = Object.hasOwn(opts, 'reviewReasoningEffort') ? opts.reviewReasoningEffort : opts.reasoningEffort;
-  return join(root, 'build', `judge-cache${llmCacheSuffix({ ...opts, reasoningEffort })}.json`);
-}
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const CACHE_FILE = join(ROOT, 'build', 'judge-cache.json');
 
 /** 判定类别 → 中文标签。 */
 export const VERDICT_LABEL = {
@@ -69,25 +64,24 @@ const SYSTEM = `你是系统评价数据抽取的**评审核对员**。
 
 const fingerprint = (p) => `${p.field}\u0000${p.gold}\u0000${p.pred}`;
 
-function loadCache(path) {
-  if (!existsSync(path)) return {};
-  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return {}; }
+function loadCache() {
+  if (!existsSync(CACHE_FILE)) return {};
+  try { return JSON.parse(readFileSync(CACHE_FILE, 'utf8')); } catch { return {}; }
 }
-function saveCache(path, cache) {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(cache, null, 2), 'utf8');
+function saveCache(cache) {
+  mkdirSync(join(ROOT, 'build'), { recursive: true });
+  writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
 }
 
 /**
  * 批量判定。
  *
  * @param {Array<{key:string, field:string, gold:string, pred:string}>} pairs
- * @param {{apiKey:string, baseUrl?:string, model?:string, wireApi?:string, reasoningEffort?:'low'|'medium'|'high'|'xhigh', httpHeaders?:Record<string,string>, batchSize?:number, noCache?:boolean, onProgress?:(m:string)=>void}} opts
+ * @param {{apiKey:string, baseUrl?:string, model?:string, batchSize?:number, noCache?:boolean, onProgress?:(m:string)=>void}} opts
  * @returns {Promise<Array<{key:string, field:string, gold:string, pred:string, verdict:string, reason?:string}>>}
  */
 export async function judgePairs(pairs, opts) {
-  const cachePath = judgeCachePath(ROOT, opts);
-  const cache = opts.noCache ? {} : loadCache(cachePath);
+  const cache = opts.noCache ? {} : loadCache();
   const results = [];
   const todo = [];
 
@@ -101,11 +95,8 @@ export async function judgePairs(pairs, opts) {
 
   const llm = createDeepSeekLlm({
     apiKey: opts.apiKey,
-    baseUrl: opts.baseUrl,
-    model: opts.model,
-    wireApi: opts.wireApi,
-    reasoningEffort: Object.hasOwn(opts, 'reviewReasoningEffort') ? opts.reviewReasoningEffort : opts.reasoningEffort,
-    httpHeaders: opts.httpHeaders,
+    ...(opts.baseUrl ? { baseUrl: opts.baseUrl } : {}),
+    ...(opts.model ? { model: opts.model } : {}),
     temperature: 0,
     maxTokens: 4000,
   });
@@ -142,6 +133,6 @@ export async function judgePairs(pairs, opts) {
     }
   }
 
-  if (!opts.noCache) saveCache(cachePath, cache);
+  if (!opts.noCache) saveCache(cache);
   return results;
 }

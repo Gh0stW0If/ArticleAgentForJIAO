@@ -2,67 +2,29 @@
  * @aa/web — 本地 API 服务（仅用于开发/演示，绑定 127.0.0.1）
  *
  * 只服务于：
- *   GET  /api/health                          健康检查
- *   GET  /api/studies?year=2015               某年份可选的研究列表
- *   GET  /api/minidoc?year&study              解析文档（blocks + pages，带 bbox）
- *   GET  /api/pdf?year&study                  PDF 原始字节（供 pdf.js）
- *   GET  /api/fields?year&study               字段视图（含 sheets 布局与逐字段核对状态）
- *   GET  /api/annotation?year&study[&reviewer] 核对记录 + 全部核对人进度 + 分歧 + 两两一致率
- *   POST /api/annotation                     写入某核对人的标注（reviewer 必填）
- *   DELETE /api/annotation                   删某核对人的某字段 / 整份记录
- *   GET  /api/export?year&study&format=      导出人工核对结果（xlsx / csv）
- *                                             给 year 不带 study = 整年；scope=all = 全部年份
- *   POST /api/import-review?reviewer=         把改过的表导回（默认 dry-run，apply=1 才落盘）
- *   GET  /api/review-sets?year&study          可比较的结果集目录（机器 / 核对人 / 导入批次）
- *   GET  /api/compare?year&study&a=&b=        两组结果逐字段对比
- *   POST /api/import                         导入 PDF
- *   POST /api/parse | /api/extract           后台任务（MinerU 解析 / LLM 抽取）
- *   GET  /api/jobs                           任务状态与日志尾部
+ *   GET /api/health                          健康检查
+ *   GET /api/studies?year=2015               某年份可选的研究列表
+ *   GET /api/minidoc?year&study              解析文档（blocks + pages，带 bbox）
+ *   GET /api/pdf?year&study                  PDF 原始字节（供 pdf.js）
  *
- * 说明：抽取结果读取 `build/extraction/<year>/<id>.json`（流水线产物），
- * 缺失时退回 `build/gold/<year>.json`（金标准），仅用于演示界面。
+ * 说明：抽取结果目前直接读取 `build/gold/<year>.json`（金标准），
+ * 因此「框选比对」这一功能可以先跑起来——用金标准的字段与证据对照 PDF。
+ * 待 LLM 接入后，再把 `/api/extraction` 指向流水线产物即可，接口形状不变。
  *
  * 安全：只允许读取 Datas/ 与 build/ 下的文件；路径参数经过白名单校验，
  * 防止目录穿越。
  */
 
 import { createServer } from 'node:http';
-import { networkInterfaces } from 'node:os';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import {
-  studiesFromPdfNames,
-  buildConsensus, consensusStats, pairwiseAgreement, reviewerSummaries, reviewerOf,
-  LEGACY_REVIEWER,
-} from '../../packages/core/dist/index.js';
-import { buildReviewExport, csvBuffer, exportFileName } from '../../tools/export_review.mjs';
-import { buildXlsx } from '../../tools/lib/xlsxwrite.mjs';
-import { readReviewTables, planImport, studyPairs, readSignature } from '../../tools/import_review.mjs';
-import { verifySignature } from '../../tools/export_review.mjs';
-import { labelOutcomeField } from '../../tools/outcome-field-map.mjs';
-import { RETIRED_KEYS } from '../../tools/canonical-field-map.mjs';
-import { isOutcomeCandidate, outcomeSimilarity } from '../../tools/lib/align.mjs';
-import { llmConfigPath, loadLlmConfig, REASONING_SETTINGS, validReasoningStages } from '../../tools/lib/llm-config.mjs';
-import { canReviewSummary, isFinalReviewCurrent } from '../../tools/lib/workflow-final-review.mjs';
-import { readWorkflow, selectOutcomes, addCandidate, updateCandidate, editResult, safeSourcePath, effectiveRecords } from '../../tools/lib/workflow-store.mjs';
-import { workflowExportSheets, workflowCsv } from '../../tools/lib/workflow-export.mjs';
+import { studiesFromPdfNames } from '../../packages/core/dist/index.js';
 
 const ROOT = resolve(process.env.AA_ROOT ?? process.cwd());
 const PORT = Number(process.env.AA_PORT ?? 43130);
-
-/*
- * 多人核对依赖 @aa/core 的新增导出。dist 是**构建产物**——若它比源码旧（没跑过 `pnpm build`），
- * 这些符号会是 undefined，然后要等到某个请求进来才炸，报错还很难懂。
- * 因此在启动时就把话说明白：缺哪个符号、该怎么修。
- */
-for (const [name, fn] of Object.entries({ buildConsensus, consensusStats, pairwiseAgreement, reviewerSummaries })) {
-  if (typeof fn !== 'function') {
-    throw new Error(`@aa/core 缺少导出 ${name}：packages/core/dist 是旧版本，请先运行 \`pnpm build\``);
-  }
-}
 
 /**
  * 本服务**代码**所在目录（开发时=仓库根；Electron 打包后=exe 内的 app 目录）。
@@ -86,13 +48,6 @@ const DIRS = {
    */
   annotations: join(ROOT, 'build', 'annotations'),
   /**
-   * 导回批次快照。
-   *
-   * 每导回一次留一份「这一批改了哪些字段、从什么改成什么」。
-   * 用途有二：① 可追溯（谁在哪一批改的）；② 当「两组结果对比」里的一组。
-   */
-  batches: join(ROOT, 'build', 'review-batches'),
-  /**
    * 用户导入的 PDF。
    *
    * ⚠️ 刻意**不写进 `Datas/`**：那是只读语料（金标准与原文的来源），
@@ -100,564 +55,29 @@ const DIRS = {
    * 导入件放在 `build/imports/`，侧车 `.meta.json` 记录原始文件名、大小与 sha256。
    */
   imports: join(ROOT, 'build', 'imports'),
-  /**
-   * 结局行的**人工裁定**记录（202609 覆盖率口径的配套）。
-   *
-   * 覆盖率口径下，流水线抽了、金标准没要的结局行**不判错**，改为"交人工裁定"。
-   * 裁定结果（保留 / 丢弃）按核对人分开存，和标注覆盖层同一个思路：
-   *   - 不覆盖原始产物，随时可对比"机器抽的 vs 人留的"
-   *   - 多人独立裁定，**分歧不替人裁决**（保留并标出）
-   */
-  adjudications: join(ROOT, 'build', 'adjudications'),
   /** 本地私有配置（API key 等）——只在本机读写，永不回显明文 */
   runtime: join(ROOT, 'runtime'),
 };
 
 /* ------------------------------ 标注读写 ------------------------------ */
-/*
- * 202609 起：**一位核对人一份文件**（需求见 packages/core/src/annotation.ts 顶部说明）。
- *
- *   build/annotations/<year>/<study>.json                 v1 遗留件（读取时归属 legacy）
- *   build/annotations/<year>/<study>.<reviewer>.json      某位核对人的记录
- *
- * 为什么按人分文件、而不是在同一份 JSON 里放 reviewer 数组：
- *   · **盲评**——各写各的文件，物理上不可能互相覆盖；
- *   · **并发安全**——两人同时提交不会丢更新（同文件"读-改-写"会丢）；
- *   · **可单独删除**某一位的记录，不影响其他人。
- * 代价是"读一篇研究要先列目录"，但量级是几十个文件，可以忽略。
- */
 
-/** 研究号归一化（去掉前导 `-`，与文件名一致）。 */
-const studyKey = (study) => String(study ?? '').replace(/^-+/, '');
+const annotationPath = (year, study) =>
+  join(DIRS.annotations, year, `${study.replace(/^-+/, '')}.json`);
 
-/*
- * 核对人标识会**直接拼进文件名**，因此必须严格校验：
- * 只允许中英文数字与 `.` `-` `_`，长度 1–40，且显式拒绝 `..`（否则可穿越出 annotations 目录）。
- * `legacy` 是保留字，不允许被写成核对人名，避免与 v1 遗留件混淆。
- */
-const REVIEWER_RE = /^[\w.\-\u4e00-\u9fa5]{1,40}$/u;
-function safeReviewer(raw) {
-  const s = String(raw ?? '').trim();
-  if (!s || s === LEGACY_REVIEWER) return null;
-  if (!REVIEWER_RE.test(s) || s.includes('..')) return null;
-  return s;
-}
-
-const annotationDir = (year) => join(DIRS.annotations, year);
-const legacyAnnotationPath = (year, study) => join(annotationDir(year), `${studyKey(study)}.json`);
-const reviewerAnnotationPath = (year, study, reviewer) =>
-  join(annotationDir(year), `${studyKey(study)}.${reviewer}.json`);
-
-/** 读一份覆盖层文件（损坏时返回 null，不让整个接口失败）。 */
-function readOverlayFile(path) {
-  if (!existsSync(path)) return null;
-  try {
-    const ov = JSON.parse(readFileSync(path, 'utf8'));
-    if (!ov || !Array.isArray(ov.entries)) return null;
-    return ov;
-  } catch {
-    return null;
-  }
-}
-
-/** 某位核对人的覆盖层（reviewer 省略时读 v1 遗留件）。 */
-function readAnnotation(year, study, reviewer = LEGACY_REVIEWER) {
-  if (reviewer === LEGACY_REVIEWER) return readOverlayFile(legacyAnnotationPath(year, study));
-  const r = safeReviewer(reviewer);
-  return r ? readOverlayFile(reviewerAnnotationPath(year, study, r)) : null;
-}
-
-/** 某篇研究的**全部**核对人记录（含 v1 遗留件）。 */
-function listAnnotations(year, study) {
-  const key = studyKey(study);
-  const out = [];
-
-  const legacy = readOverlayFile(legacyAnnotationPath(year, study));
-  if (legacy) out.push(legacy);
-
-  const dir = annotationDir(year);
-  if (!existsSync(dir)) return out;
-  for (const f of readdirSync(dir)) {
-    if (!f.startsWith(`${key}.`) || !f.endsWith('.json')) continue;
-    const reviewer = f.slice(key.length + 1, -'.json'.length);
-    if (!reviewer || reviewer === LEGACY_REVIEWER) continue;
-    const ov = readOverlayFile(join(dir, f));
-    // 文件名是权威来源：早先手工放进去的文件可能没有 reviewer 字段
-    if (ov) out.push({ ...ov, reviewer: ov.reviewer ?? reviewer });
-  }
-  return out;
-}
-
-/** 写某位核对人的覆盖层，返回落盘路径。 */
-function writeAnnotation(year, study, reviewer, overlay) {
-  const r = safeReviewer(reviewer);
-  if (!r) throw new Error(`核对人标识非法：${JSON.stringify(reviewer)}`);
-  const p = reviewerAnnotationPath(year, study, r);
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify({
-    ...overlay, schemaVersion: 'AA_ANNOTATION/2.0', reviewer: r,
-  }, null, 2), 'utf8');
-  return p;
-}
-
-/** 删除某位核对人的记录：带 fieldPath 只删该字段，否则整份删除。 */
-function deleteAnnotation(year, study, reviewer, fieldPath) {
-  const r = safeReviewer(reviewer);
-  if (!r) return { ok: false, removed: 0, error: `核对人标识非法：${JSON.stringify(reviewer)}` };
-  const p = reviewerAnnotationPath(year, study, r);
-
-  if (!fieldPath) {
-    if (existsSync(p)) rmSync(p, { force: true });
-    return { ok: true, removed: 'all' };
-  }
-  const ov = readOverlayFile(p);
-  if (!ov) return { ok: true, removed: 0 };
-  const before = ov.entries.length;
-  ov.entries = ov.entries.filter((e) => e.fieldPath !== fieldPath);
-  const removed = before - ov.entries.length;
-  if (!ov.entries.length) rmSync(p, { force: true });
-  else writeFileSync(p, JSON.stringify({ ...ov, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
-  return { ok: true, removed };
-}
-
-/* ------------------------------ 结局行人工裁定 ------------------------------ */
-/*
- * 覆盖率口径下，流水线抽了、金标准没要的结局行**不判错**，改为"交人工裁定"
- * （多抽的可以裁掉，漏抽的才是硬伤）。裁定结果按核对人分开存，
- * 与标注覆盖层同一个思路：不动原始产物、多人独立、**分歧不替人裁决**。
- */
-
-const adjudicationDir = (year) => join(DIRS.adjudications, year);
-const adjudicationPath = (year, study, reviewer) =>
-  join(adjudicationDir(year), `${studyKey(study)}.${reviewer}.json`);
-
-/** 读一份裁定文件（损坏时返回 null，不让整个接口失败）。 */
-function readAdjudicationFile(path) {
-  if (!existsSync(path)) return null;
-  try {
-    const d = JSON.parse(readFileSync(path, 'utf8'));
-    if (!d || typeof d.rows !== 'object' || d.rows === null) return null;
-    return d;
-  } catch {
-    return null;
-  }
-}
-
-/** 某篇研究的**全部**核对人裁定记录。 */
-function listAdjudications(year, study) {
-  const key = studyKey(study);
-  const dir = adjudicationDir(year);
-  if (!existsSync(dir)) return [];
-  const out = [];
-  for (const f of readdirSync(dir)) {
-    if (!f.startsWith(`${key}.`) || !f.endsWith('.json')) continue;
-    const reviewer = f.slice(key.length + 1, -'.json'.length);
-    if (!reviewer) continue;
-    const d = readAdjudicationFile(join(dir, f));
-    // 文件名是权威来源（与标注覆盖层同样的处理）
-    if (d) out.push({ ...d, reviewer: d.reviewer ?? reviewer });
-  }
-  return out;
-}
-
-/**
- * 逐行裁定的合并状态：
- *   agreed   全部核对人一致 → 生效
- *   single   只有一位表过态 → 生效（与标注覆盖层的口径一致）
- *   disputed 有分歧        → **不生效**，按"保留"处理并标出：删数据是不可逆的，
- *                            宁可留着让人再裁一次，也不替人删
- *   none     无人裁定       → 未裁定（导出时保留并标出）
- */
-function adjudicationIndex(year, study) {
-  const gather = new Map();
-  for (const doc of listAdjudications(year, study)) {
-    for (const [k, v] of Object.entries(doc.rows ?? {})) {
-      const i = Number(k);
-      if (!Number.isInteger(i) || i < 0) continue;
-      if (v?.decision !== 'keep' && v?.decision !== 'drop') continue;
-      if (!gather.has(i)) gather.set(i, []);
-      gather.get(i).push({ reviewer: doc.reviewer, decision: v.decision, ...(v.note ? { note: v.note } : {}) });
-    }
-  }
-  const out = new Map();
-  for (const [i, opinions] of gather) {
-    const ds = [...new Set(opinions.map((o) => o.decision))];
-    const status = ds.length > 1 ? 'disputed' : opinions.length === 1 ? 'single' : 'agreed';
-    out.set(i, {
-      status,
-      effective: status === 'disputed' ? 'keep' : ds[0],
-      opinions,
-    });
-  }
-  return out;
-}
-
-/** 写一条裁定。`decision = null` 表示撤销这条记录（回到"未裁定"）。 */
-function setAdjudication(year, study, reviewer, rowIndex, decision, note) {
-  const r = safeReviewer(reviewer);
-  if (!r) return { ok: false, error: `核对人标识非法：${JSON.stringify(reviewer)}` };
-  const i = Number(rowIndex);
-  if (!Number.isInteger(i) || i < 0) return { ok: false, error: `结局行下标非法：${JSON.stringify(rowIndex)}` };
-  if (decision !== null && decision !== 'keep' && decision !== 'drop') {
-    return { ok: false, error: `裁定只能是 keep / drop / null，收到 ${JSON.stringify(decision)}` };
-  }
-  const p = adjudicationPath(year, study, r);
-  const doc = readAdjudicationFile(p) ?? { study: studyKey(study), year, reviewer: r, rows: {} };
-  if (decision === null) delete doc.rows[String(i)];
-  else {
-    doc.rows[String(i)] = {
-      decision,
-      ...(note ? { note: String(note).slice(0, 300) } : {}),
-      at: new Date().toISOString(),
-    };
-  }
-  if (!Object.keys(doc.rows).length) {
-    // 撤空即删文件，避免留下一堆空壳影响"谁裁过"的判断
-    if (existsSync(p)) rmSync(p, { force: true });
-    return { ok: true, cleared: true };
-  }
-  mkdirSync(adjudicationDir(year), { recursive: true });
-  writeFileSync(p, JSON.stringify({ ...doc, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
-  return { ok: true, path: p.replace(`${ROOT}${sep}`, '') };
-}
-
-/** 数一个对象里有多少个字段值（形如 `{ raw, ... }`）——与评测的 countFieldLeaves 同义。 */
-function countLeaves(node) {
-  let n = 0;
-  const walk = (o) => {
-    if (o === null || typeof o !== 'object') return;
-    if (Array.isArray(o)) { o.forEach(walk); return; }
-    if (typeof o.raw === 'string') { n++; return; }
-    Object.values(o).forEach(walk);
-  };
-  walk(node);
-  return n;
-}
-
-/**
- * 「金标准没要」的产物结局行 = 人工裁定队列。
- *
- * 判据**与评测同一实现**（`tools/lib/align.mjs` 的 `isOutcomeCandidate`）：
- * 某个产物结局行如果对**任何**一条金标准结局行都不是候选，它就是金标准没要的。
- * 两边各写一份判据必然会漂移，所以共用。
- */
-function deferredOutcomeRows(year, study) {
-  const norm = studyKey(study);
-  const extractionFile = join(DIRS.extraction, year, `${norm}.json`);
-  const goldFile = join(DIRS.gold, `${year}.json`);
-  if (!existsSync(extractionFile)) return { rows: [], warning: `未找到 build/extraction/${year}/${norm}.json` };
-  if (!existsSync(goldFile)) return { rows: [], warning: `未找到 build/gold/${year}.json` };
-
-  const doc = JSON.parse(readFileSync(extractionFile, 'utf8'));
-  const gold = JSON.parse(readFileSync(goldFile, 'utf8'));
-  const goldOuts = (gold.articles ?? []).find((a) => a.article_id === norm)?.outcomes ?? [];
-  const preds = doc.outcomes ?? [];
-  const idx = adjudicationIndex(year, study);
-
-  const rows = [];
-  for (let i = 0; i < preds.length; i++) {
-    const p = preds[i];
-    if (goldOuts.some((g) => isOutcomeCandidate(g, p))) continue;   // 金标准要它 → 不是待裁行
-    const a = idx.get(i);
-    const evSrc = p.outcome?.name?.evidence ?? p.outcome?.instrument?.evidence ?? [];
-    /*
-     * 附上"最接近的金标准行"。
-     *
-     * 为什么需要：候选边是**窄**的（construct/subconstruct 不能凭空造边），
-     * 于是像金标准「BI score change」↔产物「activities of daily living /
-     * BI: Barthel Index」这种明显同一个结局、但文本分只有 0.33 的对，
-     * 也可能被判成"没有对应"。规则负责**缩小队列**，最终判断交给人 ——
-     * 所以必须把最接近的那条摆出来给人看，而不是给一个是/否。
-     */
-    let closest = null;
-    for (const g of goldOuts) {
-      const s = outcomeSimilarity(g, p);
-      if (!closest || s.score > closest.score) {
-        closest = {
-          name: g.outcome?.name?.raw ?? '',
-          instrument: g.outcome?.instrument?.raw ?? '',
-          textScore: Number(s.textScore.toFixed(3)),
-          corr: s.corr,
-          score: Number(s.score.toFixed(3)),
-        };
-      }
-    }
-    rows.push({
-      index: i,
-      studyId: p.studyId ?? null,
-      name: p.outcome?.name?.raw ?? '',
-      instrument: p.outcome?.instrument?.raw ?? '',
-      leaves: countLeaves(p),
-      evidence: evSrc.slice(0, 1).map((e) => ({ page: e.page, bbox: e.bbox ?? null, quote: e.quote ?? '', kind: e.kind })),
-      closest,
-      status: a?.status ?? 'none',
-      effective: a?.effective ?? 'keep',
-      opinions: a?.opinions ?? [],
-    });
-  }
-  const counts = { keep: 0, drop: 0, disputed: 0, none: 0 };
-  for (const r of rows) {
-    if (r.status === 'disputed') counts.disputed++;
-    else if (r.status === 'none') counts.none++;
-    else counts[r.effective]++;
-  }
-  return { rows, counts, goldRows: goldOuts.length, totalRows: preds.length };
-}
-
-/**
- * 多位核对人的记录 → 前端要的两个索引：
- *   `entries`：fieldPath → **生效的**人工条目（一致 / 仅一人时才生效）
- *   `review` ：fieldPath → { status, opinions }（分歧时供界面标红）
- *
- * ⚠️ 有分歧（disputed）的字段**故意不生效**——保留机器原值，等第三方仲裁。
- * 替人挑一个值会让"专家分歧"这个信号在数据里消失，而它正是要建模的东西。
- */
-function consensusIndex(overlays) {
-  const entries = new Map();
-  const review = new Map();
-  for (const row of buildConsensus({}, overlays)) {
-    review.set(row.fieldPath, { status: row.status, opinions: row.opinions });
-    if (row.status === 'disputed' || !row.agreedValue) continue;
-
-    const first = row.opinions[0];
-    // 与机器原值相同 = 确认；不同 = 改动（具体是 add 还是 override 取核对人标的动作）
-    const action = row.agreedWithMachine
-      ? 'confirm'
-      : (first?.action === 'confirm' ? 'override' : (first?.action ?? 'override'));
-
-    entries.set(row.fieldPath, {
-      fieldPath: row.fieldPath,
-      value: row.agreedValue,
-      action,
-      ...(row.machineValue ? { llmValue: row.machineValue } : {}),
-      ...(first?.note ? { note: first.note } : {}),
-      ...(first?.reviewer ? { author: first.reviewer } : {}),
-      ...(first?.updatedAt ? { updatedAt: first.updatedAt } : {}),
-    });
-  }
-  return { entries, review };
-}
-
-/** 某篇研究的核对汇总（给界面用）：逐人进度 + 分歧清单 + 两两一致率。 */
-function reviewSummary(year, study) {
-  const overlays = listAnnotations(year, study);
-  const rows = buildConsensus({}, overlays);
-  const stats = consensusStats(rows);
-  return {
-    reviewers: reviewerSummaries(overlays),
-    consensus: {
-      stats,
-      disputed: rows.filter((r) => r.status === 'disputed')
-        .map((r) => ({
-          fieldPath: r.fieldPath,
-          machineRaw: r.machineValue?.raw ?? null,
-          opinions: r.opinions.map((o) => ({ reviewer: o.reviewer, raw: o.raw, action: o.action })),
-        })),
-      pairwise: pairwiseAgreement(overlays),
-    },
-  };
-}
-
-/* ------------------------------ 导回与结果集 ------------------------------ */
-
-/*
- * 批次 id 的净化：保留中文（核对人名字要能认出来），去掉路径分隔符与 `..`。
- * 读写两侧**必须用同一个函数**，否则写进去的文件名读不回来。
- */
-const safeBatchId = (id) => String(id ?? '')
-  .replace(/\.\./g, '_')
-  .replace(/[^\w.\-\u4e00-\u9fa5]/g, '_')
-  .slice(0, 120);
-
-/** 读一个导回批次快照（文件名 = 批次 id）。 */
-function readBatch(id) {
-  const safe = safeBatchId(id);
-  if (!safe) return null;
-  const p = join(DIRS.batches, `${safe}.json`);
+function readAnnotation(year, study) {
+  const p = annotationPath(year, study);
   if (!existsSync(p)) return null;
-  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }
+  try {
+    return JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    return null;   // 文件损坏不应让整个接口失败
+  }
 }
 
-/** 列出导回批次（可按研究过滤），新的在前。 */
-function listBatches(year, study) {
-  if (!existsSync(DIRS.batches)) return [];
-  const out = [];
-  for (const f of readdirSync(DIRS.batches)) {
-    if (!f.endsWith('.json')) continue;
-    const b = readBatch(f.replace(/\.json$/, ''));
-    if (!b) continue;
-    if (year && study && !(b.changes ?? []).some((c) => c.year === year && c.study === study)) continue;
-    out.push(b);
-  }
-  return out.sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? '')));
-}
-
-/**
- * 把导回的差异落到覆盖层，并留一份批次快照。
- *
- * ⚠️ 这是整个程序里**第二处会改写人工记录**的地方（另一处是 /api/annotation 的单条标注）。
- * 两处都只写覆盖层、绝不碰流水线产物。
- *
- * 保留原证据：值被改了，但之前框选的 bbox/quote 仍然有意义，不清掉。
- */
-function applyReviewImport({ reviewer, changes, cleared, meta }) {
-  /** (year/study) → { entries: Map<fieldPath, rec>, removed: string[] } */
-  const byStudy = new Map();
-  const slot = (year, study) => {
-    const k = `${year}/${study}`;
-    if (!byStudy.has(k)) byStudy.set(k, { year, study, entries: new Map(), removed: [] });
-    return byStudy.get(k);
-  };
-
-  for (const c of changes) {
-    const g = slot(c.year, c.study);
-    const prev = g.entries.get(c.fieldPath);
-    g.entries.set(c.fieldPath, {
-      fieldPath: c.fieldPath,
-      action: c.action,
-      // 证据留空数组占位；若该字段原先有证据，下面合并时保留
-      value: { raw: c.raw, evidence: prev?.value?.evidence ?? [], provenance: 'human', confidence: 1 },
-      ...(c.note ? { note: c.note } : {}),
-    });
-  }
-  for (const c of cleared) slot(c.year, c.study).removed.push(c.fieldPath);
-
-  const touched = [];
-  for (const g of byStudy.values()) {
-    const ov = readAnnotation(g.year, g.study, reviewer) ?? {
-      schemaVersion: 'AA_ANNOTATION/2.0',
-      year: g.year,
-      articleId: studyKey(g.study),
-      sourcePdf: `Datas/articles/${g.year}/${studyKey(g.study)}.pdf`,
-      reviewer,
-      entries: [],
-      updatedAt: new Date().toISOString(),
-    };
-    const prevByPath = new Map((ov.entries ?? []).map((e) => [e.fieldPath, e]));
-    const now = new Date().toISOString();
-
-    for (const [fp, rec] of g.entries) {
-      const prev = prevByPath.get(fp);
-      const evidence = rec.value.evidence.length ? rec.value.evidence : (prev?.value?.evidence ?? []);
-      const full = { ...rec, value: { ...rec.value, evidence }, author: reviewer, updatedAt: now };
-      const i = ov.entries.findIndex((x) => x.fieldPath === fp);
-      if (i >= 0) ov.entries[i] = full; else ov.entries.push(full);
-    }
-    if (g.removed.length) {
-      const gone = new Set(g.removed);
-      ov.entries = ov.entries.filter((x) => !gone.has(x.fieldPath));
-    }
-
-    ov.updatedAt = now;
-    if (ov.entries.length) writeAnnotation(g.year, g.study, reviewer, ov);
-    else {
-      const p = reviewerAnnotationPath(g.year, g.study, reviewer);
-      if (existsSync(p)) rmSync(p, { force: true });
-    }
-    touched.push({ year: g.year, study: g.study, written: g.entries.size, removed: g.removed.length });
-  }
-
-  // 批次快照
-  const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
-  mkdirSync(DIRS.batches, { recursive: true });
-  /*
-   * id 精确到秒。同一秒内连导两次会撞名——而撞名 = 后一次**覆盖**前一次的快照，
-   * 等于悄悄丢掉一批记录（实测踩到：两次导入相隔 200ms）。这里加序数兜底。
-   */
-  const base = safeBatchId(`${stamp}-${reviewer}`);
-  let batchId = base;
-  for (let n = 2; existsSync(join(DIRS.batches, `${batchId}.json`)); n++) batchId = `${base}-${n}`;
-
-  const batch = {
-    id: batchId,
-    at: new Date().toISOString(),
-    reviewer,
-    ...(meta ?? {}),
-    changes: changes.map((c) => ({
-      year: c.year, study: c.study, fieldPath: c.fieldPath,
-      action: c.action, raw: c.raw, before: c.before ?? null,
-    })),
-    cleared: cleared.map((c) => ({
-      year: c.year, study: c.study, fieldPath: c.fieldPath, before: c.before ?? null,
-    })),
-    studies: touched,
-  };
-  writeFileSync(join(DIRS.batches, `${batch.id}.json`), JSON.stringify(batch, null, 2), 'utf8');
-
-  return { batchId: batch.id, applied: changes.length, retracted: cleared.length, studies: touched };
-}
-
-/* ---- 结果集：机器 / 某位核对人 / 某个导回批次 ---- */
-
-/** 字段路径 → 中文标签（比较表里要显示人看得懂的名字）。 */
-function labelIndex(groups) {
-  const m = new Map();
-  for (const g of groups ?? []) {
-    for (const f of g.fields ?? []) m.set(f.fieldPath, f.label ?? f.fieldPath);
-  }
-  return m;
-}
-
-/** 机器结果集：只收「机器真的产出了值」的字段（人工补录的不算机器值）。 */
-function machineSet(groups) {
-  const m = new Map();
-  for (const g of groups ?? []) {
-    for (const f of g.fields ?? []) {
-      const v = f.decidedBy === 'human' ? f.llmRaw : f.raw;
-      const s = v === undefined || v === null ? '' : String(v);
-      if (s !== '') m.set(f.fieldPath, { raw: s });
-    }
-  }
-  return m;
-}
-
-/** 核对人结果集：只收他**表过态**的字段。没表过态 ≠ 他认可机器值。 */
-function reviewerSet(year, study, name) {
-  const ov = readAnnotation(year, study, name);
-  const m = new Map();
-  for (const e of ov?.entries ?? []) m.set(e.fieldPath, { raw: String(e.value?.raw ?? '') });
-  return m;
-}
-
-/** 导回批次结果集：只含**该批改动过**的字段（不是当时的全量状态，标签里要写明）。 */
-function batchSet(year, study, id) {
-  const b = readBatch(id);
-  const m = new Map();
-  for (const c of b?.changes ?? []) {
-    if (c.year !== year || c.study !== study) continue;
-    m.set(c.fieldPath, { raw: String(c.raw ?? '') });
-  }
-  for (const c of b?.cleared ?? []) {
-    if (c.year !== year || c.study !== study) continue;
-    m.set(c.fieldPath, { raw: '（已撤回）' });
-  }
-  return m;
-}
-
-/** 可比较的结果集目录（前端下拉用）。 */
-function reviewSets(year, study) {
-  const out = [{ id: 'machine', label: '机器抽取', kind: 'machine', count: null }];
-  for (const ov of listAnnotations(year, study)) {
-    const r = reviewerOf(ov);
-    out.push({ id: `reviewer:${r}`, label: `核对人 · ${r}`, kind: 'reviewer', count: (ov.entries ?? []).length });
-  }
-  for (const b of listBatches(year, study)) {
-    out.push({
-      id: `batch:${b.id}`,
-      label: `导入批次 · ${b.reviewer}（${String(b.at ?? '').slice(0, 16).replace('T', ' ')}）`,
-      kind: 'batch',
-      count: (b.changes ?? []).length,
-    });
-  }
-  return out;
-}
-
-/** 解析结果集 id → Map<fieldPath, {raw}>。 */
-function resolveSet(id, year, study, groups) {
-  if (id === 'machine') return machineSet(groups);
-  if (id.startsWith('reviewer:')) return reviewerSet(year, study, id.slice('reviewer:'.length));
-  if (id.startsWith('batch:')) return batchSet(year, study, id.slice('batch:'.length));
-  return null;
+function writeAnnotation(year, study, overlay) {
+  const p = annotationPath(year, study);
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(overlay, null, 2), 'utf8');
 }
 
 /** 读取请求体（限制大小，防止误传大文件）。 */
@@ -721,8 +141,27 @@ const studyOk = (year, study) => (okYear(year) && okStudy(study)) || Boolean(pdf
 
 /* ------------------------------ 本地配置（设置菜单） ------------------------------ */
 
-const CONFIG_FILE = () => llmConfigPath(ROOT);
-const readConfig = () => loadLlmConfig(ROOT, { optional: true });
+const CONFIG_FILE = () => process.env.AA_LLM_CONFIG ?? join(DIRS.runtime, 'llm.local.json');
+
+/** 读取本地配置；不存在时回落到默认值。 */
+function readConfig() {
+  const p = CONFIG_FILE();
+  let file = {};
+  if (existsSync(p)) {
+    try { file = JSON.parse(readFileSync(p, 'utf8')); } catch { file = {}; }
+  }
+  return {
+    file,
+    // 环境变量优先（与 tools/llm_run.mjs 的取值顺序一致）
+    apiKey: process.env.DEEPSEEK_API_KEY ?? file.apiKey ?? '',
+    baseUrl: process.env.AA_LLM_BASE_URL ?? file.baseUrl ?? 'https://api.deepseek.com',
+    model: process.env.AA_LLM_MODEL ?? file.model ?? 'deepseek-chat',
+    provider: file.provider ?? 'deepseek',
+    temperature: file.temperature ?? 0,
+    maxTokens: file.maxTokens ?? 8000,
+    crossrefMailto: file.crossrefMailto ?? '',
+  };
+}
 
 /**
  * 掩码：只回显前 3 位与后 4 位。
@@ -855,12 +294,6 @@ function listStudies(year) {
   }
 
   return out.sort((a, b) => a.studyId.localeCompare(b.studyId));
-}
-
-/** 语料目录下有哪些年份（升序）。用于「全部年份」批量导出。 */
-function listYears() {
-  if (!existsSync(DIRS.articles)) return [];
-  return readdirSync(DIRS.articles).filter((d) => /^\d{4}$/.test(d)).sort();
 }
 
 /** 某研究对应的 PDF 绝对路径（语料优先，其次导入件）。 */
@@ -1024,14 +457,10 @@ async function buildFieldGroups(year, study) {
 /** 流水线产物 → 字段视图（含"待人工确认"分组）。 */
 async function buildFromExtraction(year, study, norm, doc) {
   const canon = await loadCanonical();
-  /*
-   * 多位核对人的记录 → 「生效的人工条目」+「逐字段核对状态」。
-   * 分歧（disputed）的字段**不生效**，保留机器原值，只把状态带给界面（见 consensusIndex）。
-   */
-  const { entries: byPath, review } = consensusIndex(listAnnotations(year, study));
-  const annEntries = [...byPath.values()];
+  const overlay = readAnnotation(year, study);
+  const byPath = new Map((overlay?.entries ?? []).map((e) => [e.fieldPath, e]));
 
-  const toView = makeToView(byPath, review);
+  const toView = makeToView(byPath);
   const groups = [];
 
   /* ---- 文章级 ---- */
@@ -1046,12 +475,10 @@ async function buildFromExtraction(year, study, norm, doc) {
   }
   for (const [k, gv] of Object.entries(art)) {
     if (used.has(k) || k === 'articleId' || k === 'external' || k === 'studyOutcomes') continue;
-    // 旧产物里的退役字段不再展示（见 canonical-field-map 的 RETIRED_KEYS）
-    if (RETIRED_KEYS.has(k)) continue;
     const v = toView(k, k, gv, k);
     if (v) artFields.push(v);
   }
-  for (const e of annEntries) {
+  for (const e of overlay?.entries ?? []) {
     if (e.fieldPath.includes('.') || artFields.some((f) => f.fieldPath === e.fieldPath)) continue;
     const v = toView(e.fieldPath, e.fieldPath, null, e.fieldPath);
     if (v) artFields.push(v);
@@ -1103,8 +530,6 @@ async function buildFromExtraction(year, study, norm, doc) {
     const fields = [];
     for (const [k, gv] of Object.entries(c)) {
       if (k === 'studyId') continue;
-      // 旧产物里的退役字段不再展示（见 canonical-field-map 的 RETIRED_KEYS）
-      if (RETIRED_KEYS.has(k)) continue;
       const label = canon.comparison.find((f) => f.key === k)?.label ?? k;
       const v = toView(`comparisons.${i}.${k}`, label, gv, k);
       if (v) fields.push(v);
@@ -1121,7 +546,7 @@ async function buildFromExtraction(year, study, norm, doc) {
    * 因此行的枚举范围要取「产物行数」与「覆盖层里出现的最大结局下标 + 1」的较大者。
    * 这样点一下「纳入」就能得到一条可编辑的 Sheet3 行（含原始表格的全部列）。
    */
-  const ovOutcomeIdx = annEntries
+  const ovOutcomeIdx = (overlay?.entries ?? [])
     .map((e) => /^outcomes\.(\d+)\./.exec(e.fieldPath))
     .filter(Boolean)
     .map((m) => Number(m[1]));
@@ -1155,16 +580,7 @@ async function buildFromExtraction(year, study, norm, doc) {
         if (v === null || v === undefined || typeof v !== 'object' || Array.isArray(v)) continue;
         const path = `outcomes.${i}.${prefix}${k}`;
         if ('raw' in v) {
-          /*
-           * ⚠️ 标题**不能**直接用契约路径（`outcome.name`、`timepoints.baseline.contin...`）——
-           * 那是抽取侧的写法，医生看不懂，也查不到原表列。
-           * 统一过一遍 `labelOutcomeField`：中文名 + 规范键（规范键用于查原始表头、按原表列序排序）。
-           */
-          const rel = `${prefix}${k}`;
-          // 旧产物里的退役字段不再展示（见 canonical-field-map 的 RETIRED_KEYS）
-          if (RETIRED_KEYS.has(k)) continue;
-          const named = labelOutcomeField(rel);
-          const v2 = toView(path, named?.label ?? rel, v, named?.key ?? k);
+          const v2 = toView(path, `${prefix}${k}`, v, k);
           if (v2) fields.push(v2);
         } else {
           walk(v, `${prefix}${k}.`);
@@ -1180,8 +596,7 @@ async function buildFromExtraction(year, study, norm, doc) {
       for (const [suffix] of formTemplate) {
         const path = `outcomes.${i}.${suffix}`;
         if (fields.some((x) => x.fieldPath === path)) continue;
-        const named = labelOutcomeField(suffix);
-        const v = toView(path, named?.label ?? suffix, null, named?.key ?? suffix.split('.').pop());
+        const v = toView(path, suffix, null, suffix.split('.').pop());
         if (v) fields.push(v);
       }
     }
@@ -1226,11 +641,6 @@ async function buildFromExtraction(year, study, norm, doc) {
 
   /* ---- 三张 Sheet 的选项卡视图（按原始表格列序） ---- */
   const layout = await loadSheetLayout(year);
-  /*
-   * 待人工裁定的结局行（覆盖率口径的配套）：
-   * 流水线抽了、**金标准没要**的行不判错，列出来让人决定留不留。
-   */
-  const deferred = deferredOutcomeRows(year, study);
   const sheets = {
     layoutSource: layout.source ? layout.source.replace(`${ROOT}${sep}`, '') : null,
     headerOf: layout.headerOf,
@@ -1252,19 +662,22 @@ async function buildFromExtraction(year, study, norm, doc) {
       candidates: candidateFields,
       /** 下一个可用的结局行下标（「纳入抽取」写入这里） */
       nextOutcomeIndex: outcomeRowCount,
-      deferred: deferred.rows,
-      deferredCounts: deferred.counts ?? { keep: 0, drop: 0, disputed: 0, none: 0 },
-      ...(deferred.warning ? { deferredWarning: deferred.warning } : {}),
     },
   };
 
+  const entries = overlay?.entries ?? [];
   return {
     groups,
     sheets,
     source: 'extraction',
     generatedAt: doc.generatedAt ?? null,
     model: doc.pipeline?.modelIds?.[0] ?? null,
-    stats: statsOfEntries(annEntries),
+    stats: {
+      total: entries.length,
+      added: entries.filter((e) => e.action === 'add').length,
+      overridden: entries.filter((e) => e.action === 'override').length,
+      confirmed: entries.filter((e) => e.action === 'confirm').length,
+    },
     articleId: norm,
   };
 }
@@ -1279,10 +692,10 @@ async function buildFromGold(year, study, norm) {
   if (!article) return { groups: [], stats: emptyStats(), source: 'none', warning: `金标准中未找到 ${norm}` };
 
   const canon = await loadCanonical();
-  const { entries: byPath, review } = consensusIndex(listAnnotations(year, study));
-  const annEntries = [...byPath.values()];
+  const overlay = readAnnotation(year, study);
+  const byPath = new Map((overlay?.entries ?? []).map((e) => [e.fieldPath, e]));
 
-  const toView = makeToView(byPath, review);
+  const toView = makeToView(byPath);
 
   const groups = [];
   const artFields = [];
@@ -1298,7 +711,7 @@ async function buildFromGold(year, study, norm) {
     const v = toView(k, k, gv);
     if (v) artFields.push(v);
   }
-  for (const e of annEntries) {
+  for (const e of overlay?.entries ?? []) {
     if (e.fieldPath.includes('.') || artFields.some((f) => f.fieldPath === e.fieldPath)) continue;
     const v = toView(e.fieldPath, e.fieldPath, null);
     if (v) artFields.push(v);
@@ -1312,17 +725,17 @@ async function buildFromGold(year, study, norm) {
       if (!groups.includes(g)) groups.push(g);
     }
   }
-  for (const e of annEntries) {
+  for (const e of overlay?.entries ?? []) {
     if (e.fieldPath.includes('.') || artFields.some((f) => f.fieldPath === e.fieldPath)) continue;
     const v = toView(e.fieldPath, e.fieldPath, null);
     if (v && !artFields.includes(v)) artFields.push(v);
   }
-  return { groups, source: 'gold', stats: statsOfEntries(annEntries), articleId: norm };
+  return { groups, source: 'gold', stats: statsOf(overlay), articleId: norm };
 }
 
 const emptyStats = () => ({ total: 0, added: 0, overridden: 0, confirmed: 0 });
-/** 「生效的人工条目」→ 统计（界面头部用）。有分歧的字段不在其中，见 consensusIndex。 */
-const statsOfEntries = (entries) => {
+const statsOf = (overlay) => {
+  const entries = overlay?.entries ?? [];
   return {
     total: entries.length,
     added: entries.filter((e) => e.action === 'add').length,
@@ -1331,13 +744,8 @@ const statsOfEntries = (entries) => {
   };
 };
 
-/**
- * 值 + 人工覆盖层 → FieldView（两条数据源共用）。
- *
- * `review` 来自 `consensusIndex`：有核对记录的字段会带上 `reviewStatus`
- * （agreed / disputed / single）与各人意见 `reviews`，前端据此标分歧、看详情。
- */
-function makeToView(byPath, review = new Map()) {
+/** 值 + 人工覆盖层 → FieldView（两条数据源共用）。 */
+function makeToView(byPath) {
   return (fieldPath, label, gv, key) => {
     const ann = byPath.get(fieldPath);
     const base = ann ? ann.value : gv;
@@ -1355,9 +763,6 @@ function makeToView(byPath, review = new Map()) {
       ...(base.legend !== undefined ? { legend: base.legend } : {}),
       decidedBy: ann ? 'human' : (base.provenance ?? 'model'),
       overridden: ann ? ann.action !== 'confirm' : false,
-      ...(review.has(fieldPath)
-        ? { reviewStatus: review.get(fieldPath).status, reviews: review.get(fieldPath).opinions }
-        : {}),
       /** 原始产物里是否存在该字段：false 表示人工新增（写回时用 action='add'） */
       inGold: Boolean(gv),
       ...(base.confidence !== undefined ? { confidence: base.confidence } : {}),
@@ -1428,75 +833,6 @@ const server = createServer(async (req, res) => {
     const year = url.searchParams.get('year') ?? '';
     const study = url.searchParams.get('study') ?? '';
 
-    if (p.startsWith('/api/workflow')) {
-      if (!okYear(year) || !okImportId(study)) {
-        return json(res, 400, { error: '论文编号或年份非法' });
-      }
-      try {
-        if (p === '/api/workflow' && req.method === 'GET') {
-          const state = readWorkflow(ROOT, year, study);
-          const records = effectiveRecords(state);
-          return json(res, 200, { ...state, effectiveRecords: records, reviewCurrent: isFinalReviewCurrent(state, records) });
-        }
-        if (p === '/api/workflow/select' && req.method === 'POST') {
-          const state = await selectOutcomes(ROOT, year, study, await readBody(req));
-          return json(res, 200, state);
-        }
-        if (p === '/api/workflow/candidate' && req.method === 'POST') {
-          return json(res, 200, await addCandidate(ROOT, year, study, await readBody(req)));
-        }
-        if (p === '/api/workflow/candidate' && req.method === 'PATCH') {
-          return json(res, 200, await updateCandidate(ROOT, year, study, await readBody(req)));
-        }
-        if (p === '/api/workflow/edit' && req.method === 'POST') {
-          return json(res, 200, await editResult(ROOT, year, study, await readBody(req)));
-        }
-        if (p === '/api/workflow/run' && req.method === 'POST') {
-          const input = await readBody(req);
-          const stage = input.stage;
-          if (!['basic', 'candidates', 'summary', 'review'].includes(stage)) return json(res, 400, { error: '未知工作流阶段' });
-          const active = [...jobs.values()].find(j => j.year === year && j.study === study && j.state === 'running');
-          if (active) return json(res, 409, { error: '该论文已有任务运行，请等待完成', job: jobView(active) });
-          const state = readWorkflow(ROOT, year, study);
-          if (Object.values(state.stages).some(s => s.status === 'running')) return json(res, 409, { error: '该论文已有任务运行' });
-          if (stage !== 'basic' && !state.basic) return json(res, 409, { error: '请先提取基础字段' });
-          if (stage === 'summary' && (!state.selection.candidateIds.length || input.selectionRevision !== state.selection.revision)) {
-            return json(res, 409, { error: '请先保存结局选择，再运行汇总' });
-          }
-          if (stage === 'review' && (!canReviewSummary(state) || input.selectionRevision !== state.selection.revision)) {
-            return json(res, 409, { error: '请先汇总当前所选结局，再运行最终复核' });
-          }
-          const args = [join(APP_DIR, 'tools', 'workflow_run.mjs'), '--year', year, '--study', study, '--stage', stage];
-          if (stage === 'summary' || stage === 'review') args.push('--selection-revision', String(state.selection.revision));
-          if (input.fresh === true) args.push('--fresh');
-          const job = startJob('workflow', year, study, process.execPath, args, { ELECTRON_RUN_AS_NODE: '1', AA_ROOT: ROOT });
-          return json(res, 200, { ok: true, job: jobView(job) });
-        }
-        if (p === '/api/workflow/pdf' && req.method === 'GET') {
-          const state = readWorkflow(ROOT, year, study);
-          const source = state.sources?.find(s => s.id === url.searchParams.get('document'));
-          if (!source) return json(res, 404, { error: '找不到正文或附件' });
-          const bytes = readFileSync(safeSourcePath(ROOT, source));
-          res.writeHead(200, { 'content-type': 'application/pdf', 'content-length': bytes.length, 'cache-control': 'no-store' });
-          return res.end(bytes);
-        }
-        if (p === '/api/workflow/export' && req.method === 'GET') {
-          const state = readWorkflow(ROOT, year, study);
-          const csv = url.searchParams.get('format') === 'csv';
-          const body = csv ? Buffer.from(workflowCsv(state), 'utf8') : buildXlsx(workflowExportSheets(state));
-          res.writeHead(200, {
-            'content-type': csv ? 'text/csv; charset=utf-8' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'content-disposition': 'attachment; filename="' + study + '-workflow.' + (csv ? 'csv' : 'xlsx') + '"',
-            'content-length': body.length, 'cache-control': 'no-store',
-          });
-          return res.end(body);
-        }
-        return json(res, 404, { error: '未知工作流接口' });
-      } catch (error) {
-        return json(res, 409, { error: redact(error.message, readConfig().apiKey) });
-      }
-    }
-
     if (p === '/api/health') {
       return json(res, 200, {
         ok: true,
@@ -1563,57 +899,46 @@ const server = createServer(async (req, res) => {
       return json(res, 200, r);
     }
 
-    /*
-     * 人机核对记录（202609：**一位核对人一份文件**）。
-     *
-     *   GET    ?reviewer=X               X 的覆盖层 + 全部核对人进度 + 分歧清单 + 两两一致率
-     *   POST   { reviewer, entry|entries } 写入 X 的记录（盲评：互不覆盖）
-     *   DELETE ?reviewer=X[&fieldPath=…]  删除 X 的某字段 / 整份记录
-     *
-     * reviewer **一律必填**：静默落到某个默认核对人，会让人以为自己标上了、
-     * 实际写进了别人的文件——这种 bug 在盲评场景里最难发现。
-     */
     if (p === '/api/annotation') {
       if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
 
-      const wantReviewer = url.searchParams.get('reviewer');
-      if (wantReviewer && !safeReviewer(wantReviewer)) {
-        return json(res, 400, { error: 'reviewer 非法：只允许 1–40 位中英文/数字/. - _，且不含 ..' });
-      }
-
       if (req.method === 'GET') {
-        const ov = wantReviewer ? readAnnotation(year, study, wantReviewer) : null;
-        return json(res, 200, {
-          overlay: ov,
-          stats: statsOfEntries(ov?.entries ?? []),
-          ...reviewSummary(year, study),
-        });
+        const ov = readAnnotation(year, study);
+        return json(res, 200, { overlay: ov, stats: ov ? {
+          total: ov.entries.length,
+          added: ov.entries.filter((e) => e.action === 'add').length,
+          overridden: ov.entries.filter((e) => e.action === 'override').length,
+          confirmed: ov.entries.filter((e) => e.action === 'confirm').length,
+        } : { total: 0, added: 0, overridden: 0, confirmed: 0 } });
       }
 
       if (req.method === 'DELETE') {
-        if (!wantReviewer) {
-          return json(res, 400, { error: '删除必须指定 reviewer（不指定会把所有核对人的记录一起删掉）' });
-        }
+        const fp = annotationPath(year, study);
+        // 带 fieldPath 时只删除该字段的人工标注（= 单字段「回滚」），
+        // 否则清空整份覆盖层（= 该研究全部「重置」）。
         const fieldPath = url.searchParams.get('fieldPath') ?? '';
-        const r = deleteAnnotation(year, study, wantReviewer, fieldPath);
-        if (!r.ok) return json(res, 400, { error: r.error });
-        return json(res, 200, r);
+        if (!fieldPath) {
+          if (existsSync(fp)) rmSync(fp, { force: true });
+          return json(res, 200, { ok: true, removed: 'all' });
+        }
+        const ov = readAnnotation(year, study);
+        if (!ov) return json(res, 200, { ok: true, removed: 0 });
+        const before = ov.entries.length;
+        ov.entries = ov.entries.filter((e) => e.fieldPath !== fieldPath);
+        const removed = before - ov.entries.length;
+        if (!ov.entries.length) rmSync(fp, { force: true });
+        else writeAnnotation(year, study, { ...ov, updatedAt: new Date().toISOString() });
+        return json(res, 200, { ok: true, removed });
       }
 
       if (req.method === 'POST' || req.method === 'PUT') {
         const body = await readBody(req);
-        const reviewer = safeReviewer(body.reviewer ?? wantReviewer);
-        if (!reviewer) {
-          return json(res, 400, { error: '缺少或非法的 reviewer：只允许 1–40 位中英文/数字/. - _，且不含 ..' });
-        }
-
-        const artId = studyKey(study);
-        const base = readAnnotation(year, study, reviewer) ?? {
-          schemaVersion: 'AA_ANNOTATION/2.0',
+        const artId = study.replace(/^-+/, '');
+        const base = readAnnotation(year, study) ?? {
+          schemaVersion: 'AA_ANNOTATION/1.0',
           year,
           articleId: artId,
           sourcePdf: `Datas/articles/${year}/${artId}.pdf`,
-          reviewer,
           entries: [],
           updatedAt: new Date().toISOString(),
         };
@@ -1628,408 +953,17 @@ const server = createServer(async (req, res) => {
           if (!['confirm', 'override', 'add'].includes(e.action)) {
             return json(res, 400, { error: `action 非法：${e.action}` });
           }
-          // 同一位核对人对同一 fieldPath 只保留最新一条（其他人的记录互不影响）
+          // 同一 fieldPath 只保留最新一条
           const idx = base.entries.findIndex((x) => x.fieldPath === e.fieldPath);
-          const rec = { ...e, author: reviewer, updatedAt: new Date().toISOString() };
+          const rec = { ...e, updatedAt: new Date().toISOString() };
           if (idx >= 0) base.entries[idx] = rec; else base.entries.push(rec);
         }
         base.updatedAt = new Date().toISOString();
-        writeAnnotation(year, study, reviewer, base);
-        return json(res, 200, {
-          ok: true, reviewer, overlay: { ...base, reviewer }, count: base.entries.length,
-          ...reviewSummary(year, study),
-        });
+        writeAnnotation(year, study, base);
+        return json(res, 200, { ok: true, overlay: base, count: base.entries.length });
       }
 
       return json(res, 405, { error: `不支持的方法 ${req.method}` });
-    }
-
-    /*
-     * 导出人工核对结果（XLSX / CSV）。
-     *
-     * 三种范围：
-     *   ?study=2015-01    单篇（界面上单篇"导出"用它）
-     *   ?year=2015        该年份全部研究
-     *   ?scope=all        全部年份
-     *
-     * 数据来源与界面**完全同一份**（buildFieldGroups），
-     * 所以导出的内容必然与屏幕上看到的一致，不会"页面一个值、文件另一个值"。
-     */
-    if (p === '/api/export') {
-      const format = (url.searchParams.get('format') ?? 'xlsx').toLowerCase();
-      if (!['xlsx', 'csv'].includes(format)) {
-        return json(res, 400, { error: `format 非法：${format}（只支持 xlsx / csv）` });
-      }
-
-      /*
-       * **导出必须署名**。
-       *
-       * 导出的文件是要拿去改、再导回来的；署名就是"这份表是谁的"。
-       * 没有署名，导回时就没法判断改动该记到谁名下——只能靠界面输入框，
-       * 而那个框是可以随手填别人名字的。
-       */
-      const signer = safeReviewer(url.searchParams.get('reviewer'));
-      if (!signer) {
-        return json(res, 400, {
-          error: '导出必须指定 reviewer：导出人要写进文件签名。请先在界面右上角填写「核对人」。',
-        });
-      }
-
-      const wantAll = (url.searchParams.get('scope') ?? '').toLowerCase() === 'all';
-      let targets;
-      let label;
-      let scope;
-      if (study) {
-        if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
-        targets = [{ year, study }];
-        label = `${year}_${studyKey(study)}`;
-        scope = 'study';
-      } else if (wantAll) {
-        targets = listYears().flatMap((y) => listStudies(y).map((s) => ({ year: y, study: s.studyId })));
-        label = '全部年份';
-        scope = 'all';
-      } else if (okYear(year)) {
-        const list = listStudies(year);
-        if (!list.length) return json(res, 409, { error: `${year} 下没有研究` });
-        targets = list.map((s) => ({ year, study: s.studyId }));
-        label = `${year}_全部`;
-        scope = 'year';
-      } else {
-        return json(res, 400, { error: '请给 study、year 或 scope=all' });
-      }
-      if (!targets.length) return json(res, 409, { error: '没有可导出的研究' });
-
-      /*
-       * 逐篇组装。缺抽取产物的篇目**跳过并计数**，而不是让整次导出失败——
-       * 批量导出的场景下，一篇没有产物不该拖住另外两百篇。
-       */
-      const subjects = [];
-      const skipped = [];
-      /*
-       * 结局行裁定的汇总（覆盖率口径的配套）。
-       * 被丢弃的行从 `groups` 里剔除 —— 那才是"丢弃"的实际意义；
-       * 同时把裁定明细带给导出器，让它写进「核对汇总」留痕。
-       */
-      const adjSummary = { keep: 0, drop: 0, disputed: 0, none: 0, rows: [] };
-      for (const t of targets) {
-        const built = await buildFieldGroups(t.year, t.study);
-        if (!built.groups?.length) { skipped.push(`${t.year}/${t.study}`); continue; }
-
-        const deferred = deferredOutcomeRows(t.year, t.study);
-        const dropped = new Set();
-        for (const d of deferred.rows ?? []) {
-          if (d.status === 'disputed') adjSummary.disputed++;
-          else if (d.status === 'none') adjSummary.none++;
-          else adjSummary[d.effective]++;
-          /* 只有明确被丢弃（且非分歧）的才剔除；分歧与未裁定一律保留 */
-          if (d.status !== 'disputed' && d.effective === 'drop') dropped.add(d.index);
-          adjSummary.rows.push({
-            year: t.year, study: t.study, index: d.index, name: d.name || d.instrument || '（未命名）',
-            decision: d.status === 'disputed' ? 'keep' : d.effective,
-            opinions: d.opinions ?? [],
-          });
-        }
-
-        const groups = dropped.size
-          ? built.groups.filter((g) => {
-            const m = /^out-(\d+)$/.exec(g.id ?? '');
-            return !(m && dropped.has(Number(m[1])));
-          })
-          : built.groups;
-
-        subjects.push({
-          year: t.year,
-          study: t.study,
-          groups,
-          order: built.sheets?.order,
-          headerOf: built.sheets?.headerOf,
-        });
-      }
-      if (!subjects.length) {
-        return json(res, 409, {
-          error: `没有可导出的字段（${skipped.length} 篇缺抽取产物，先跑 pnpm llm:run）`,
-        });
-      }
-
-      const { sheets, csv } = buildReviewExport({
-        label: `${label}${skipped.length ? `（${skipped.length} 篇无产物已跳过）` : ''}`,
-        scope,
-        signer,
-        subjects,
-        ...(adjSummary.rows.length ? { adjudication: adjSummary } : {}),
-      });
-
-      const name = exportFileName(label, format);
-      const bytes = format === 'csv' ? csvBuffer(csv) : buildXlsx(sheets);
-      res.writeHead(200, {
-        'content-type': format === 'csv'
-          ? 'text/csv; charset=utf-8'
-          : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'content-length': bytes.length,
-        'cache-control': 'no-store',
-        // 中文文件名必须用 RFC 5987 的 filename*，否则浏览器存下来是乱码
-        'content-disposition':
-          `attachment; filename="review-export.${format}"; filename*=UTF-8''${encodeURIComponent(name)}`,
-      });
-      return res.end(bytes);
-    }
-
-    /* ------------------------------ 导回人工结果 ------------------------------ */
-    /*
-     * POST /api/import-review?reviewer=X[&apply=1][&retractCleared=1]
-     * body = 导出的 xlsx / csv 原始字节（`x-file-name` 可选，仅用于回显）
-     *
-     * **两段式**：默认 dry-run，只回差异供人确认；真要落盘必须显式 `apply=1`。
-     * 能覆盖人工成果的功能，默认值就该是"不发生"。
-     */
-    if (p === '/api/import-review' && req.method === 'POST') {
-      const reviewer = safeReviewer(url.searchParams.get('reviewer'));
-      if (!reviewer) return json(res, 400, { error: '缺少或非法的 reviewer（1–40 位中英文/数字/. - _）' });
-      const apply = url.searchParams.get('apply') === '1';
-      const retractCleared = url.searchParams.get('retractCleared') === '1';
-
-      let bytes;
-      try { bytes = await readBinary(req, 64 * 1024 * 1024); }
-      catch (e) { return json(res, 400, { error: `读取上传内容失败：${e.message}` }); }
-      if (!bytes.length) return json(res, 400, { error: '上传内容为空' });
-
-      // 认格式：xlsx 本质是 ZIP（PK 头），其余按 CSV
-      const kind = bytes.subarray(0, 2).toString('latin1') === 'PK' ? 'xlsx' : 'csv';
-
-      let tables;
-      try { tables = readReviewTables(bytes, kind); }
-      catch (e) { return json(res, 400, { error: `解析失败：${e.message}` }); }
-      if (!tables.length) {
-        return json(res, 400, {
-          error: '文件里没有可识别的数据表（需要导出生成的那三张表，含 年份/研究/fieldPath 列）',
-        });
-      }
-
-      /*
-       * 验签。
-       *
-       * ⚠️ 这**不是**密码学校验——文件本来就要给人编辑，任何数据哈希都必然失效。
-       * 它解决的是**归属**：这份表是谁导出的、改动该记到谁名下。
-       * 没有签名（本次改动之前导出的文件）→ 放行但明确标注，由界面提示。
-       */
-      const allowMismatch = url.searchParams.get('allowMismatch') === '1';
-      const signature = readSignature(bytes, kind);
-      const signatureOk = signature ? verifySignature(signature) : false;
-      const signerMatches = Boolean(signature?.signer) && signature.signer === reviewer;
-
-      if (signature && !signatureOk && !allowMismatch) {
-        return json(res, 400, {
-          error: `文件签名校验和不符（署名块可能被表格软件改坏了）。署名写的是「${signature.signer ?? '（空）'}」。`
-            + '建议重新导出后再改；确实要按当前核对人写入，请勾选「忽略署名异常」。',
-          signature,
-        });
-      }
-      if (signatureOk && !signerMatches && !allowMismatch) {
-        return json(res, 400, {
-          error: `这份文件是「${signature.signer}」导出的，但你当前以「${reviewer}」身份导回。`
-            + `请把界面右上角「核对人」改成「${signature.signer}」（改动才记得到他名下）；`
-            + '若确认要按文件署名写入，请勾选「忽略署名异常」。',
-          signature,
-        });
-      }
-
-      /*
-       * **生效的核对人由署名决定**，不是界面输入框。
-       *
-       * 表里那一列本来就属于"导出人"——署名可信时，改动就该记到他名下。
-       * 界面输入框退化为"本次提交人"的角色，两者不一致时写进批次快照备查。
-       * 没有署名（旧版文件）或署名块已损坏时，才退回用界面上的核对人。
-       */
-      const effectiveReviewer = (signatureOk && signature?.signer) ? signature.signer : reviewer;
-
-      /*
-       * 只给**文件里出现过**的研究建字段索引——
-       * 全部年份的批量文件有两百多篇，全量建索引会白读几百兆 JSON。
-       */
-      const index = new Map();
-      for (const pair of studyPairs(tables)) {
-        const [y, s] = pair.split('/');
-        if (!okYear(y) || !okStudy(s)) continue;
-        const built = await buildFieldGroups(y, s);
-        const ov = readAnnotation(y, s, effectiveReviewer);
-        const existing = new Map((ov?.entries ?? []).map((e) => [e.fieldPath, e]));
-
-        for (const g of built.groups ?? []) {
-          for (const f of g.fields ?? []) {
-            // 机器值：人工已改过时取 LLM 原值；空串即"机器本来没有"
-            const machineRaw = f.decidedBy === 'human' ? (f.llmRaw ?? '') : (f.raw ?? '');
-            const cur = existing.get(f.fieldPath);
-            index.set(`${y}/${s}::${f.fieldPath}`, {
-              machineRaw,
-              hasMachine: machineRaw !== '',
-              ...(cur ? {
-                existing: {
-                  raw: String(cur.value?.raw ?? ''),
-                  action: cur.action,
-                  ...(cur.note ? { note: cur.note } : {}),
-                },
-              } : {}),
-            });
-          }
-        }
-        // 覆盖层里有、字段视图里没有的（人工补录的行）也要能导回
-        for (const [fp, e] of existing) {
-          const key = `${y}/${s}::${fp}`;
-          if (index.has(key)) continue;
-          index.set(key, {
-            machineRaw: '',
-            hasMachine: false,
-            existing: { raw: String(e.value?.raw ?? ''), action: e.action, ...(e.note ? { note: e.note } : {}) },
-          });
-        }
-      }
-
-      const plan = planImport({ tables, reviewer: effectiveReviewer, index, retractCleared });
-      const stats = {
-        rows: plan.seen,
-        changes: plan.changes.length,
-        unchanged: plan.unchanged,
-        cleared: plan.cleared.length,
-        errors: plan.errors.length,
-      };
-      /** 署名信息随响应回传，界面要把它显眼地摆出来。 */
-      const sig = {
-        signature,
-        signatureOk,
-        signerMatches,
-        effectiveReviewer,
-        // 没签名的文件也要能导（本次改动之前导出的），但必须让人知道
-        warning: !signature
-          ? '这份文件没有签名（可能是旧版导出的），无法确认导出人，改动将按当前「核对人」记录。'
-          : (!signatureOk
-            ? '署名块校验和不符，署名不可信，改动将按当前「核对人」记录。'
-            : (!signerMatches
-              ? `文件署名是「${signature.signer}」，与当前核对人「${reviewer}」不同；改动将记到署名者「${signature.signer}」名下。`
-              : '')),
-      };
-
-      if (!apply) {
-        return json(res, 200, {
-          dryRun: true, kind, reviewer, stats, ...sig,
-          changes: plan.changes.slice(0, 300),
-          cleared: plan.cleared.slice(0, 100),
-          errors: plan.errors.slice(0, 100),
-          truncated: plan.changes.length > 300 || plan.errors.length > 100,
-        });
-      }
-
-      if (!plan.changes.length && !plan.cleared.length) {
-        return json(res, 200, {
-          ok: true, kind, reviewer, applied: 0, retracted: 0, batchId: null,
-          stats, ...sig, errors: plan.errors.slice(0, 100),
-        });
-      }
-
-      const fname = req.headers['x-file-name']
-        ? decodeURIComponent(String(req.headers['x-file-name'])) : '';
-      const result = applyReviewImport({
-        reviewer: effectiveReviewer,
-        changes: plan.changes,
-        cleared: plan.cleared,
-        meta: {
-          kind,
-          ...(fname ? { file: fname } : {}),
-          stats,
-          // 批次里同时留「文件署名」与「实际提交人」，署名对不上时能查
-          signature: signature ?? null,
-          signerMatches: signature ? signerMatches : null,
-          submittedBy: reviewer,
-        },
-      });
-      return json(res, 200, { ok: true, kind, reviewer, ...result, stats, errors: plan.errors.slice(0, 100) });
-    }
-
-    /* ------------------------------ 结果集与两组对比 ------------------------------ */
-    if (p === '/api/review-sets') {
-      if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
-      return json(res, 200, { year, study, sets: reviewSets(year, study) });
-    }
-
-    /*
-     *   GET  /api/adjudication?year=2025&study=2025-01
-     *     → 「金标准没要」的产物结局行 = 人工裁定队列（含证据与裁定状态）
-     *
-     *   POST /api/adjudication    { year, study, reviewer, rowIndex, decision, note? }
-     *     → decision: 'keep' | 'drop' | null（null = 撤销，回到"未裁定"）
-     *
-     * 覆盖率口径下这些行**不判错**，由人工决定留不留；裁定按核对人分开存，
-     * 分歧不替人裁决（保留并标出）。
-     */
-    if (p === '/api/adjudication' && req.method === 'GET') {
-      if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
-      const r = deferredOutcomeRows(year, study);
-      return json(res, 200, { year, study, ...r });
-    }
-
-    if (p === '/api/adjudication' && req.method === 'POST') {
-      let body;
-      try { body = await readBody(req); } catch (e) { return json(res, 400, { error: e.message }); }
-      const bYear = String(body?.year ?? '');
-      const bStudy = String(body?.study ?? '');
-      if (!studyOk(bYear, bStudy)) return json(res, 400, { error: 'year/study 参数非法' });
-      const reviewer = safeReviewer(body?.reviewer);
-      if (!reviewer) return json(res, 400, { error: '请先在右上角填写核对人标识（letters/numbers/中文，≤32 字）' });
-
-      const decision = body?.decision ?? null;
-      const written = setAdjudication(bYear, bStudy, reviewer, body?.rowIndex, decision, body?.note);
-      if (!written.ok) return json(res, 400, { error: written.error });
-
-      const after = deferredOutcomeRows(bYear, bStudy);
-      return json(res, 200, { ok: true, reviewer, decision, ...written, counts: after.counts, rows: after.rows });
-    }
-
-    /*
-     *   GET /api/compare?year=2019&study=2019-01&a=machine&b=reviewer:评审A
-     *
-     * 某一组没有的字段**不算"两边相同"**，单独计 onlyA / onlyB——
-     * 「没表态」和「表态说一样」是两件事。
-     */
-    if (p === '/api/compare') {
-      if (!studyOk(year, study)) return json(res, 400, { error: 'year/study 参数非法' });
-      const aId = url.searchParams.get('a') ?? 'machine';
-      const bId = url.searchParams.get('b') ?? '';
-      if (!bId) return json(res, 400, { error: '请给 a 与 b 两个结果集' });
-
-      const built = await buildFieldGroups(year, study);
-      if (!built.groups?.length) return json(res, 409, { error: built.warning ?? '该研究没有可比较的字段' });
-
-      const A = resolveSet(aId, year, study, built.groups);
-      const B = resolveSet(bId, year, study, built.groups);
-      if (!A) return json(res, 400, { error: `未知的结果集：${aId}` });
-      if (!B) return json(res, 400, { error: `未知的结果集：${bId}` });
-
-      const labels = labelIndex(built.groups);
-      const rows = [];
-      for (const fp of [...new Set([...A.keys(), ...B.keys()])].sort()) {
-        const av = A.get(fp);
-        const bv = B.get(fp);
-        rows.push({
-          fieldPath: fp,
-          label: labels.get(fp) ?? fp,
-          a: av?.raw ?? null,
-          b: bv?.raw ?? null,
-          status: av && bv ? (av.raw === bv.raw ? 'same' : 'diff') : (av ? 'only-a' : 'only-b'),
-        });
-      }
-      const count = (s) => rows.filter((r) => r.status === s).length;
-      const same = count('same');
-      const diff = count('diff');
-      return json(res, 200, {
-        year, study, a: aId, b: bId,
-        sets: reviewSets(year, study),
-        stats: {
-          total: rows.length, same, diff,
-          onlyA: count('only-a'), onlyB: count('only-b'),
-          // 一致率只在「两边都表过态」的字段上算——没表态的不该拉低它
-          rate: same + diff ? same / (same + diff) : null,
-        },
-        rows,
-      });
     }
 
     /* ------------------------------ 设置（API 配置） ------------------------------ */
@@ -2040,17 +974,14 @@ const server = createServer(async (req, res) => {
           provider: c.provider,
           baseUrl: c.baseUrl,
           model: c.model,
-          wireApi: c.wireApi,
-          reasoningEffort: c.reasoningSetting ?? null,
-          reasoningStages: c.reasoningStages,
           temperature: c.temperature,
           maxTokens: c.maxTokens,
-          crossrefMailto: c.crossrefMailto ?? '',
+          crossrefMailto: c.crossrefMailto,
           /** 只回显掩码；前端留空即"不修改" */
           apiKeyMasked: maskKey(c.apiKey),
           hasKey: Boolean(c.apiKey),
           /** 密钥来自环境变量时，界面上说明"改文件不生效" */
-          keyFromEnv: c.keyFromEnv,
+          keyFromEnv: Boolean(process.env.DEEPSEEK_API_KEY),
           configPath: CONFIG_FILE().replace(`${ROOT}${sep}`, ''),
         });
       }
@@ -2058,24 +989,8 @@ const server = createServer(async (req, res) => {
         const body = await readBody(req);
         const path = CONFIG_FILE();
         let cur = {};
-        if (existsSync(path)) { try { cur = JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')); } catch { cur = {}; } }
+        if (existsSync(path)) { try { cur = JSON.parse(readFileSync(path, 'utf8')); } catch { cur = {}; } }
         const next = { ...cur };
-        if (Object.hasOwn(body, 'reasoningEffort')) {
-          const effort = body.reasoningEffort;
-          if (effort === null) {
-            delete next.reasoningEffort;
-          } else if ((cur.wireApi ?? 'chat_completions') !== 'responses' || !REASONING_SETTINGS.includes(effort)) {
-            return json(res, 400, { error: 'Responses 思考强度可选择按字段分配、自动、低、中、高或极高' });
-          } else {
-            next.reasoningEffort = effort;
-          }
-        }
-        if (Object.hasOwn(body, 'reasoningStages')) {
-          if ((cur.wireApi ?? 'chat_completions') !== 'responses' || !validReasoningStages(body.reasoningStages)) {
-            return json(res, 400, { error: '各阶段思考强度需从自动、低、中、高或极高选择' });
-          }
-          next.reasoningStages = { ...readConfig().reasoningStages, ...body.reasoningStages };
-        }
         for (const k of ['provider', 'baseUrl', 'model', 'crossrefMailto']) {
           if (typeof body[k] === 'string' && body[k].trim()) next[k] = body[k].trim();
         }
@@ -2084,21 +999,20 @@ const server = createServer(async (req, res) => {
         }
         // 密钥：空字符串/缺省 = 保留原值（避免"只改模型"时把 key 抹掉）
         if (typeof body.apiKey === 'string' && body.apiKey.trim()) next.apiKey = body.apiKey.trim();
-        next._note ??= '本地私有配置。环境变量 AA_LLM_API_KEY / AA_LLM_MODEL 可覆盖 apiKey 与 model。';
+        next._note ??= '本地私有配置，不要提交/外发。也可用环境变量 DEEPSEEK_API_KEY / AA_LLM_MODEL 覆盖 apiKey 与 model。';
         mkdirSync(DIRS.runtime, { recursive: true });
         writeFileSync(path, JSON.stringify(next, null, 2), { encoding: 'utf8', mode: 0o600 });
         const c = readConfig();
         return json(res, 200, {
           ok: true,
-          baseUrl: c.baseUrl, model: c.model, reasoningEffort: c.reasoningSetting ?? null, reasoningStages: c.reasoningStages,
-          apiKeyMasked: maskKey(c.apiKey), hasKey: Boolean(c.apiKey),
+          baseUrl: c.baseUrl, model: c.model, apiKeyMasked: maskKey(c.apiKey), hasKey: Boolean(c.apiKey),
         });
       }
       return json(res, 405, { error: `不支持的方法 ${req.method}` });
     }
 
     /*
-     * 连通性测试：GET /models（不花 token）。
+     * 连通性测试：优先 GET /models（不花 token），失败再退回一次最小的 chat 调用。
      * 响应里**只回状态与耗时**，任何错误都过 redact()，绝不回显密钥。
      */
     if (p === '/api/settings/test' && req.method === 'POST') {
@@ -2110,17 +1024,12 @@ const server = createServer(async (req, res) => {
       if (!apiKey) return json(res, 400, { error: '尚未配置 API Key' });
       const t0 = Date.now();
       try {
-        const r = await fetch(`${baseUrl}/models`, {
-          headers: { ...c.httpHeaders, authorization: `Bearer ${apiKey}` },
-          signal: AbortSignal.timeout(15_000),
-        });
+        const r = await fetch(`${baseUrl}/models`, { headers: { authorization: `Bearer ${apiKey}` } });
         const text = await r.text();
         if (r.ok) {
           let ids = [];
-          try { ids = (JSON.parse(text).data ?? []).map((m) => m.id); } catch { /* 忽略 */ }
-          return json(res, 200, {
-            ok: true, via: '/models', ms: Date.now() - t0, models: ids.slice(0, 20), modelInList: ids.includes(model),
-          });
+          try { ids = (JSON.parse(text).data ?? []).map((m) => m.id).slice(0, 20); } catch { /* 忽略 */ }
+          return json(res, 200, { ok: true, via: '/models', ms: Date.now() - t0, models: ids, modelInList: ids.includes(model) });
         }
         return json(res, 200, {
           ok: false, via: '/models', status: r.status, ms: Date.now() - t0,
@@ -2175,21 +1084,8 @@ const server = createServer(async (req, res) => {
       if (!okYear(year)) return json(res, 400, { error: 'year 参数非法' });
       const hit = pdfPathOf(year, study);
       if (!hit) return json(res, 404, { error: `未找到 ${year} 下的 ${study}.pdf` });
-      /*
-       * MinerU 是外部 Python 环境，**不在安装包里**（数 GB）。
-       * 路径按平台区分：Windows 是 venv 的 `Scripts/mineru.exe`，mac/Linux 是 `bin/mineru`。
-       * 装没装都返回友好报错 —— 医生只做核对，本来就不需要这一步。
-       */
-      const mineru = process.platform === 'win32'
-        ? join(ROOT, 'runtime', 'mineru', 'Scripts', 'mineru.exe')
-        : join(ROOT, 'runtime', 'mineru', 'bin', 'mineru');
-      if (!existsSync(mineru)) {
-        return json(res, 500, {
-          error: `本机未安装 MinerU：${mineru}\n`
-            + '（解析需要外部 Python 环境，安装包里不带。医生核对已有结果不需要这一步；'
-            + '要自己导入新 PDF，请在开发机上解析后再把 build/mineru 拷过来）',
-        });
-      }
+      const mineru = join(ROOT, 'runtime', 'mineru', 'Scripts', 'mineru.exe');
+      if (!existsSync(mineru)) return json(res, 500, { error: `MinerU 未安装：${mineru}` });
       // 单篇解析：只把目标 PDF 放进暂存目录，避免整年重跑（MinerU 的 -p 只接受一个路径）
       const stage = join(ROOT, 'build', '_stage_web', year);
       mkdirSync(stage, { recursive: true });
@@ -2247,34 +1143,11 @@ const server = createServer(async (req, res) => {
   }
 });
 
-/*
- * 监听地址默认**只绑本机**。`AA_HOST=0.0.0.0` 时才对外，用于
- * "服务开在这台机器、让同事用浏览器访问"的场景（比如 Mac 上不想装 Node）。
- *
- * ⚠️ 这个服务**没有任何鉴权**，而且能写文件（核对记录、裁定、导入的 PDF）。
- *    绑到 0.0.0.0 等于把工作区敞开给同网段的任何人。
- *    只在**可信局域网**里临时这么做，用完就关。所以默认值必须是 127.0.0.1，
- *    并且真的对外监听时要在启动日志里把话说明白。
- */
-const HOST = process.env.AA_HOST ?? '127.0.0.1';
-const EXPOSED = HOST !== '127.0.0.1' && HOST !== 'localhost';
-
-server.listen(PORT, HOST, () => {
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`@aa/web API 已启动: http://127.0.0.1:${PORT}`);
   console.log(`  根目录: ${ROOT}`);
   console.log(`  前端页面: ${existsSync(DIST) ? `http://127.0.0.1:${PORT}/ （dist 已构建）` : '未构建，请先 pnpm web:build'}`);
   for (const [k, v] of Object.entries(DIRS)) {
     console.log(`  ${k.padEnd(9)} ${existsSync(v) ? '✓' : '✗'} ${v}`);
-  }
-  if (EXPOSED) {
-    /* 把同网段的访问地址直接打出来，省得对方问"我该输什么" */
-    const ips = Object.values(networkInterfaces()).flat()
-      .filter((i) => i && i.family === 'IPv4' && !i.internal)
-      .map((i) => i.address);
-    console.log('');
-    console.log(`  ⚠️ 已对外监听（AA_HOST=${HOST}）：同网段的机器可以访问，且能读改本工作区`);
-    for (const ip of ips) console.log(`     对方浏览器打开：http://${ip}:${PORT}/`);
-    if (!ips.length) console.log('     （没探测到局域网 IP，用 ipconfig / ifconfig 看一下）');
-    console.log('     本服务**没有鉴权**，用完请关掉；别在公共网络上这么开。');
   }
 });

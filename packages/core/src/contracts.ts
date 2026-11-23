@@ -1,4 +1,3 @@
-import type { MeasurementUnitNormalization } from './measurement-units.js';
 /**
  * @aa/core — 证据、字段与三层抽取结果的核心契约
  *
@@ -57,8 +56,6 @@ export interface Evidence {
   quote: string;
   /** 来源块 id，用于回溯到解析产物（如 MinerU content_list 下标或 block_id） */
   blockId?: string;
-  /** 结构化表格网格中的 1-based 行和列。 */
-  tableCell?: { row: number; column: number; heading?: string; groupHeadings?: readonly string[] };
   /** 外部来源时给出标识（如 DOI） */
   externalId?: string;
 }
@@ -84,9 +81,6 @@ export interface FieldValue<T = string> {
   raw: string;
   /** 归一化后的值（如编码 "1" / "2/5"）。无法确定时为 undefined */
   code?: string;
-  /** Evidence-preserving spelling/percentage normalization; raw remains unchanged. */
-  normalized?: string;
-  unitStatus?: MeasurementUnitNormalization['status'];
   /** code 的含义说明 */
   legend?: string;
   /** 支撑证据，至少一条；空数组视为未解析 */
@@ -144,17 +138,7 @@ export interface CategoryCounts {
  * 而扁平键更稳。两者的转换由 outcome SKILL 的 `TIMEPOINT_FIELD_MAP` 负责。
  */
 export interface OutcomeLevel {
-  /** 数值层按 11 月规则优先采用的结果形态。 */
-  preferredResult?: 'postTreatment' | 'betweenGroupDifference' | 'prePost';
   studyId: string;
-  /** 上游计划的比较组身份，用于限定结果归属及审计回填。 */
-  comparisonScope?: {
-    id: string;
-    interventionId: string;
-    controlId: string;
-    intervention: string;
-    control: string;
-  };
   /** 文献编号 + 结局序号，如 EN009-1（金标准 Sheet3 的 STUDYID 列实为此意） */
   literatureCode?: FieldValue;
   /** ARMNU：多试验组/多对照组时的组别号 */
@@ -172,6 +156,7 @@ export interface OutcomeLevel {
     measurementType?: FieldValue;
     baselineAdjusted?: FieldValue;
     primaryOutcomeTimepoint?: FieldValue;
+    specialCategory?: FieldValue;
   };
   followUp?: {
     description?: FieldValue;
@@ -294,8 +279,6 @@ export interface ComparisonLevel {
   typeOfData?: FieldValue;
   priorAcupuncture?: FieldValue;
   randomizedN?: FieldValue;
-  /** 该比较组两臂在主要结局时点的样本量合计。 */
-  analyzedN?: FieldValue;
   /** 试验组在主要结局时点的样本量（金标准列名 randomized_n_experimental） */
   randomizedNExperimental?: FieldValue;
   /** 对照组在主要结局时点的样本量（金标准列名 randomized_n_control） */
@@ -309,31 +292,8 @@ export interface ComparisonLevel {
   missingDataReported?: FieldValue;
   primaryAnalysis?: FieldValue;
   missingDataHandling?: FieldValue;
-  missingData?: MissingDataAssessment;
   /** 未在此枚举中的额外字段（保住不丢信息） */
   extra?: Readonly<Record<string, FieldValue>>;
-}
-
-export interface MissingDataFrame {
-  role: 'experimental' | 'control' | 'overall';
-  group?: FieldValue;
-  outcome?: FieldValue;
-  time?: FieldValue;
-  population?: FieldValue;
-  primary?: FieldValue;
-  counts: Partial<Record<'randomized' | 'observed' | 'analyzed' | 'imputed' | 'dropout' | 'missing', FieldValue>>;
-  reportedRatio?: FieldValue;
-  derivedRatio?: FieldValue;
-  basis?: 'reported_missing_count' | 'randomized_minus_observed';
-  status: 'supported' | 'needs_review' | 'insufficient';
-  issues: string[];
-}
-export interface MissingDataAssessment {
-  reportedRatio?: FieldValue;
-  originalRatio?: FieldValue;
-  derivedRatio?: FieldValue;
-  frames: MissingDataFrame[];
-  issues: string[];
 }
 
 /** 文章级抽取结果。 */

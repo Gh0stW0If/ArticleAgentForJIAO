@@ -8,13 +8,8 @@
     "rewriteRelativeImportExtensions": true,
     "outDir": "./dist",
     "rootDir": "./src",
-    "paths": {
-      "@aa/core": ["./packages/core/dist/index.d.ts"],
-      "@aa/crossref": ["./packages/crossref/dist/index.d.ts"],
-      "@aa/europepmc": ["./packages/europepmc/dist/index.d.ts"]
-    },
-    "types": ["node"],
-    "lib": ["ES2022", "DOM"]
+    "paths": {},
+    "types": ["node"]
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/__tests__/**"]

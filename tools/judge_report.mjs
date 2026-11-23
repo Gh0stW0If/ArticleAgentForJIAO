@@ -15,19 +15,17 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { judgeCachePath, VERDICT_LABEL } from './lib/judge.mjs';
-import { loadLlmConfig } from './lib/llm-config.mjs';
+import { VERDICT_LABEL } from './lib/judge.mjs';
 
-const ROOT = process.env.AA_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const cfg = loadLlmConfig(ROOT, { optional: true });
-const CACHE = judgeCachePath(ROOT, { ...cfg, model: cfg.reviewModel });
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const CACHE = join(ROOT, 'build', 'judge-cache.json');
 
 const argv = process.argv.slice(2);
 const onlyVerdict = argv.includes('--verdict') ? argv[argv.indexOf('--verdict') + 1] : null;
 const asMd = argv.includes('--md');
 
 if (!existsSync(CACHE)) {
-  console.error('当前评审模型没有判定缓存，请先运行 pnpm llm:eval');
+  console.error('缺少 build/judge-cache.json：请先跑一次 pnpm llm:eval（会生成判定缓存）');
   process.exit(2);
 }
 

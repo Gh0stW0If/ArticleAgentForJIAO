@@ -22,7 +22,6 @@
 
 import {
   type FieldValue,
-  type GroupStats,
   type Issue,
   type OutcomeLevel,
   type Skill,
@@ -33,16 +32,20 @@ import {
 } from '@aa/core';
 import { PROMPTS } from './prompts.generated.ts';
 import { collectMaterials } from './materials.ts';
-import { groundField, numericTokens, type RawFieldClaim } from './grounding.ts';
-import { intervalProblem, reportedNumber } from './timepoints.ts';
+import { groundField, type RawFieldClaim } from './grounding.ts';
+
+/** 时点块内的键（与 outcome SKILL 的 TIMEPOINT_FIELD_MAP 同名）。 */
+const TIMEPOINT_KEYS = new Set([
+  'estimateType', 'varianceType', 'experimentalEstimate', 'experimentalCiLower', 'experimentalCiUpper',
+  'experimentalN', 'controlEstimate', 'controlCiLower', 'controlCiUpper', 'controlN',
+  'experimentalEvents', 'controlEvents', 'differenceEstimate', 'differenceCiLower', 'differenceCiUpper',
+]);
 
 const TIMEPOINT_JSON = new Set(['baseline', 'endOfTreatment', 'followUpEnd']);
 
 /** 一条待补/待核的记录。 */
 interface AuditItem {
   outcomeName: string;
-  outcomeId?: string;
-  source?: RawFieldClaim['source'];
   timepoint?: string;
   field: string;
   value: string;
@@ -93,8 +96,6 @@ export function createOutcomeAuditSkill(opts: OutcomeAuditOptions): Skill<Outcom
         return { skillId: skill.id, level: 'cross-cutting', payload: { checkResults, filled, reported, summaryChars: 0 }, unresolved, issues };
       }
 
-      const auditIds = list.map((row, index) => `${row.comparisonScope?.id ?? row.studyId}:${index + 1}`);
-
       /* ---------------- ① 确定性核查 ---------------- */
 
       const checklist: string[] = [];
@@ -122,7 +123,7 @@ export function createOutcomeAuditSkill(opts: OutcomeAuditOptions): Skill<Outcom
               checkResults.push({ code: 'AUDIT_MISSING_N', path: `outcomes[${i}].${tp}.${side}.n`, message: m });
               checklist.push(`· 结局「${name}」${tp}：缺 ${side === 'experimental' ? '试验组' : '对照组'}例数（多在正文里）`);
             }
-            if (cont.varianceType?.code === '2' && has('ciLower') !== has('ciUpper')) {
+            if (has('ciLower') !== has('ciUpper')) {
               const m = `结局「${name}」${tp}.${side}：95%CI 只填了一半`;
               issues.push(warn(m, 'AUDIT_CI_INCOMPLETE', { path: `outcomes[${i}].${tp}.${side}` }));
               checkResults.push({ code: 'AUDIT_CI_INCOMPLETE', path: `outcomes[${i}].${tp}.${side}`, message: m });
@@ -139,7 +140,6 @@ export function createOutcomeAuditSkill(opts: OutcomeAuditOptions): Skill<Outcom
         pages: [1],
         tables: true,
         figures: false,
-        numberTableCells: true,
         maxCharsPerBlock: 6000,
         ...(opts.maxTotalChars !== undefined ? { maxTotalChars: opts.maxTotalChars } : {}),
       });
@@ -149,17 +149,18 @@ export function createOutcomeAuditSkill(opts: OutcomeAuditOptions): Skill<Outcom
         const name = o.outcome?.name?.raw ?? '(未命名)';
         const ins = o.outcome?.instrument?.raw ?? '';
         const tps = Object.entries(o.timepoints ?? {}).map(([tp, block]) => {
-          const continuous = block?.continuous;
-          const show = (side: 'experimental' | 'control'): string => {
-            const entries = Object.entries({ ...continuous?.[side], ...block?.binary?.[side] });
-            const parts = entries.filter(([, value]) => value?.raw).map(([key, value]) => `${key}=${value.raw}`);
+          const cont = (block?.continuous ?? {}) as Record<string, FieldValue>;
+          const show = (side: string): string => {
+            const g = cont[side] as Record<string, FieldValue> | undefined;
+            if (!g) return `${side}: -`;
+            const parts = Object.entries(g)
+              .filter(([, v]) => v?.raw)
+              .map(([k, v]) => `${k}=${v.raw}`);
             return `${side}: ${parts.join(' ') || '-'}`;
           };
-          return `    ${tp} (varianceType=${continuous?.varianceType?.code ?? '?'}): ${show('experimental')} | ${show('control')}`;
+          return `    ${tp}: ${show('experimental')} | ${show('control')}`;
         });
-        const pair = o.comparisonScope;
-        const scope = pair ? ` (${pair.intervention} vs ${pair.control})` : '';
-        return `  [outcomeId=${auditIds[i]}] ${name}${ins ? ` / ${ins}` : ''}${scope}\n${tps.join('\n')}`;
+        return `  [${i + 1}] ${name}${ins ? ` / ${ins}` : ''}\n${tps.join('\n')}`;
       }).join('\n');
 
       const user =
@@ -174,7 +175,7 @@ export function createOutcomeAuditSkill(opts: OutcomeAuditOptions): Skill<Outcom
       let suspects: AuditItem[] = [];
       try {
         const res = await ctx.llm.invoke({
-          system: PROMPTS.outcomeAudit + '\n每条差异原样返回摘要的 outcomeId。表格差异返回 source={block,row,column}，行列从 1 开始。varianceType 为 1 或 3 时，ciLower 存单个 SE/SD，ciUpper 无需填写。只在同一结局、组别、时点及估计口径下报告 CI 或例数。',
+          system: PROMPTS.outcomeAudit,
           user,
           temperature: 0,
           tag: `${skill.id}@${skill.version}:${ctx.doc.articleId}`,
@@ -185,8 +186,6 @@ export function createOutcomeAuditSkill(opts: OutcomeAuditOptions): Skill<Outcom
             .filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === 'object')
             .map((x) => ({
               outcomeName: String(x.outcomeName ?? ''),
-              ...(x.outcomeId ? { outcomeId: String(x.outcomeId) } : {}),
-              ...(x.source && typeof x.source === 'object' ? { source: x.source as NonNullable<RawFieldClaim['source']> } : {}),
               ...(x.timepoint ? { timepoint: String(x.timepoint) } : {}),
               field: String(x.field ?? ''),
               value: String(x.value ?? ''),
@@ -206,105 +205,88 @@ export function createOutcomeAuditSkill(opts: OutcomeAuditOptions): Skill<Outcom
 
       /* ---------------- 落地：能补的空位补上，其余只报告 ---------------- */
 
-      /** 新响应使用行 ID，旧响应仅允许唯一且精确的结局名称。 */
+      /** 找到该结局在已抽取列表里的下标（按名称/工具模糊匹配）。 */
       const findIndex = (item: AuditItem): number => {
-        if (item.outcomeId) return auditIds.indexOf(item.outcomeId);
-        const norm = (value: string): string => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
-        const expected = norm(item.outcomeName);
-        if (!expected) return -1;
-        const matched = list.flatMap((row, index) => {
-          const name = row.outcome?.name?.raw ?? '';
-          const instrument = row.outcome?.instrument?.raw ?? '';
-          return [name, instrument, name + instrument].some(label => norm(label) === expected) ? [index] : [];
+        const norm = (s: string): string => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+        const needle = norm(item.outcomeName);
+        if (!needle) return -1;
+        let best = -1;
+        let bestScore = 0;
+        list.forEach((o, i) => {
+          const hay = norm(`${o.outcome?.name?.raw ?? ''} ${o.outcome?.instrument?.raw ?? ''}`);
+          if (!hay) return;
+          if (hay.includes(needle) || needle.includes(hay)) {
+            const score = Math.min(hay.length, needle.length);
+            if (score > bestScore) { bestScore = score; best = i; }
+          }
         });
-        return matched.length === 1 ? matched[0]! : -1;
-      };
-
-      type Proposal = { item: AuditItem; idx: number; tp: string; candidate: FieldValue };
-      const pendingIntervals = new Map<GroupStats, { lower: Proposal[]; upper: Proposal[] }>();
-      const report = (item: AuditItem, idx: number, tp: string | undefined, reason: string) => {
-        reported.push({ outcomeIndex: idx >= 0 ? idx : null, field: tp ? `${tp}.${item.field}` : item.field, value: item.value, reason });
-      };
-      const applied = ({ item, idx, tp, candidate }: Proposal) => {
-        filled.push({ outcomeIndex: idx, timepoint: tp, field: item.field, value: item.value });
-        issues.push(warn(`已补漏：结局「${item.outcomeName}」${tp}.${item.field} = ${item.value}`,
-          'AUDIT_FILLED', { path: `outcomes[${idx}].${tp}.${item.field}`, evidence: candidate.evidence }));
+        return best;
       };
 
       const applyItem = (item: AuditItem, isSuspect: boolean): void => {
         const idx = findIndex(item);
-        const tp = item.timepoint && TIMEPOINT_JSON.has(item.timepoint)
-          ? item.timepoint as keyof NonNullable<OutcomeLevel['timepoints']> : undefined;
-        const grounded = groundField(ctx.doc, `outcomeAudit.${item.field}`,
-          { value: item.value, quote: item.quote, ...(item.source ? { source: item.source } : {}),
-            ...(item.confidence !== undefined ? { confidence: item.confidence } : {}) },
-          { kinds: ['text', 'title', 'table'] });
+        const grounded = groundField(
+          ctx.doc,
+          `outcomeAudit.${item.field}`,
+          { value: item.value, quote: item.quote, ...(item.confidence !== undefined ? { confidence: item.confidence } : {}) } as RawFieldClaim,
+          { kinds: ['text', 'title', 'table'] },
+        );
+
         if (grounded.unresolved) {
           unresolved.push(grounded.unresolved);
-          report(item, idx, tp, 'quote 无法定位，未采用');
+          reported.push({ outcomeIndex: idx >= 0 ? idx : null, field: item.field, value: item.value, reason: 'quote 无法定位，未采用' });
           return;
         }
         if (!grounded.field) return;
-        if (idx < 0) {
-          report(item, idx, tp, '未唯一匹配到对应结局及比较组');
-          return;
+
+        const tp = item.timepoint && TIMEPOINT_JSON.has(item.timepoint) ? item.timepoint : undefined;
+
+        // 目标位置：时点块内的键 → 该结局该时点该组该叶；否则按结局级键处理
+        if (idx >= 0 && tp && TIMEPOINT_KEYS.has(item.field)) {
+          const target = list[idx]!;
+          const block = (target.timepoints as unknown as Record<string, { continuous?: Record<string, unknown> }> | undefined)?.[tp];
+          const cont = block?.continuous as Record<string, { experimental?: Record<string, FieldValue>; control?: Record<string, FieldValue> }> | undefined;
+          const side = item.field.startsWith('experimental') ? 'experimental' : item.field.startsWith('control') ? 'control' : null;
+          const leaf = side === 'experimental' ? item.field.slice('experimental'.length)
+            : side === 'control' ? item.field.slice('control'.length) : item.field;
+          const leafKey = leaf.charAt(0).toLowerCase() + leaf.slice(1);
+          const sideMap = side && cont ? (cont[side] as unknown as Record<string, FieldValue> | undefined) : undefined;
+          const slot = sideMap?.[leafKey];
+
+          if (slot?.raw && !/^(NR|NA)$/i.test(slot.raw)) {
+            // 已有值 → 绝不静默改写，只作为疑点报告
+            reported.push({
+              outcomeIndex: idx,
+              field: `${tp}.${item.field}`,
+              value: item.value,
+              reason: isSuspect ? '与原值不符（原值已保留）' : '该位置已有值，未覆盖',
+            });
+            return;
+          }
+          if (cont && side) {
+            if (!cont[side]) cont[side] = {};
+            (cont[side] as unknown as Record<string, FieldValue>)[leafKey] = grounded.field;
+            filled.push({ outcomeIndex: idx, timepoint: tp, field: item.field, value: item.value });
+            issues.push(warn(
+              `已补漏：结局「${item.outcomeName}」${tp}.${item.field} = ${item.value}`,
+              'AUDIT_FILLED',
+              { path: `outcomes[${idx}].${tp}.${item.field}`, evidence: grounded.field.evidence },
+            ));
+            return;
+          }
         }
-        const match = /^(experimental|control)(CiLower|CiUpper|N)$/.exec(item.field);
-        const cont = tp ? list[idx]!.timepoints?.[tp]?.continuous : undefined;
-        const side = match?.[1] as 'experimental' | 'control' | undefined;
-        const group = side ? cont?.[side] : undefined;
-        const leaf = match?.[2] === 'N' ? 'n' : match?.[2] === 'CiLower' ? 'ciLower' : 'ciUpper';
-        if (!tp || !group || isSuspect || !match) {
-          report(item, idx, tp, '需人工核对');
-          return;
-        }
-        const slot = group[leaf];
-        if (slot?.raw && !/^(NR|NA|NE)$/i.test(slot.raw)) {
-          report(item, idx, tp, '该位置已有值，未覆盖');
-          return;
-        }
-        const source = grounded.field.evidence[0];
-        const estimate = group.estimate?.evidence[0];
-        const value = reportedNumber(grounded.field);
-        const sameCell = source?.kind === 'table' && estimate?.kind === 'table'
-          && source.tableCell?.row !== undefined && source.tableCell.row === estimate.tableCell?.row
-          && source.tableCell.column === estimate.tableCell.column;
-        const sameExcerpt = source?.kind === 'text' && estimate?.kind === 'text' && source.quote === estimate.quote;
-        const scoped = source && estimate && value !== undefined && numericTokens(source.quote).includes(value)
-          && source.blockId === estimate.blockId && source.page === estimate.page && (sameCell || sameExcerpt);
-        const proposal = { item, idx, tp, candidate: grounded.field };
-        if (scoped && leaf === 'n' && sameCell && Number(/\bn\s*=\s*(\d+)\b/i.exec(source.quote)?.[1]) === value && value > 0) {
-          group.n = grounded.field;
-          applied(proposal);
-        } else if (scoped && leaf !== 'n' && cont?.varianceType?.code === '2') {
-          const entry = pendingIntervals.get(group) ?? { lower: [], upper: [] };
-          entry[leaf === 'ciLower' ? 'lower' : 'upper'].push(proposal);
-          pendingIntervals.set(group, entry);
-        } else {
-          report(item, idx, tp, '缺少同一时点、组别和统计量的证据，交人工确认');
-        }
+
+        // 兜底：找不到确切位置 → 只报告
+        reported.push({
+          outcomeIndex: idx >= 0 ? idx : null,
+          field: `${tp ? `${tp}.` : ''}${item.field}`,
+          value: item.value,
+          reason: idx < 0 ? '未匹配到对应结局' : '该字段不支持自动回填，交人工确认',
+        });
       };
 
       for (const g of gaps) applyItem(g, false);
       for (const s of suspects) applyItem(s, true);
-      const estimateWithInterval = /([−–+-]?\d+(?:\.\d+)?)\s*(?:[,;]?\s*(?:95\s*%\s*(?:CI|confidence interval))\s*)?[([]\s*([−–+-]?\d+(?:\.\d+)?)\s*(?:to|[,–—]|\s+-\s+)\s*([−–+-]?\d+(?:\.\d+)?)\s*[)\]]/gi;
-      for (const [group, { lower, upper }] of pendingIntervals) {
-        const lo = lower[0];
-        const hi = upper[0];
-        const candidateLower = lo?.candidate ?? group.ciLower;
-        const candidateUpper = hi?.candidate ?? group.ciUpper;
-        const expected = [group.estimate, candidateLower, candidateUpper].map(reportedNumber);
-        const quoted = group.estimate?.evidence[0]?.quote ?? '';
-        const matchingTuple = [...quoted.matchAll(estimateWithInterval)].some(match =>
-          match.slice(1).every((part, index) => Number(part.replace(/[−–]/g, '-')) === expected[index]));
-        if (lower.length > 1 || upper.length > 1 || !matchingTuple
-            || intervalProblem(group.estimate, candidateLower, candidateUpper, true)) {
-          for (const { item, idx, tp } of [...lower, ...upper]) report(item, idx, tp, '置信区间的边界或来源无法唯一确认');
-          continue;
-        }
-        if (lo) { group.ciLower = lo.candidate; applied(lo); }
-        if (hi) { group.ciUpper = hi.candidate; applied(hi); }
-      }
 
       return {
         skillId: skill.id,

@@ -53,7 +53,7 @@ export const SHEET3_COLUMNS = [
 export const SHEET3_TOP_MAP = {
   STUDYID: 'literature_code',
   ARMNU: 'arm_number',
-  // STDATA（Sheet3 E 列「特殊数据情况」）已退役 —— 见 RETIRED_FIELDS
+  STDATA: 'special_data_flag',
   CONST: 'outcome.construct_code',
   SUBCONST: 'outcome.subconstruct_code',
   PVALRAG: 'outcome.p_value_range',
@@ -66,7 +66,7 @@ export const SHEET3_TOP_MAP = {
   MTYPE: 'outcome.measurement_type',
   IFADJ: 'outcome.baseline_adjusted',
   POTIMPO: 'outcome.primary_outcome_timepoint',
-  // SPECO（Sheet3 R 列「结局特殊类别」）已退役 —— 见 RETIRED_FIELDS
+  SPECO: 'outcome.special_category',
   FOLTIM: 'follow_up.description',
   FOLTIMN: 'follow_up.value',
   FOLTIMU: 'follow_up.unit',
@@ -124,8 +124,7 @@ export const ARTICLE_FIELDS = [
   { key: 'literature_no', labels: ['文献编号'] },
   { key: 'extractor', labels: ['提取人姓名'] },
   { key: 'outliers_influential', labels: ['outliers and influential observations'] },
-  // 已退役（202609 规则 Sheet1 F 列）——见 tools/canonical-field-map.mjs 的 RETIRED_FIELDS
-  // { key: 'eligibility_check', labels: ['复核合格标准'] },
+  { key: 'eligibility_check', labels: ['复核合格标准'] },
   { key: 'title', labels: ['题目'] },
   { key: 'publication_year', labels: ['发表年份'] },
   { key: 'language', labels: ['文献语言'] },
@@ -172,15 +171,13 @@ export const COMPARISON_FIELDS = [
   { key: 'frequency_desc', labels: ['治疗频次描述（标明单位）'] },
   { key: 'frequency_value', labels: ['治疗频次数值'] },
   { key: 'frequency_unit', labels: ['治疗频次单位'] },
-  // 已退役（202609 规则 Sheet1 AW 列）——见 RETIRED_FIELDS
-  // { key: 'frequency_class', labels: ['治疗频次分类'] },
+  { key: 'frequency_class', labels: ['治疗频次分类'] },
   { key: 'course_desc', labels: ['疗程（单位：天）'] },
   { key: 'course_value', labels: ['疗程数值'] },
   { key: 'course_unit', labels: ['疗程单位'] },
   { key: 'total_sessions', labels: ['治疗总次数'] },
-  // 已退役（202609 规则 Sheet1 BB / BC 列）——见 RETIRED_FIELDS
-  // { key: 'total_sessions_class_a', labels: ['治疗总次数治疗分类'] },
-  // { key: 'total_sessions_class_b', labels: ['治疗总次数分类'] },
+  { key: 'total_sessions_class_a', labels: ['治疗总次数治疗分类'] },
+  { key: 'total_sessions_class_b', labels: ['治疗总次数分类'] },
   { key: 'deqi', labels: ['得气'] },
   { key: 'insertion_depth_text', labels: ['进针深度 （单位：毫米, mm）'] },
   { key: 'insertion_depth_class', labels: ['进针深度分类'] },
@@ -188,8 +185,7 @@ export const COMPARISON_FIELDS = [
   { key: 'needle_retention_desc', labels: ['留针时间 (单位：分钟, min）'] },
   { key: 'needle_retention_value', labels: ['留针时间数值（留针时间）'] },
   { key: 'needle_retention_unit', labels: ['留针时间单位（留针时间）'] },
-  // 已退役（202609 规则 Sheet1 BK 列）——见 RETIRED_FIELDS
-  // { key: 'needle_retention_class', labels: ['留针时间分类'] },
+  { key: 'needle_retention_class', labels: ['留针时间分类'] },
   { key: 'needle_count_text', labels: ['针的数目（腧穴）'] },
   { key: 'needle_count_min', labels: ['使用最少针数目'] },
   { key: 'post_insertion_manipulation', labels: ['进针后针刺操作分类'] },
