@@ -50,6 +50,12 @@ interface ViewerProps {
   highlights?: Highlight[];
   showBlocks: boolean;
   mode: SelectMode;
+  /**
+   * 界面缩放倍数（字体档位带来的 CSS `zoom`）。
+   * 只影响**鼠标坐标换算**——见 PageCanvas.relPos：Chromium 的 gBCR 返回的是
+   * 缩放后坐标，不除会导致框选证据整体错位。默认 1。
+   */
+  uiZoom?: number;
   /** 滚到这一页（字段定位时用）；变化即触发滚动 */
   focusPage?: number | undefined;
   focusToken?: number;
@@ -80,7 +86,7 @@ function displaySize(meta: MiniDocPageMeta, scale: number): { width: number; hei
 
 /** 单页：占位 + 惰性 canvas + 叠加层 + 框选。 */
 function PageCanvas({
-  pdf, meta, blocks, scale, visible, highlights, showBlocks, mode, onSelect, onVisible,
+  pdf, meta, blocks, scale, visible, highlights, showBlocks, mode, uiZoom, onSelect, onVisible,
 }: {
   pdf: PDFDocumentProxy;
   meta: MiniDocPageMeta;
@@ -90,6 +96,8 @@ function PageCanvas({
   highlights: Highlight[];
   showBlocks: boolean;
   mode: SelectMode;
+  /** 界面缩放（字体档位带来的 CSS zoom）。见 relPos 的说明。 */
+  uiZoom: number;
   onSelect(sel: Selection | null): void;
   onVisible(page: number): void;
 }) {
@@ -127,25 +135,58 @@ function PageCanvas({
     return () => { cancelled = true; task?.cancel(); };
   }, [pdf, meta.page, scale, visible]);
 
+  /**
+   * 鼠标位置 → **页面局部 CSS px**。
+   *
+   * ⚠️ 必须除以 `uiZoom`：界面「字体大小」是用 CSS `zoom` 实现的，
+   * 而 Chromium 的 `getBoundingClientRect()` 返回的是**已经缩放过的**坐标，
+   * clientX 也在同一套（缩放后）坐标里。两者相减得到的是"缩放后的局部偏移"，
+   * 不除就会比真实页面 px 大 zoom 倍 —— 框选反算出的证据框会整体错位。
+   *
+   * 缩放倍数由 App 算好传进来，这里不读 localStorage，组件保持纯粹。
+   */
   const relPos = useCallback((e: React.MouseEvent): { x: number; y: number } => {
     const rect = wrapRef.current?.getBoundingClientRect();
     if (!rect) return { x: 0, y: 0 };
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
-  }, []);
+    return { x: (e.clientX - rect.left) / uiZoom, y: (e.clientY - rect.top) / uiZoom };
+  }, [uiZoom]);
 
-  const finishDrag = () => {
-    if (!drag) return;
-    if (drag.width < 4 || drag.height < 4) { setDrag(null); onSelect(null); return; }
-    const bbox = screenToBbox(drag, geom) as [number, number, number, number];
+  /** 用「起点 + 终点」收尾（终点来自鼠标事件，可能落在页外）。 */
+  const finishAt = useCallback((start: Rect, end: { x: number; y: number }) => {
+    const rect = rectFromPoints(start.x, start.y, end.x, end.y);
+    if (rect.width < 4 || rect.height < 4) { setDrag(null); onSelect(null); return; }
+    const bbox = screenToBbox(rect, geom) as [number, number, number, number];
     const hits: Hit[] = blocks
       .filter((b) => b.bbox)
-      .map((b) => ({ block: b, ratio: overlapRatio(drag, bboxToScreen(b.bbox as Bbox, geom)) }))
+      .map((b) => ({ block: b, ratio: overlapRatio(rect, bboxToScreen(b.bbox as Bbox, geom)) }))
       .filter((x) => x.ratio > 0.15)
       .sort((a, b) => b.ratio - a.ratio)
       .slice(0, 8);
     onSelect({ page: meta.page, bbox, hits, quote: composeQuote(hits), mode });
     setDrag(null);
-  };
+  }, [geom, blocks, meta.page, mode, onSelect]);
+
+  /*
+   * 结束框选：**mouseup 才算数，且监听挂在 window 上**。
+   *
+   * 不用 `onMouseLeave` 收尾，实测它有两个坑：
+   *   1. 指针**还在页内**时就会误触发（拖拽矩形每次重渲染都会干扰 React 的 leave 判定）——
+   *      日志实测：mouseleave 在终点 (647,522)、而页框是 19..804 / 209..1255，明明在里面；
+   *   2. 它只能拿"最后一次 mousemove 存下的 state"收尾，追不上真实位置，
+   *      框出来比手画的短一截（zoom 1.2 下稳定停在 8 步里的第 7 步）。
+   *
+   * 挂 window 还顺带覆盖了"在页面外松开"的情况：终点坐标照样取自事件本身。
+   */
+  useEffect(() => {
+    if (!drag) return;
+    const onUp = (ev: MouseEvent) => {
+      const r = wrapRef.current?.getBoundingClientRect();
+      if (!r) return;
+      finishAt(drag, { x: (ev.clientX - r.left) / uiZoom, y: (ev.clientY - r.top) / uiZoom });
+    };
+    window.addEventListener('mouseup', onUp);
+    return () => window.removeEventListener('mouseup', onUp);
+  }, [drag, uiZoom, finishAt]);
 
   return (
     <div
@@ -166,12 +207,11 @@ function PageCanvas({
       }}
       onMouseMove={(e) => {
         if (!drag) return;
-        const rect = wrapRef.current?.getBoundingClientRect();
-        if (!rect) return;
-        setDrag(rectFromPoints(drag.x, drag.y, e.clientX - rect.left, e.clientY - rect.top));
+        const p = relPos(e);
+        setDrag(rectFromPoints(drag.x, drag.y, p.x, p.y));
       }}
-      onMouseUp={finishDrag}
-      onMouseLeave={() => drag && finishDrag()}
+      onMouseUp={() => { /* 由 window 监听收尾，避免在页外松开时丢失 */ }}
+      onMouseLeave={() => { /* 收尾统一交给 window 的 mouseup，见上面的 useEffect */ }}
       onMouseEnter={() => onVisible(meta.page)}
     >
       {!drawn && (
@@ -241,7 +281,8 @@ function PageCanvas({
 }
 
 export function PdfViewer({
-  pdf, doc, scale, highlights = [], showBlocks, mode, focusPage, focusToken = 0, onSelect, onPageChange,
+  pdf, doc, scale, highlights = [], showBlocks, mode, focusPage, focusToken = 0, uiZoom = 1,
+  onSelect, onPageChange,
 }: ViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   /** 每页是否处于"渲染窗口"（可见页 ± 1） */
@@ -322,6 +363,7 @@ export function PdfViewer({
           highlights={highlights.filter((h) => h.page === meta.page)}
           showBlocks={showBlocks}
           mode={mode}
+          uiZoom={uiZoom}
           onSelect={onSelect}
           onVisible={() => { /* 进入页面：并入渲染窗口 */ setWindowPages((p) => new Set(p).add(meta.page)); }}
         />

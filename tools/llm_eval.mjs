@@ -28,7 +28,8 @@ import { fileURLToPath } from 'node:url';
 import { camelToSnake } from './lib/keys.mjs';
 import { numericEqual, quantityEqual } from '../packages/core/dist/index.js';
 import { judgePairs, VERDICT_LABEL, VERDICT_WEIGHT } from './lib/judge.mjs';
-import { normText, normNum, tokensOf, dice, outcomeSimilarity, alignOutcomes, MIN_SCORE } from './lib/align.mjs';
+import { loadLlmConfig } from './lib/llm-config.mjs';
+import { normText, normNum, tokensOf, dice, outcomeSimilarity, alignOutcomes, MIN_SCORE, isOutcomeCandidate } from './lib/align.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -331,6 +332,56 @@ function countFieldLeaves(node) {
   return n;
 }
 
+/**
+ * 覆盖率口径下的**候选边**：名字像（文本 Dice ≥ MIN_SCORE）**或**有数值佐证（重合 ≥2 个数）。
+ *
+ * 实现与口径说明见 `tools/lib/align.mjs` 的 `isOutcomeCandidate`
+ * （与网页端「待人工裁定的结局行」共用，避免两边漂移）。
+ * ⚠️ 不要退回 `score >= MIN_SCORE`：construct/subconstruct 加成会让每个产物行
+ * 都成为候选，多对一之下漏抽会退化成 0。
+ */
+
+/**
+ * 结局行的**路径拍平**：把一行拍成 `[路径, 字段对象]`。
+ *
+ * 只取 outcome / follow_up / timepoints 三块 —— 金标准行根上的 `literature_code`
+ * 与 `arm_number` 不是抽取目标（等同 NON_LLM_GOLD），不该进分母。
+ * 产物的块名是 camelCase（followUp），统一归一成金标准的 `follow_up`，
+ * 这样两边路径能直接对齐。
+ */
+function flattenRow(row, blocks, conv) {
+  const out = [];
+  const walk = (node, prefix) => {
+    if (node === null || typeof node !== 'object' || Array.isArray(node)) return;
+    if (typeof node.raw === 'string') { out.push([prefix, node]); return; }
+    for (const [k, v] of Object.entries(node)) walk(v, prefix ? `${prefix}.${conv(k)}` : conv(k));
+  };
+  for (const b of blocks) {
+    if (!row?.[b]) continue;
+    walk(row[b], b === 'followUp' ? 'follow_up' : b);
+  }
+  return out;
+}
+const ROW_BLOCKS_GOLD = ['outcome', 'follow_up', 'timepoints'];
+const ROW_BLOCKS_PRED = ['outcome', 'followUp', 'timepoints'];
+
+/**
+ * 路径 → (`byField` 用的 scope, field)。
+ *
+ *   outcome.x                    → ('outcome', 'x')
+ *   follow_up.x                  → ('followUp', 'x')
+ *   timepoints.tp.kind.role.leaf → ('tp.kind', 'leaf')   ← **组别段不进键**
+ *
+ * 组别（experimental/control）不进键是**故意**的：旧口径就是按 `tp.kind.leaf`
+ * 聚合的，保持键不变才能让历史 `byField` 与新旧报告对照。
+ */
+function scopeFieldOf(path) {
+  const seg = path.split('.');
+  if (seg[0] === 'outcome') return { scope: 'outcome', field: seg.slice(1).join('.') };
+  if (seg[0] === 'follow_up') return { scope: 'followUp', field: seg.slice(1).join('.') };
+  return { scope: `${seg[1]}.${seg[2]}`, field: seg[seg.length - 1] };
+}
+
 
 /* 结局层额外统计：金标准行的"覆盖率" */
 const outcomeCoverage = { goldRows: 0, alignedRows: 0, goldFields: 0, goldFieldsHit: 0 };
@@ -482,8 +533,7 @@ for (const id of ids) {
     art.notes.push(`结局数量不符：金标准 ${goldOuts.length} / 流水线 ${predOuts.length}`);
   }
   /* 结局行对齐：文本相似度 + 数值佐证（实现见 tools/lib/align.mjs，与诊断工具共用） */
-  const { goldToPred, usedPred: usedGold, alignments } = alignOutcomes(goldOuts, predOuts);
-  const extraCounted = new Set();
+  const { goldToPred, alignments } = alignOutcomes(goldOuts, predOuts);
   for (const a of alignments) {
     if (a.kind === 'text') outcomeAlignment.textOnly++;
     else if (a.kind === 'numeric') {
@@ -499,92 +549,77 @@ for (const id of ids) {
     }
   }
 
+  /*
+   * ── 结局层计分：**覆盖率口径**（202609 定稿）──
+   *
+   * 旧口径是"结局行 1:1 配对"：金标准两行、产物的行只有一行 → 必有一行整行计漏抽；
+   * 产物多出来的行全算 extra。这与实际用法不符 —— **多抽的可以人工裁掉，
+   * 漏抽的才是硬伤**。实测 1108 个金标准行里只有 775 行能 1:1 配上，而未配上的
+   * 333 行里约 42%（按叶子）在产物里其实是有数据的，只是那一行被别的金标准行占了。
+   *
+   * 因此改成：
+   *   · **候选边**：`score ≥ MIN_SCORE`（保留数值佐证），不再要求 1:1；
+   *   · **多对一**：一个产物行可以同时供给多个金标准行；
+   *   · **要求去重**：同一篇内 (路径 + 值) 相同的金标准要求只计一次
+   *     —— 实测 55.3% 的金标准叶子是同一篇内的重复要求（如按组/按臂把同一份数据
+   *     列两行），不去重等于"同一份数据答对加一分、答错扣两分"，把口径带偏；
+   *   · **产物侧多抽**：不被任何金标准行需要的行记 extra，并计入"人工裁定"队列。
+   */
   const nOut = goldOuts.length;
+  const adj = goldOuts.map((g) => {
+    const list = [];
+    for (let j = 0; j < predOuts.length; j++) {
+      if (isOutcomeCandidate(g, predOuts[j])) list.push(j);
+    }
+    return list;
+  });
+  const neededPred = new Set();
+  for (const list of adj) for (const j of list) neededPred.add(j);
+  art.outcomeDeferredRows = predOuts.length - neededPred.size;
+  for (let j = 0; j < predOuts.length; j++) {
+    if (neededPred.has(j)) continue;
+    const n = countFieldLeaves(predOuts[j]) || 1;
+    for (let k = 0; k < n; k++) addTo(art.outcome, 'extra');
+  }
+  const flatPred = predOuts.map((p) => new Map(flattenRow(p, ROW_BLOCKS_PRED, camelToSnake)));
+
+  const reqSeen = new Set();
   for (let i = 0; i < nOut; i++) {
     const g = goldOuts[i];
-    const pi = goldToPred.get(i);
-    const p = pi === undefined ? null : predOuts[pi];
-
+    const cands = adj[i];
     outcomeCoverage.goldRows++;
-    if (p) outcomeCoverage.alignedRows++;
-
-    if (!p) {
-      const n = countFieldLeaves(g) || 8;
-      outcomeCoverage.goldFields += countFieldLeaves(g);
-      for (let k = 0; k < n; k++) addTo(art.outcome, 'missed');
-      continue;
-    }
-
-    // 这条金标准行被覆盖到了：统计其字段命中率（用于"覆盖率"这一独立口径）
-    {
-      const beforeHit = art.outcome.hit + art.outcome['code-hit'];
-      outcomeCoverage.goldFields += countFieldLeaves(g);
+    outcomeCoverage.goldFields += countFieldLeaves(g);
+    if (cands.length) {
+      outcomeCoverage.alignedRows++;
       art.outcomeCoveredRows = (art.outcomeCoveredRows ?? 0) + 1;
-      void beforeHit;
     }
 
-    // 流水线多抽出来的（没被任何金标准条目配对）计入 extra
-    for (const [j, cand] of predOuts.entries()) {
-      if (usedGold.has(j) || extraCounted.has(j)) continue;
-      extraCounted.add(j);
-      const n = countFieldLeaves(cand) || 1;
-      for (let k = 0; k < n; k++) addTo(art.outcome, 'extra');
-    }
+    for (const [path, gv] of flattenRow(g, ROW_BLOCKS_GOLD, (k) => k)) {
+      const { scope, field } = scopeFieldOf(path);
+      if (NON_LLM_GOLD.has(field)) continue;
+      if (isExcluded(id, scope, field, gv.raw)) continue;   // 值不在论文里/疑似错位 → 不计分
+      const rk = `${path}\u0000${normText(gv.raw)}`;
+      if (reqSeen.has(rk)) continue;                        // 同一篇内的重复要求只计一次
+      reqSeen.add(rk);
 
-    // 结局元信息
-    const judgeBlock = (goldObj, predObj, scope) => {
-      for (const [snake, gv] of Object.entries(goldObj ?? {})) {
-        if (NON_LLM_GOLD.has(snake)) continue;
-        if (gv === null || typeof gv !== 'object') continue;
-        if (isExcluded(id, 'outcome', snake, gv.raw)) continue;   // 疑似错位 → 不计分
-        const camel = Object.keys(predObj ?? {}).find((k) => camelToSnake(k) === snake);
-        const predObjField = camel ? predObj[camel] : undefined;
-        // Sheet3 的自然语言信息（结局名称/工具等）→ LLM 判语义
-        const verdict = shouldJudge(scope, gv.raw, predObjField?.raw)
-          ? enqueueJudge(`${id}/${scope}.${snake}`, scope, snake, gv.raw, predObjField.raw)
-          : judgeField(predObjField, gv);
-        if (verdict === 'judged') continue;
-        addTo(art.outcome, verdict);
-        addTo(fieldStat(scope, snake), verdict);
-        if ((verdict === 'wrong' || verdict === 'missed') && opt.detail) {
-          art.notes.push(`结局${i + 1}.${scope}.${snake}: 金标准「${String(gv.raw).slice(0, 50)}」 vs 流水线「${camel ? String(predObj[camel]?.raw).slice(0, 50) : '（缺）'}」`);
-        }
+      /* 从候选行里取同路径的产物值；有"判等命中"的优先（多对一时取最合适的那一行） */
+      let predField;
+      for (const j of cands) {
+        const v = flatPred[j].get(path);
+        if (!v) continue;
+        if (!predField) predField = v;
+        if (compareValue(v.raw, gv.raw) === 'hit') { predField = v; break; }
       }
-    };
-    judgeBlock(g.outcome, p.outcome, 'outcome');
-    judgeBlock(g.follow_up, p.followUp, 'followUp');
 
-    // 时点块
-    const gTps = g.timepoints ?? {};
-    const pTps = p.timepoints ?? {};
-    for (const [snakeTp, gtp] of Object.entries(gTps)) {
-      const camelTp = Object.keys(pTps).find((k) => camelToSnake(k) === snakeTp);
-      const ptp = camelTp ? pTps[camelTp] : null;
-      for (const [kindSnake, gkind] of Object.entries(gtp ?? {})) {
-        if (!gkind || typeof gkind !== 'object') continue;
-        const pkind = ptp ? (ptp[kindSnake] ?? ptp[camelToSnake(kindSnake)] ?? null) : null;
-        const judge = (goldObj, predObj, scope) => {
-          for (const [snake, gv] of Object.entries(goldObj ?? {})) {
-            if (gv === null || typeof gv !== 'object') continue;
-            if (Array.isArray(gv)) continue;
-            const isLeaf = 'raw' in gv;
-            if (!isLeaf) { judge(gv, predObj?.[Object.keys(predObj ?? {}).find((k) => camelToSnake(k) === snake) ?? snake], scope); continue; }
-            const camel = Object.keys(predObj ?? {}).find((k) => camelToSnake(k) === snake);
-            const predField = camel ? predObj[camel] : undefined;
-            if (isExcluded(id, scope, snake, gv.raw)) continue;   // 值不在论文里/疑似错位 → 不计分
-            // 时点块内的自然语言字段（如 measurement_range/unit）同样交 LLM 判语义
-            const verdict = shouldJudge(scope, gv.raw, predField?.raw)
-              ? enqueueJudge(`${id}/${snakeTp}.${kindSnake}.${scope}.${snake}`, scope, snake, gv.raw, predField.raw)
-              : judgeField(predField, gv);
-            if (verdict === 'judged') continue;
-            addTo(art.outcome, verdict);
-            addTo(fieldStat(scope, snake), verdict);
-            if ((verdict === 'wrong' || verdict === 'missed') && opt.detail) {
-              art.notes.push(`${snakeTp}/${kindSnake}/${scope}.${snake}: 金标准「${String(gv.raw).slice(0, 40)}」 vs 流水线「${camel ? String(predObj[camel]?.raw).slice(0, 40) : '（缺）'}」`);
-            }
-          }
-        };
-        judge(gkind, pkind, `${snakeTp}.${kindSnake}`);
+      // 时点块内的自然语言字段（如 measurement_range/unit）同样交 LLM 判语义
+      const verdict = shouldJudge(scope, gv.raw, predField?.raw)
+        ? enqueueJudge(`${id}/${scope}.${field}`, scope, field, gv.raw, predField.raw)
+        : judgeField(predField, gv);
+      if (verdict === 'judged') continue;
+      addTo(art.outcome, verdict);
+      addTo(fieldStat(scope, field), verdict);
+      if ((verdict === 'wrong' || verdict === 'missed') && opt.detail) {
+        art.notes.push(`${scope}.${field}: 金标准「${String(gv.raw).slice(0, 45)}」 vs 流水线「${predField ? String(predField.raw).slice(0, 45) : '（缺）'}」`);
       }
     }
   }
@@ -627,18 +662,14 @@ function countFields(node) {
 
 let judgeResults = [];
 if (judgeQueue.length) {
-  const cfgPath = join(ROOT, 'runtime', 'llm.local.json');
-  let cfg = {};
-  if (existsSync(cfgPath)) { try { cfg = JSON.parse(readFileSync(cfgPath, 'utf8')); } catch { /* 忽略 */ } }
-  const apiKey = process.env.DEEPSEEK_API_KEY ?? cfg.apiKey;
-  if (!apiKey) {
+  const cfg = loadLlmConfig(ROOT, { optional: true });
+  if (!cfg.apiKey) {
     console.log(`\n  ⚠ ${judgeQueue.length} 组待语义判定，但未配置 API key（跳过，按"未判定"计）`);
   } else {
     process.stdout.write(`\n  语义判定 ${judgeQueue.length} 组（LLM 批量，带缓存）…`);
     judgeResults = await judgePairs(judgeQueue, {
-      apiKey,
-      ...(cfg.baseUrl ? { baseUrl: cfg.baseUrl } : {}),
-      model: process.env.AA_JUDGE_MODEL ?? cfg.model,
+      ...cfg,
+      model: cfg.reviewModel,
       batchSize: 8,
       onProgress: (m) => console.log(m),
     });

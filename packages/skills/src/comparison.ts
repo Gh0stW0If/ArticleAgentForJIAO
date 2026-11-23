@@ -14,14 +14,16 @@ import {
   type MiniDoc,
   type Skill,
   type SkillContext,
+  type LlmRequest,
   type SkillOutput,
   type FieldValue,
   warn,
 } from '@aa/core';
 import { PROMPTS, COMPARISON_TASK } from './prompts.generated.ts';
 import { collectMaterials } from './materials.ts';
-import { groundNested, type GroundOptions } from './grounding.ts';
+import { groundField, groundNested, numericTokens, type GroundOptions, type RawFieldClaim } from './grounding.ts';
 import { decode } from './legend.ts';
+import { applyMissingDataAssessment, reviewMissingDataScope } from './missing-data.ts';
 
 /* ------------------------------ 字段映射 ------------------------------ */
 
@@ -108,6 +110,66 @@ export const COMPARISON_FIELD_MAP: Readonly<Record<string, string>> = {
   totalSessionsClassB: 'totalSessionsClassB',
 };
 
+const SAMPLE_SIZE_FIELDS = [
+  ['randomizedN', 'priorAcupunctureExperimental', 'priorAcupunctureControl'],
+  ['analyzedN', 'randomizedNExperimental', 'randomizedNControl'],
+  ['dropoutTotal', 'analyzedNExperimental', 'analyzedNControl'],
+] as const;
+
+function participantCount(field?: FieldValue): number | undefined {
+  const n = field?.raw.trim().replace(/,/g, '');
+  if (!n || !/^\d+$/.test(n)) return undefined;
+  const value = Number(n);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
+function supportedParticipantCount(field?: FieldValue): number | undefined {
+  const value = participantCount(field);
+  return value !== undefined && field?.evidence.some(source => numericTokens(source.quote).includes(value))
+    ? value : undefined;
+}
+
+function reconcileSampleSizes(
+  doc: MiniDoc, comparison: ComparisonLevel, rawClaims: unknown, prefix: string,
+  issues: Issue[], unresolved: SkillOutput['unresolved'],
+): void {
+  const claims = rawClaims as Record<string, unknown> | undefined;
+  for (const [total, experimental, control] of SAMPLE_SIZE_FIELDS) {
+    let totalConflicted = false;
+    for (const key of [total, experimental, control]) {
+      if (!Array.isArray(claims?.[key])) continue;
+      const path = `${prefix}.${key}`;
+      const candidates = [comparison[key], ...(claims[key] as unknown[])
+        .filter((claim): claim is RawFieldClaim => Boolean(claim && typeof claim === 'object' && 'source' in claim))
+        .map(claim => groundField(doc, path, claim, { kinds: ['text', 'title', 'table', 'figure'] }).field)]
+        .filter((field): field is FieldValue => supportedParticipantCount(field) !== undefined);
+      if (!candidates.length) continue;
+      const evidence = [...new Map(candidates.flatMap(field => field.evidence)
+        .map(source => [`${source.blockId}:${source.quote}`, source] as const)).values()];
+      const counts = new Set(candidates.map(participantCount));
+      if (counts.size > 1) {
+        const reason = `同一比较组和人数口径的来源不一致（${[...counts].join(' / ')}），请复核流程图、正文与表格`;
+        issues.push(warn(reason, 'SAMPLE_SIZE_SOURCE_CONFLICT', { path, evidence }));
+        unresolved.push({ reason, raw: [...counts].join(' / '), evidence, confidence: 0 });
+        delete comparison[key];
+        if (key === total) totalConflicted = true;
+      } else {
+        comparison[key] = { ...candidates[0]!, evidence };
+      }
+    }
+    const a = comparison[experimental];
+    const b = comparison[control];
+    const nA = supportedParticipantCount(a);
+    const nB = supportedParticipantCount(b);
+    if (!totalConflicted && participantCount(comparison[total]) === undefined && a && b && nA !== undefined && nB !== undefined) {
+      comparison[total] = {
+        raw: String(nA + nB), provenance: 'deterministic',
+        evidence: [...a.evidence, ...b.evidence], confidence: Math.min(a.confidence, b.confidence),
+      };
+    }
+  }
+}
+
 /** 需要确定性编码的字段（模型给原文，编码由本地图例推导）。 */
 const CODE_TARGETS: readonly (keyof ComparisonLevel)[] = [
   'controlType', 'controlTypeConverted', 'comparisonType',
@@ -160,6 +222,9 @@ export function sortComparisons(list: ComparisonLevel[]): ComparisonLevel[] {
 }
 
 export interface ComparisonSkillOptions {
+  /** Raise reasoning only for a grounded but unresolved missing-data denominator. */
+  reviewMissingData?: boolean;
+  reviewReasoningEffort?: LlmRequest['reasoningEffort'];
   /** 材料最多取多少字符 */
   maxTotalChars?: number;
   /** 是否把表格纳入材料（默认 true —— 例数/性别/基线值主要在基线特征表里） */
@@ -178,12 +243,12 @@ export function createComparisonSkill(opts: ComparisonSkillOptions = {}): Skill<
   const planned = opts.plannedComparisons ?? [];
   const skill: Skill<ComparisonPayload> = {
     id: 'comparison',
-    version: '0.1.0',
+    version: '0.2.0',
     level: 'comparison',
     description: '逐比较组抽取设计与针刺方案细节，并把受控编码由本地图例确定性推导',
     needs: ['methods', 'results'],
     needsTables: true,
-    needsFigures: false,
+    needsFigures: true,
 
     async run(ctx: SkillContext): Promise<SkillOutput<ComparisonPayload>> {
       const issues: Issue[] = [];
@@ -196,10 +261,11 @@ export function createComparisonSkill(opts: ComparisonSkillOptions = {}): Skill<
        * 实测不带表格时 sex_experimental / randomized_n_* / baseline_cat_* 一律抽成 NR。
        */
       const includeTables = opts.includeTables ?? true;
-      const materials = collectMaterials(ctx.doc, {
+      const materialDoc = { ...ctx.doc, blocks: ctx.doc.blocks.filter(b => b.type !== 'figure' || b.figureOcr) };
+      const materials = collectMaterials(materialDoc, {
         sections: ['methods', 'results', 'abstract'],
         tables: includeTables,
-        figures: false,
+        figures: true,
         ...(opts.maxTotalChars !== undefined ? { maxTotalChars: opts.maxTotalChars } : {}),
       });
 
@@ -266,12 +332,13 @@ export function createComparisonSkill(opts: ComparisonSkillOptions = {}): Skill<
           }
 
           const grounded = groundNested<Record<string, FieldValue>>(
-            ctx.doc, item, pathMap, { kinds: ['text', 'title', 'table'] } satisfies GroundOptions, 'comparison',
+            materialDoc, item, pathMap, { kinds: ['text', 'title', 'table', 'figure'] } satisfies GroundOptions, 'comparison',
           );
           allUnresolved.push(...grounded.unresolved);
           for (const g of grounded.issues) issues.push(warn(g.reason, 'GROUNDING_FAILED', { path: `${prefix}.${g.field}` }));
 
           const cmp = { studyId: ctx.doc.articleId, ...grounded.payload } as ComparisonLevel;
+          reconcileSampleSizes(materialDoc, cmp, item.sampleSizeEvidence, prefix, issues, allUnresolved);
           const cmpRec = cmp as unknown as Record<string, FieldValue | undefined>;
 
 
@@ -308,6 +375,8 @@ export function createComparisonSkill(opts: ComparisonSkillOptions = {}): Skill<
             }
           }
 
+          applyMissingDataAssessment(materialDoc, cmp, item.missingDataEvidence, prefix, issues);
+          if (opts.reviewMissingData) await reviewMissingDataScope(materialDoc, cmp, ctx.llm, prefix, issues, opts.reviewReasoningEffort);
           comparisons.push(cmp);
         }
 
@@ -347,16 +416,17 @@ export function createComparisonSkill(opts: ComparisonSkillOptions = {}): Skill<
 
         // rawPrefix 把行内路径补全为映射表键（comparisons.<i>）
         const grounded = groundNested<Record<string, FieldValue>>(
-          ctx.doc,
+          materialDoc,
           item,
           pathMap,
-          { kinds: ['text', 'title'] } satisfies GroundOptions,
+          { kinds: ['text', 'title', 'table', 'figure'] } satisfies GroundOptions,
           prefix,
         );
         allUnresolved.push(...grounded.unresolved);
         for (const g of grounded.issues) issues.push(warn(g.reason, 'GROUNDING_FAILED', { path: `comparisons[${i}].${g.field}` }));
 
         const cmp = { studyId: ctx.doc.articleId, ...grounded.payload } as ComparisonLevel;
+        reconcileSampleSizes(materialDoc, cmp, (item as Record<string, unknown>).sampleSizeEvidence, prefix, issues, allUnresolved);
 
         // 确定性编码（用 Record 视图写入，避免 keyof 联合类型带来的赋值窄化问题）
         const cmpRec = cmp as unknown as Record<string, FieldValue | undefined>;
@@ -394,6 +464,7 @@ export function createComparisonSkill(opts: ComparisonSkillOptions = {}): Skill<
           }
         }
 
+        applyMissingDataAssessment(materialDoc, cmp, (item as Record<string, unknown>).missingDataEvidence, prefix, issues);
         comparisons.push(cmp);
       });
 
@@ -438,16 +509,18 @@ export function createComparisonSkill(opts: ComparisonSkillOptions = {}): Skill<
           }
         }
 
-        // 例数自洽：试验组+对照组 = 随机总数
-        const a = Number(c.randomizedNExperimental?.raw);
-        const b = Number(c.randomizedNControl?.raw);
-        const t = Number(c.randomizedN?.raw);
-        if (Number.isFinite(a) && Number.isFinite(b) && Number.isFinite(t) && a + b !== t) {
-          issues.push(warn(
-            `${p}: 随机例数不自洽，${a} + ${b} ≠ ${t}`,
-            'SAMPLE_SIZE_INCONSISTENT',
-            { path: `${p}.randomizedN` },
-          ));
+        // 旧字段名与工作簿批注不一致，按批注的同一人口及同一时点对账。
+        const labels = ['随机分配人数', '主要结局时点人数', '主要结局脱落人数'];
+        for (const [index, [total, experimental, control]] of SAMPLE_SIZE_FIELDS.entries()) {
+          const a = participantCount(c[experimental]);
+          const b = participantCount(c[control]);
+          const t = participantCount(c[total]);
+          if (a !== undefined && b !== undefined && t !== undefined && a + b !== t) {
+            issues.push(warn(`${p} 的${labels[index]}不自洽，${a} + ${b} ≠ ${t}`, 'SAMPLE_SIZE_INCONSISTENT', {
+              path: `${p}.${total}`,
+              evidence: [experimental, control, total].flatMap(key => c[key]?.evidence ?? []),
+            }));
+          }
         }
 
         // 总次数与 频次×疗程 的粗校验（仅当三者都是纯数字时）

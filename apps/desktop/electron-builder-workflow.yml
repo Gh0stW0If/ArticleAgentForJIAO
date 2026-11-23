@@ -1,0 +1,19 @@
+extends: ./electron-builder.yml
+productName: Article Agent Workflow
+extraMetadata:
+  version: 0.2.5
+directories:
+  output: ../../build/desktop-workflow
+  buildResources: ../../build
+win:
+  target:
+    - target: portable
+      arch: [x64]
+  icon: ../../build/icon.png
+  artifactName: ArticleAgent-Workflow-${version}-portable.exe
+portable:
+  artifactName: ArticleAgent-Workflow-${version}-portable.exe
+  unpackDirName: article-agent-workflow
+extraFiles:
+  - from: ../../build/desktop-workflow-stage/pdfjs-dist
+    to: resources/app/tools/nodepdf/node_modules/pdfjs-dist

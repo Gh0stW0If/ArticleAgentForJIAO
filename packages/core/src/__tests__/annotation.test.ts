@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   mergeOverlay, makeAnnotation, annotationStats, evidenceFromSelection,
+  buildConsensus, consensusStats, mergeConsensus, pairwiseAgreement,
+  reviewerSummaries, reviewerOf, LEGACY_REVIEWER,
   type AnnotationOverlay, type FieldValue,
 } from '@aa/core';
 
@@ -142,3 +144,159 @@ describe('annotation — 统计与证据构造', () => {
     expect(evidenceFromSelection(1, [0, 0, 1, 1] as const, 'q', { kind: 'table' }).kind).toBe('table');
   });
 });
+
+/* ==========================================================================
+ * 多人机核对（202609）
+ * ========================================================================== */
+
+/** 构造某位核对人的覆盖层。 */
+const byReviewer = (reviewer: string, entries: AnnotationOverlay['entries'], updatedAt = '2026-09-24T00:00:00.000Z'): AnnotationOverlay => ({
+  schemaVersion: 'AA_ANNOTATION/2.0',
+  year: '2015',
+  articleId: '2015-01',
+  sourcePdf: 'Datas/articles/2015/-2015-01.pdf',
+  reviewer,
+  entries,
+  updatedAt,
+});
+
+const at = (fieldPath: string, raw: string, action: 'confirm' | 'override' | 'add' = 'override') =>
+  makeAnnotation(fieldPath, humanField(raw), { action });
+
+describe('annotation — 多人核对：逐字段状态', () => {
+  const pipeline = {
+    'article.title': llmField('Acupuncture for fibromyalgia'),
+    'article.country': llmField('Spain'),
+  };
+
+  it('两位核对人结论一致 → agreed，并采用该值', () => {
+    const rows = buildConsensus(pipeline, [
+      byReviewer('A', [at('article.country', 'Spain', 'confirm')]),
+      byReviewer('B', [at('article.country', 'Spain', 'confirm')]),
+    ]);
+    const row = rows.find((r) => r.fieldPath === 'article.country')!;
+    expect(row.status).toBe('agreed');
+    expect(row.agreedWithMachine).toBe(true);
+    expect(row.agreedValue!.raw).toBe('Spain');
+    expect(row.opinions.map((o) => o.reviewer)).toEqual(['A', 'B']);
+  });
+
+  it('两位核对人结论不同 → disputed，且不给出一致值', () => {
+    const rows = buildConsensus(pipeline, [
+      byReviewer('A', [at('article.country', 'Spain')]),
+      byReviewer('B', [at('article.country', 'China')]),
+    ]);
+    const row = rows.find((r) => r.fieldPath === 'article.country')!;
+    expect(row.status).toBe('disputed');
+    expect(row.agreedValue).toBeUndefined();
+  });
+
+  it('只有一位核对人表态 → single（还差第二人）', () => {
+    const rows = buildConsensus(pipeline, [byReviewer('A', [at('article.title', 'X', 'confirm')])]);
+    expect(rows.find((r) => r.fieldPath === 'article.title')!.status).toBe('single');
+  });
+
+  it('无人表过态的机器字段 → machine-only', () => {
+    const rows = buildConsensus(pipeline, []);
+    expect(rows.every((r) => r.status === 'machine-only')).toBe(true);
+  });
+
+  it('比对忽略大小写与多余空白', () => {
+    const rows = buildConsensus(pipeline, [
+      byReviewer('A', [at('article.title', '  acupuncture FOR fibromyalgia ')]),
+      byReviewer('B', [at('article.title', 'Acupuncture for fibromyalgia')]),
+    ]);
+    expect(rows.find((r) => r.fieldPath === 'article.title')!.status).toBe('agreed');
+  });
+
+  it('人工补录、机器没有的字段也会进入汇总', () => {
+    const rows = buildConsensus(pipeline, [byReviewer('A', [at('article.doi', '10.1/x', 'add')])]);
+    const row = rows.find((r) => r.fieldPath === 'article.doi')!;
+    expect(row.machineValue).toBeUndefined();
+    expect(row.status).toBe('single');
+  });
+
+  it('v1 旧覆盖层（无 reviewer 字段）归一化为 legacy，不丢历史记录', () => {
+    const legacy = overlay([at('article.country', 'Spain', 'confirm')]);
+    expect(reviewerOf(legacy)).toBe(LEGACY_REVIEWER);
+    expect(buildConsensus(pipeline, [legacy]).find((r) => r.fieldPath === 'article.country')!.opinions[0]!.reviewer)
+      .toBe(LEGACY_REVIEWER);
+  });
+});
+
+describe('annotation — 多人核对：合并与统计', () => {
+  const pipeline = {
+    'article.title': llmField('Acupuncture for fibromyalgia'),
+    'article.country': llmField('Spain'),
+  };
+
+  it('一致时采用人工值；disputed 时保留机器原值、不替人裁决', () => {
+    const merged = mergeConsensus(pipeline, [
+      byReviewer('A', [at('article.country', 'Spain', 'confirm'), at('article.title', 'Title A')]),
+      byReviewer('B', [at('article.country', 'China'), at('article.title', 'Title A')]),
+    ]);
+
+    const country = merged.find((m) => m.fieldPath === 'article.country')!;
+    expect(country.value.raw).toBe('Spain');       // disputed → 保留机器值
+    expect(country.reviewStatus).toBe('disputed');
+    expect(country.overridden).toBe(false);
+
+    const title = merged.find((m) => m.fieldPath === 'article.title')!;
+    expect(title.value.raw).toBe('Title A');       // agreed → 采用人工值
+    expect(title.reviewStatus).toBe('agreed');
+    expect(title.overridden).toBe(true);           // 与机器原值不同 = 真的改了
+    expect(title.llmValue!.raw).toBe('Acupuncture for fibromyalgia');
+    expect(title.decidedBy).toBe('human');
+  });
+
+  it('确认机器值不算改动', () => {
+    const merged = mergeConsensus(pipeline, [
+      byReviewer('A', [at('article.title', 'Acupuncture for fibromyalgia', 'confirm')]),
+      byReviewer('B', [at('article.title', 'Acupuncture for fibromyalgia', 'confirm')]),
+    ]);
+    const title = merged.find((m) => m.fieldPath === 'article.title')!;
+    expect(title.overridden).toBe(false);
+    expect(title.decidedBy).toBe('human');
+  });
+
+  it('统计包含分歧数与"真正改掉"的数量', () => {
+    const rows = buildConsensus(pipeline, [
+      byReviewer('A', [at('article.country', 'Spain', 'confirm'), at('article.title', 'T1')]),
+      byReviewer('B', [at('article.country', 'China'), at('article.title', 'T1')]),
+    ]);
+    expect(consensusStats(rows)).toEqual({
+      total: 2, agreed: 1, disputed: 1, single: 0, machineOnly: 0, reviewed: 2, changed: 1,
+    });
+  });
+
+  it('两两一致率只用"两人都表过态"的字段做分母', () => {
+    const [pair] = pairwiseAgreement([
+      byReviewer('A', [at('f1', 'x'), at('f2', 'y')]),
+      byReviewer('B', [at('f1', 'x')]),           // B 没标 f2 → 不进分母
+    ]);
+    expect(pair!.reviewerA).toBe('A');
+    expect(pair!.reviewerB).toBe('B');
+    expect(pair!.common).toBe(1);
+    expect(pair!.same).toBe(1);
+    expect(pair!.rate).toBe(1);
+  });
+
+  it('没有共同字段时一致率为 null（不报 0%，避免误读为完全不一致）', () => {
+    const [pair] = pairwiseAgreement([
+      byReviewer('A', [at('f1', 'x')]),
+      byReviewer('B', [at('f2', 'y')]),
+    ]);
+    expect(pair!.common).toBe(0);
+    expect(pair!.rate).toBeNull();
+  });
+
+  it('逐核对人统计（界面进度面板用）', () => {
+    const s = reviewerSummaries([
+      byReviewer('B', [at('f1', 'x'), at('f2', 'y', 'add')]),
+      byReviewer('A', [at('f1', 'x', 'confirm')]),
+    ]);
+    expect(s.map((x) => x.reviewer)).toEqual(['A', 'B']);
+    expect(s[1]).toMatchObject({ total: 2, added: 1, overridden: 1, confirmed: 0 });
+  });
+});
+

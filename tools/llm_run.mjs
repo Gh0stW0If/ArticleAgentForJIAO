@@ -15,6 +15,7 @@
  *   node tools/llm_run.mjs --year 2015                    # 全部 6 篇
  *   node tools/llm_run.mjs --year 2015 --only 2015-01     # 单篇（调提示词时用）
  *   node tools/llm_run.mjs --year 2015 --skill comparison # 只跑一个 SKILL
+ *   node tools/llm_run.mjs --year 2015 --skill outcomePlan,audit --seed-dir build/extraction --out-dir build/pilot
  *   node tools/llm_run.mjs --year 2015 --fresh            # 忽略缓存，强制重新请求
  *
  * 缓存：请求指纹（tag+system+user+model）→ build/llm-cache/<key>.json。
@@ -36,6 +37,12 @@ import {
   createOutcomeSkill,
   createOutcomeValuesSkill,
   applyMeasurementType,
+  validateExtractedIntervals,
+  comparisonScope,
+  declaredPrimaryChange,
+  matchesDeclaredChange,
+  sameOutcomeLabel,
+  sourceEventPair,
   createOutcomePlanSkill,
   createOutcomeAuditSkill,
   createStudyPlanSkill,
@@ -48,6 +55,9 @@ import {
 import { createCrossrefClient } from '../packages/crossref/dist/index.js';
 import { createEuropePmcClient } from '../packages/europepmc/dist/index.js';
 import { readIfEntriesFromXlsx, buildIfLookup } from './lib/if.mjs';
+import { loadLlmConfig, llmCacheSuffix } from './lib/llm-config.mjs';
+import { readParticipantFlow } from './lib/participant-flow.mjs';
+import { applyNativeTableRepairs, readNativeTables } from './lib/source-table-repair.mjs';
 
 /*
  * 数据根目录（Datas / build / runtime 所在处）。
@@ -67,7 +77,7 @@ const ROOT = process.env.AA_ROOT
 /* ------------------------------ 参数解析 ------------------------------ */
 
 function parseArgs(argv) {
-  const out = { year: '2015', only: [], skill: 'all', fresh: false, crossref: true, europepmc: true, dry: false, config: null, model: null };
+  const out = { year: '2015', only: [], skill: 'all', fresh: false, crossref: true, europepmc: true, dry: false, config: null, model: null, outDir: null, seedDir: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -78,6 +88,8 @@ function parseArgs(argv) {
     else if (a === '--no-crossref') out.crossref = false;
     else if (a === '--no-europepmc') out.europepmc = false;
     else if (a === '--dry') out.dry = true;
+    else if (a === '--out-dir') out.outDir = next();
+    else if (a === '--seed-dir') out.seedDir = next();
     else if (a === '--config') out.config = next();
     else if (a === '--model') out.model = next();
     else if (a === '--help' || a === '-h') { console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0]); process.exit(0); }
@@ -87,25 +99,6 @@ function parseArgs(argv) {
 }
 
 /* ------------------------------ 配置读取 ------------------------------ */
-
-function loadConfig(explicitPath) {
-  const path = explicitPath ?? join(ROOT, 'runtime', 'llm.local.json');
-  let file = {};
-  if (existsSync(path)) {
-    try { file = JSON.parse(readFileSync(path, 'utf8')); } catch (e) { throw new Error(`配置解析失败 ${path}: ${e.message}`); }
-  } else if (!process.env.DEEPSEEK_API_KEY) {
-    throw new Error(`未找到配置文件 ${path}，且没有 DEEPSEEK_API_KEY 环境变量`);
-  }
-  return {
-    apiKey: process.env.DEEPSEEK_API_KEY ?? file.apiKey,
-    baseUrl: process.env.AA_LLM_BASE_URL ?? file.baseUrl ?? 'https://api.deepseek.com',
-    model: process.env.AA_LLM_MODEL ?? file.model ?? 'deepseek-chat',
-    temperature: file.temperature ?? 0,
-    maxTokens: file.maxTokens ?? 8000,
-    crossrefMailto: process.env.AA_CROSSREF_MAILTO ?? file.crossrefMailto,
-    configPath: path,
-  };
-}
 
 /* ------------------------------ 模型列表 ------------------------------ */
 
@@ -128,8 +121,9 @@ function listStudies(year) {
 /* ------------------------------ 主流程 ------------------------------ */
 
 const args = parseArgs(process.argv.slice(2));
-const cfg = loadConfig(args.config);
+const cfg = loadLlmConfig(ROOT, { path: args.config ?? undefined });
 const model = args.model ?? cfg.model;
+const cacheSuffix = llmCacheSuffix({ ...cfg, model });
 
 const log = (msg, data) => {
   const t = new Date().toISOString().slice(11, 19);
@@ -142,11 +136,8 @@ let cacheHit = 0;
 let cacheMiss = 0;
 
 const llm = createDeepSeekLlm({
-  apiKey: cfg.apiKey,
-  baseUrl: cfg.baseUrl,
+  ...cfg,
   model,
-  temperature: cfg.temperature,
-  maxTokens: cfg.maxTokens,
   onCall: (info) => {
     const u = info.usage ? ` in=${info.usage.inputTokens ?? '?'} out=${info.usage.outputTokens ?? '?'}` : '';
     log(`  ${info.ok ? '✓' : '✗'} ${info.tag} ${info.ms}ms${u}${info.error ? ' — ' + info.error : ''}`);
@@ -158,7 +149,7 @@ resetGroundingStats();
 
 const cachedLlm = {
   async invoke(req) {
-    const key = `${requestKey(req)}-${model.replace(/[^\w.-]/g, '_')}`;
+    const key = `${requestKey(req)}-${model.replace(/[^\w.-]/g, '_')}${cacheSuffix}`;
     const file = join(cacheDir, `${key}.json`);
     if (!args.fresh && existsSync(file)) {
       const hit = JSON.parse(readFileSync(file, 'utf8'));
@@ -236,7 +227,12 @@ console.log(`  模型   ${model} (${cfg.baseUrl})`);
 console.log(`  配置   ${cfg.configPath}`);
 console.log(`  Crossref ${crossref ? '开' : '关'} | 缓存 ${args.fresh ? '禁用(--fresh)' : '开启'}\n`);
 
-const outDir = join(ROOT, 'build', 'extraction', args.year);
+const stageOrder = ['plan', 'article', 'comparison', 'outcomePlan', 'outcome', 'outcomeValues', 'audit'];
+const stages = args.skill === 'all' ? stageOrder : args.skill.split(',');
+if (stages.some(stage => !stageOrder.includes(stage))) throw new Error(`未知抽取阶段 ${args.skill}`);
+const outDir = join(args.outDir ? resolve(ROOT, args.outDir) : join(ROOT, 'build', 'extraction'), args.year);
+const seedDir = args.seedDir ? resolve(ROOT, args.seedDir, args.year) : null;
+const outcomeWork = stages.some(stage => ['outcomePlan', 'outcome', 'outcomeValues', 'audit'].includes(stage));
 mkdirSync(outDir, { recursive: true });
 
 const runSummary = {
@@ -247,6 +243,17 @@ const runSummary = {
 for (const studyId of studies) {
   console.log(`\n──── ${studyId} ────`);
   const t0 = Date.now();
+  /**
+   * 本篇开始的调用计数。
+   *
+   * 用来判定"全盘失败"：`llm.calls` 每次请求都推一条带 `ok` 的记录。
+   * ⚠️ 光看"有没有抛异常"不够 —— 每个 SKILL 的失败都被 catch 住、记进 issues
+   * 后继续跑下一个，所以"余额用尽"这种全盘失败也会走完全程、写出几乎空的产物。
+   * 而且"所有 SKILL 都失败"这个判据也不够：实测 7 个 SKILL 里有 4 个"成功地"
+   * 跑出了 0 项（每次调用都失败但被吞掉），照样被判成成功。
+   * **调用级**才是准的。
+   */
+  const callsBefore = llm.calls.length;
 
   let ing;
   try {
@@ -256,7 +263,8 @@ for (const studyId of studies) {
     runSummary.articles.push({ studyId, ok: false, error: e.message });
     continue;
   }
-  const doc = ing.doc;
+  const native = outcomeWork ? readNativeTables(ROOT, args.year, studyId, ing.doc) : { doc: ing.doc, repairs: [], unresolved: [] };
+  const doc = native.doc;
   console.log(`  MiniDoc: ${doc.stats.totalBlocks} 块 / ${doc.stats.pagesCovered} 页 / 表 ${doc.stats.tables} / 图 ${doc.stats.figures}`);
 
   /*
@@ -287,14 +295,17 @@ for (const studyId of studies) {
    * 因此先读回已有产物，只覆盖本次真正跑过的层；issue/unresolved 按 skill 过滤后再并。
    */
   const outFile = join(outDir, `${doc.articleId}.json`);
-  const prev = existsSync(outFile) ? JSON.parse(readFileSync(outFile, 'utf8')) : null;
+  const seedFile = seedDir && join(seedDir, `${doc.articleId}.json`);
+  const previousFile = existsSync(outFile) ? outFile : seedFile;
+  if (seedFile && !existsSync(previousFile)) throw new Error(`找不到局部复跑的种子结果 ${seedFile}`);
+  const prev = previousFile ? JSON.parse(readFileSync(previousFile, 'utf8')) : null;
   const ranSkills = new Set();
-  const droppedFor = (list, key) => (prev?.[list] ?? []).filter((x) => !ranSkills.has(x[key]));
+  const ranSkillIds = new Set();
 
   /** 上游规划结果（study-plan / outcome-plan 的产出），供下游使用 */
   let planPayload = prev?.pipeline?.studyPlan ?? null;
   let outcomePlanPayload = prev?.pipeline?.outcomePlan ?? null;
-  let planCount = 0;
+  let planCount = planPayload?.comparisons?.length ?? 0;
 
   const extraction = {
     schemaVersion: 'AA_EXTRACTION/1.0',
@@ -323,9 +334,100 @@ for (const studyId of studies) {
     issues: [],
   };
 
-  for (const name of ['plan', 'article', 'comparison', 'outcomePlan', 'outcome', 'outcomeValues', 'audit']) {
-    if (args.skill !== 'all' && args.skill !== name) continue;
+  const plannedChange = outcomeWork ? declaredPrimaryChange(doc) : undefined;
+  let unresolvedPrimary = false;
+  const planPrimary = () => {
+    if (!plannedChange) return;
+    const title = plannedChange.planned.name.raw;
+    const matches = label => matchesDeclaredChange(plannedChange, label);
+    const declared = outcomePlanPayload ?? { outcomes: [], otherOutcomes: [], rejected: [] };
+    const index = declared.outcomes.findIndex(outcome => matches(outcome.name?.raw ?? ''));
+    if (index < 0) {
+      outcomePlanPayload = { ...declared, outcomes: [plannedChange.planned, ...declared.outcomes] };
+      issues.push({ severity: 'info', code: 'PRIMARY_DECLARATION_RECOVERED', message: title, skill: 'outcomePlan' });
+    } else if (declared.outcomes[index].name.raw !== title) {
+      const outcomes = [...declared.outcomes];
+      outcomes[index] = { ...outcomes[index], ...plannedChange.planned };
+      outcomePlanPayload = { ...declared, outcomes };
+    }
+    extraction.pipeline.outcomePlan = outcomePlanPayload;
+    return matches;
+  };
+  const indexOfPair = studyId => {
+    const suffix = String(studyId ?? '').slice(doc.articleId.length);
+    return /^-\d{2}$/.test(suffix) ? Number(suffix.slice(1)) - 1 : 0;
+  };
+  const checks = { primaryChange: false, eventPairs: 0, nativeOutcomePairs: 0 };
+  const applySourceEvidence = () => {
+    const matchesPrimary = planPrimary();
+    const scoped = index => comparisonScope(doc.articleId, index, planPayload);
+    if (matchesPrimary) {
+      const scope = planCount === 1 ? scoped(0) : undefined;
+      const hasArm = (header, text) => {
+        const alias = header.replace(/\s+group\b.*$/i, '').trim();
+        const tokens = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+        return Boolean(alias && tokens.includes(alias.toLowerCase()));
+      };
+      if (scope && hasArm(plannedChange.groupLabels[0], scope.intervention)
+          && hasArm(plannedChange.groupLabels[1], scope.control)) {
+        const matched = extraction.outcomes.filter(row => matchesPrimary(row.outcome?.name?.raw ?? ''));
+        if (!matched.length) {
+          extraction.outcomes.push({ studyId: doc.articleId, outcome: { name: plannedChange.planned.name } });
+        }
+        if (matched.length > 1) {
+          if (!unresolvedPrimary) unresolved.push({
+            raw: plannedChange.planned.name.raw, evidence: plannedChange.planned.name.evidence, confidence: 0,
+            reason: '同一主要结局对应多条抽取记录，请核对口径', skillId: 'outcome-plan',
+          });
+          unresolvedPrimary = true;
+        }
+        const row = matched.length > 1 ? undefined : matched[0] ?? extraction.outcomes.at(-1);
+        if (row) {
+          row.outcome.name = plannedChange.planned.name;
+          // Only supply the windows verified in the single source table.
+          row.timepoints = { ...row.timepoints, ...structuredClone(plannedChange.timepoints) };
+          row.preferredResult = 'betweenGroupDifference';
+          applyMeasurementType(row, row.timepoints);
+          checks.primaryChange = true;
+        }
+      } else if (!unresolvedPrimary) {
+        unresolvedPrimary = true;
+        unresolved.push({
+          raw: plannedChange.planned.name.raw, evidence: plannedChange.planned.name.evidence, confidence: 0,
+          reason: '已找到主要结局结果行，比较组列需核对', skillId: 'outcome-plan',
+        });
+      }
+    }
+    let events = 0;
+    let repaired = 0;
+    for (const [index, row] of extraction.outcomes.entries()) {
+      const scope = scoped(indexOfPair(row.studyId));
+      if (scope) row.comparisonScope = scope;
+      if (scope && planCount > 1) {
+        const points = Object.values(row.timepoints ?? {}).filter(time => time.binary?.experimental?.events || time.binary?.control?.events);
+        const pair = points.length === 1 ? sourceEventPair(doc, row.outcome?.name?.raw ?? '', scope) : undefined;
+        if (pair) {
+          points[0].binary = { ...points[0].binary, ...pair };
+          applyMeasurementType(row, row.timepoints);
+          events++;
+        }
+      }
+      repaired += applyNativeTableRepairs(row, native.repairs);
+      if (row.timepoints) {
+        const review = [];
+        validateExtractedIntervals(row.timepoints, `outcomes.${index}`, issues, review, false);
+        unresolved.push(...review.map(item => ({ ...item, skillId: 'outcome-values' })));
+      }
+    }
+    checks.eventPairs = events;
+    checks.nativeOutcomePairs = repaired;
+  };
+
+  for (const name of stageOrder) {
+    if (!stages.includes(name)) continue;
     ranSkills.add(name);
+    if (name === 'outcome') planPrimary();
+    if (name === 'outcomeValues' || name === 'audit') applySourceEvidence();
     /*
      * 上游两个规划 SKILL 先判定结构，再把结论注入下游：
      *   study-plan   → comparison 按计划逐组抽取、outcome 按比较组数扇出
@@ -371,6 +473,8 @@ for (const studyId of studies) {
        */
       const m = new RegExp(`^${doc.articleId}-(\\d{2})$`).exec(String(studyId ?? ''));
       const idx = m ? Number(m[1]) - 1 : 0;
+      const scoped = comparisonScope(doc.articleId, idx, planPayload);
+      if (scoped) return scoped;
       const c = extraction.comparisons?.[idx];
       if (!c) return undefined;
       const intervention = (c.intervention?.raw ?? '').trim();
@@ -393,7 +497,10 @@ for (const studyId of studies) {
     const skill = name === 'plan'
       ? createStudyPlanSkill()
       : name === 'outcomePlan'
-        ? createOutcomePlanSkill()
+        ? createOutcomePlanSkill({
+            primaryHint: extraction.article?.studyOutcomes?.primaryOutcome,
+            explicitChange: plannedChange?.planned,
+          })
         : name === 'audit'
           // 事后验证：只针对已抽取的结局层做查漏补缺（不做全量重抽）
           ? createOutcomeAuditSkill({ extracted: extraction.outcomes })
@@ -409,7 +516,17 @@ for (const studyId of studies) {
                 : skills[name];
     const st = Date.now();
     try {
-      const out = await skill.run(ctx);
+      let skillContext = ctx;
+      if (name === 'comparison') {
+        const flow = await readParticipantFlow(ROOT, doc);
+        skillContext = { ...ctx, doc: flow.doc };
+        for (const message of flow.warnings) {
+          console.warn(`  ⚠ ${message}`);
+          issues.push({ severity: 'warning', code: 'FLOW_DIAGRAM_OCR', message, skill: name });
+        }
+      }
+      const out = await skill.run(skillContext);
+      ranSkillIds.add(out.skillId);
       const extra = skill.validate ? skill.validate(out, ctx) : [];
       perSkill[name] = {
         ms: Date.now() - st,
@@ -440,11 +557,14 @@ for (const studyId of studies) {
       } else if (name === 'outcomePlan') {
         outcomePlanPayload = out.payload;
         extraction.pipeline.outcomePlan = out.payload;
+        planPrimary();
       } else if (name === 'audit') {
         extraction.pipeline.outcomeAudit = {
           ...out.payload,
           filled: out.payload.filled.length,
           reported: out.payload.reported.length,
+          reportedItems: out.payload.reported,
+          filledItems: out.payload.filled,
         };
       } else if (name === 'article') {
         /*
@@ -477,7 +597,10 @@ for (const studyId of studies) {
         for (const v of filled) {
           const row = extraction.outcomes?.[v.rowIndex];
           if (!row || !v.timepoints || Object.keys(v.timepoints).length === 0) continue;
-          row.timepoints = { ...(row.timepoints ?? {}), ...v.timepoints };
+          // 新的时点候选已重新校验，旧端点不可混入本轮数值。
+          row.timepoints = v.timepoints;
+          if (v.preferredResult) row.preferredResult = v.preferredResult;
+          else delete row.preferredResult;
           /*
            * 数值与编码自洽：填了 difference_* 就该是 measurementType=2、填了 events 就该是 3。
            * 模型经常在这里自相矛盾（实测 2015-04 的 BDI 两行填了差值却写 1），
@@ -501,8 +624,14 @@ for (const studyId of studies) {
          * 随后 outcome-values 再跑一次就会覆盖成最新值。
          */
         const prevRows = extraction.outcomes ?? [];
-        for (const [i, row] of fresh.entries()) {
-          if (!row.timepoints && prevRows[i]?.timepoints) row.timepoints = prevRows[i].timepoints;
+        for (const row of fresh) {
+          const matches = prevRows.filter(old => old.studyId === row.studyId
+            && sameOutcomeLabel(old.outcome?.name?.raw ?? '', row.outcome?.name?.raw ?? '')
+            && (old.outcome?.instrument?.raw === row.outcome?.instrument?.raw
+              || sameOutcomeLabel(old.outcome?.instrument?.raw ?? '', row.outcome?.instrument?.raw ?? '')));
+          if (matches.length !== 1) continue;
+          row.timepoints ??= matches[0].timepoints;
+          row.preferredResult ??= matches[0].preferredResult;
         }
         extraction.outcomes = fresh;
       }
@@ -514,8 +643,13 @@ for (const studyId of studies) {
     }
   }
 
-  extraction.issues = [...droppedFor('issues', 'skill'), ...issues];
-  extraction.unresolved = [...droppedFor('unresolved', 'skillId'), ...unresolved];
+  if (outcomeWork) {
+    applySourceEvidence();
+    extraction.pipeline.sourceOutcomeChecks = { ...checks, tableRepairs: native.repairs, tableUnresolved: native.unresolved };
+  }
+
+  extraction.issues = [...(prev?.issues ?? []).filter(item => !ranSkills.has(item.skill)), ...issues];
+  extraction.unresolved = [...(prev?.unresolved ?? []).filter(item => !ranSkillIds.has(item.skillId)), ...unresolved];
 
   /*
    * 证据审计只针对"字段-bearing"的部分。
@@ -550,13 +684,45 @@ for (const studyId of studies) {
 
   const errors = extraction.issues.filter((i) => i.severity === 'error').length;
   const warns = extraction.issues.filter((i) => i.severity === 'warning').length;
+
+  /*
+   * "跑完没抛异常" ≠ "抽成功了"（判据说明见 callsBefore 处）。
+   * ⚠️ 假成功比直接报错危险得多：实测 2015-06 的 14 次调用全 403，
+   * 产物只剩 149 个叶子（基线 434），跑批却报"成功 6 / 6 篇"。
+   */
+  const artCalls = llm.calls.slice(callsBefore);
+  const okCalls = artCalls.filter((c) => c.ok).length;
+  const failedCalls = artCalls.length - okCalls;
+  const skillNames = Object.keys(perSkill);
+  const skillFailed = skillNames.filter((n) => perSkill[n]?.error);
+
+  const catastrophic = fieldCount === 0
+    || (artCalls.length > 0 && okCalls === 0)
+    || (skillNames.length > 0 && skillFailed.length === skillNames.length);
+  const failure = catastrophic
+    ? (artCalls.length > 0 && okCalls === 0
+      ? `本篇 ${artCalls.length} 次 LLM 调用全部失败（首个：${artCalls.find((c) => !c.ok)?.error ?? '未知'}）`
+      : skillFailed.length
+        ? `全部 ${skillFailed.length} 个 SKILL 都失败（首个：${perSkill[skillFailed[0]].error}）`
+        : '没有抽到任何字段')
+    : null;
+
   console.log(`  → ${file.replace(ROOT + '\\', '')}`);
   console.log(`  字段 ${fieldCount} | 证据违规 ${violations.length} | issue error ${errors} / warn ${warns} | ${Date.now() - t0}ms`);
+  if (failedCalls > 0) {
+    // 部分失败也要看得见：以前只在上面逐行打 ✗，汇总里完全看不出来
+    const pct = ((failedCalls / artCalls.length) * 100).toFixed(0);
+    console.warn(`  ⚠ ${failedCalls}/${artCalls.length} 次调用失败（${pct}%）`
+      + (skillFailed.length ? `，涉及 SKILL：${skillFailed.join('、')}` : ''));
+  }
 
   runSummary.articles.push({
-    studyId: doc.articleId, ok: true, file: file.replace(ROOT + '\\', ''),
+    studyId: doc.articleId, ok: !catastrophic, file: file.replace(ROOT + '\\', ''),
     perSkill, fields: fieldCount, evidenceViolations: violations.length,
     errors, warns, ms: Date.now() - t0,
+    calls: artCalls.length, callsFailed: failedCalls,
+    skillsFailed: skillFailed.length, skillsTotal: skillNames.length,
+    ...(failure ? { error: failure } : {}),
     comparisons: extraction.comparisons.length, outcomes: extraction.outcomes.length,
   });
 }
@@ -590,5 +756,10 @@ if (gTot) {
 }
 const failed = runSummary.articles.filter((a) => !a.ok);
 console.log(`  成功 ${runSummary.articles.length - failed.length} / ${runSummary.articles.length} 篇`);
-console.log(`  报告 build/extraction/${args.year}/_run.json\n`);
+if (failed.length) {
+  // 把失败原因一并打出来：以前只有一行"成功 N/M"，得往上翻几十行才知道为什么
+  console.error('\n  ✗ 失败的篇：');
+  for (const a of failed) console.error(`    ${a.studyId}  字段 ${a.fields}  —— ${a.error ?? '未知原因'}`);
+}
+console.log(`  报告 ${join(outDir, '_run.json')}\n`);
 process.exit(failed.length ? 1 : 0);

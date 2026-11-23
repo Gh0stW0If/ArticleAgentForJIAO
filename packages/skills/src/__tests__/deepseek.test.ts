@@ -68,6 +68,112 @@ describe('deepseek — 请求形状', () => {
     expect(res.usage).toEqual({ inputTokens: 100, outputTokens: 20 });
   });
 
+  it.each([[undefined, undefined], ['high', undefined], ['medium', 'high'], ['medium', null]] as const)(
+    'Responses 默认档 %s 和单次覆盖档 %s 均按配置发送',
+    async (reasoningEffort, override) => {
+    const request = vi.fn(async (_url: string, _init: RequestInit) => Response.json({
+      status: 'completed',
+      model: 'test-model',
+      output: [
+        { type: 'reasoning', content: [] },
+        { type: 'message', content: [{ type: 'output_text', text: '{"ok":true}' }] },
+      ],
+      usage: { input_tokens: 8, output_tokens: 4 },
+    }));
+    const llm = createDeepSeekLlm({
+      apiKey: KEY,
+      baseUrl: 'https://example.test/v1/',
+      model: 'test-model',
+      wireApi: 'responses',
+      httpHeaders: { 'x-test-header': 'test-value' },
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      maxTokens: 0,
+      fetchImpl: request as unknown as typeof fetch,
+    });
+    const response = await llm.invoke({ ...req(), ...(override !== undefined ? { reasoningEffort:override } : {}) });
+    const [url, init] = request.mock.calls[0]!;
+    expect(url).toBe('https://example.test/v1/responses');
+    expect(new Headers(init.headers).get('x-test-header')).toBe('test-value');
+    expect(new Headers(init.headers).get('authorization')).toBe(`Bearer ${KEY}`);
+    const effort = override === undefined ? reasoningEffort : override;
+    expect(JSON.parse(String(init.body))).toEqual({
+      model: 'test-model',
+      input: [{ role: 'system', content: req().system }, { role: 'user', content: req().user }],
+      store: false,
+      stream: false,
+      text: { format: { type: 'json_object' } },
+      ...(effort ? { reasoning: { effort } } : {}),
+    });
+    expect(response.json).toEqual({ ok: true });
+    expect(response.usage).toEqual({ inputTokens: 8, outputTokens: 4 });
+  });
+
+  it('识别 Responses 的截断，即使已经形成可解析的 JSON', async () => {
+    const llm = createDeepSeekLlm({
+      apiKey: KEY,
+      wireApi: 'responses',
+      fetchImpl: (async () => Response.json({
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [{ type: 'message', content: [{ type: 'output_text', text: '{"ok":true}' }] }],
+      })) as typeof fetch,
+    });
+    await expect(llm.invoke(req())).rejects.toMatchObject({ kind: 'truncated' });
+  });
+
+  it('maxTokens 给 0 = 不限制：整个省略 max_tokens，由服务端用自己的上限', async () => {
+    /* 为什么要这个口子：实测 gpt-6-sol 在长输出上会顶到 8000 被截断，
+       回来的是不完整 JSON、整段字段白丢。而"该填多少"没人说得准，
+       所以支持"不填"比"拍一个数"可靠。 */
+    const calls: { init: RequestInit }[] = [];
+    const llm = createDeepSeekLlm({
+      apiKey: KEY,
+      maxTokens: 0,
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        calls.push({ init });
+        return okResponse('{"ok":true}');
+      }) as unknown as typeof fetch,
+    });
+    await llm.invoke(req());
+    const body = JSON.parse(String(calls[0]!.init.body));
+    expect('max_tokens' in body).toBe(false);   // 关键：字段不存在，而不是 null / 0
+    expect(body.temperature).toBe(0);           // 其余照旧
+    expect(body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('不限制时的截断提示不再谎报成 max_tokens 的锅', async () => {
+    const llm = createDeepSeekLlm({
+      apiKey: KEY,
+      maxTokens: 0,
+      retries: 0,
+      fetchImpl: (async () => okResponse('{"a":1}', { choices: [{ message: { content: '{"a":1}' }, finish_reason: 'length' }] })) as unknown as typeof fetch,
+    });
+    await expect(llm.invoke(req())).rejects.toThrow(/服务端上限截断/);
+  });
+
+  it('403 + 余额不足：提示指向"余额"，不要误报成"检查 API key"', async () => {
+    /* 实测：某 OpenAI 兼容端点余额用尽时返回 403
+       （{"error":{"message":"insufficient balance","type":"billing_error"}}）。
+       当时提示写的是"鉴权失败，请检查 API key"，会把人带去换 key —— 而问题其实是充值。 */
+    const llm = createDeepSeekLlm({
+      apiKey: KEY, retries: 0,
+      fetchImpl: (async () => errResponse(403, '{"error":{"message":"insufficient balance","type":"billing_error"}}')) as unknown as typeof fetch,
+    });
+    const e = await llm.invoke(req()).catch((x: Error) => x);
+    expect(String(e)).toMatch(/余额\/配额不足/);
+    expect(String(e)).not.toMatch(/检查 API key/);
+  });
+
+  it('报错里用实际 host，不写死 "DeepSeek"（客户端也用于别的兼容端点）', async () => {
+    const llm = createDeepSeekLlm({
+      apiKey: KEY, baseUrl: 'https://api.example.com/v1', retries: 0,
+      fetchImpl: (async () => errResponse(500, 'boom')) as unknown as typeof fetch,
+    });
+    const e = await llm.invoke(req()).catch((x: Error) => x);
+    expect(String(e)).toMatch(/api\.example\.com HTTP 500/);
+    expect(String(e)).not.toMatch(/DeepSeek HTTP/);
+  });
+
   it('baseUrl 带 /v1 或尾斜杠时不会拼出双斜杠', async () => {
     const urls: string[] = [];
     const mk = (baseUrl: string) => createDeepSeekLlm({

@@ -7,8 +7,14 @@ export * from './prompts.generated.ts';
 export * from './article-meta.ts';
 export * from './study-plan.ts';
 export * from './outcome-plan.ts';
+export * from './source-outcomes.ts';
 export * from './comparison.ts';
 export * from './timepoints.ts';
 export * from './outcome.ts';
 export * from './outcome-values.ts';
 export * from './outcome-audit.ts';
+export * from './precis2.ts';
+
+export * from './missing-data.ts';
+
+export * from './measurement-units.ts';

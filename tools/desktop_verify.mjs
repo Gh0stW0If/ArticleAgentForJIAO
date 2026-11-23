@@ -87,11 +87,22 @@ if (existsSync(aaDir)) {
     const marks = [
       ['按原文怎么写就怎么记', '单位三列口径（第三轮修正）'],
       ['1 月 = 4 周', '单位换算约定'],
-      ['该列在原始表格里没有对应批注', 'totalSessionsClassB 仍旧口径（预期命中，尚未修）'],
     ];
     for (const [needle, label] of marks) {
       if (t.includes(needle)) ok(`提示词含「${label}」`);
       else bad(`提示词缺少「${label}」（可能是旧 dist）`);
+    }
+    /*
+     * ⑤ 已退役字段必须**不在**提示词里（202609 规则，见 RETIRED_FIELDS）。
+     *
+     * 这里以前是反着写的：当时 `totalSessionsClassB` 没有编码表属于"已知未修"，
+     * 于是断言它必须命中。该列现已整列退役，断言改成"必须消失"——
+     * 顺带让这条验收能兜住「改了字段清单但没重新打包」。
+     */
+    const retired = ['totalSessionsClassB', 'totalSessionsClassA', 'frequencyClass', 'needleRetentionClass', 'specialDataFlag'];
+    for (const k of retired) {
+      if (t.includes(k)) bad(`提示词仍含已退役字段「${k}」（字段清单没生效，或打的是旧 dist）`);
+      else ok(`已退役字段「${k}」不在提示词里`);
     }
   }
 }

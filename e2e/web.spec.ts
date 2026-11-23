@@ -16,19 +16,38 @@ const YEAR = '2015';
 const STUDY = '2015-01';
 const CORPUS_PDF = join(process.cwd(), 'Datas', 'articles', YEAR, '-2015-01.pdf');
 
-/** 备份/还原某研究的覆盖层（测试不留副作用）。 */
+/**
+ * 多人机核对（202609）：标注按**核对人**分文件存。
+ *
+ * 测试固定用 `e2e` 这个核对人，只快照/还原它自己的记录——
+ * 不去碰使用者或其它核对人的真实标注（这也正是分文件存储的好处：
+ * 回滚一位核对人不会连累其他人）。
+ */
+const REVIEWER = 'e2e';
+const annUrl = (year: string, study: string, reviewer?: string) =>
+  `/api/annotation?year=${year}&study=${study}${reviewer ? `&reviewer=${encodeURIComponent(reviewer)}` : ''}`;
+
+/** 备份/还原 `e2e` 核对人的覆盖层（测试不留副作用）。 */
 async function snapshotOverlay(req: APIRequestContext): Promise<{ year: string; study: string; overlay: unknown }> {
-  const r = await req.get(`/api/annotation?year=${YEAR}&study=${STUDY}`);
+  const r = await req.get(annUrl(YEAR, STUDY, REVIEWER));
   const d = await r.json();
   return { year: YEAR, study: STUDY, overlay: d.overlay ?? null };
 }
 
 async function restoreOverlay(req: APIRequestContext, snap: { overlay: unknown }): Promise<void> {
-  await req.delete(`/api/annotation?year=${YEAR}&study=${STUDY}`);
+  await req.delete(annUrl(YEAR, STUDY, REVIEWER));
   const entries = (snap.overlay as { entries?: unknown[] } | null)?.entries ?? [];
   if (entries.length) {
-    await req.post(`/api/annotation?year=${YEAR}&study=${STUDY}`, { data: { entries } });
+    await req.post(annUrl(YEAR, STUDY, REVIEWER), { data: { reviewer: REVIEWER, entries } });
   }
+}
+
+/** 在界面上设定核对人（多人核对的必填项；不设则提交会被服务端拒绝）。 */
+async function signIn(page: Page): Promise<void> {
+  const box = page.locator('[data-testid="reviewer-input"]');
+  await box.fill(REVIEWER);
+  await box.press('Enter');
+  await expect(box).toHaveValue(REVIEWER);
 }
 
 /** 等在 PDF 上画出可交互的页（惰性渲染完成）。 */
@@ -121,6 +140,7 @@ test.describe('前端交互（真实浏览器）', () => {
   test('标注模式：框选写入字段证据 → 落盘 → 回滚', async ({ page, request }) => {
     await page.goto('/');
     await waitForPdf(page);
+    await signIn(page);
 
     // 进入标注模式（点某个字段的「框选证据」）
     await page.locator('[data-field="title"] button:has-text("框选证据")').click();
@@ -130,7 +150,7 @@ test.describe('前端交互（真实浏览器）', () => {
 
     // 落盘校验：覆盖层里出现 title，且带 bbox
     await expect.poll(async () => {
-      const d = await (await request.get(`/api/annotation?year=${YEAR}&study=${STUDY}`)).json();
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
       const e = (d.overlay?.entries ?? []).find((x: { fieldPath: string }) => x.fieldPath === 'title');
       return e?.value?.evidence?.[0]?.bbox ? 'ok' : 'no';
     }).toBe('ok');
@@ -138,7 +158,7 @@ test.describe('前端交互（真实浏览器）', () => {
     // 回滚 → 覆盖层里的 title 消失，界面回到流水线值
     await page.locator('[data-field="title"] button:has-text("回滚")').click();
     await expect.poll(async () => {
-      const d = await (await request.get(`/api/annotation?year=${YEAR}&study=${STUDY}`)).json();
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
       return (d.overlay?.entries ?? []).some((x: { fieldPath: string }) => x.fieldPath === 'title');
     }).toBe(false);
   });
@@ -146,6 +166,7 @@ test.describe('前端交互（真实浏览器）', () => {
   test('编辑字段 → 记为人工修改 → 回滚', async ({ page, request }) => {
     await page.goto('/');
     await waitForPdf(page);
+    await signIn(page);
     const row = page.locator('[data-field="condition"]');
     await row.locator('button:has-text("编辑")').click();
     const original = (await row.locator('div').first().innerText()).trim();
@@ -154,14 +175,14 @@ test.describe('前端交互（真实浏览器）', () => {
     await expect(page.getByText(/已(修改|补录) condition/)).toBeVisible();
 
     await expect.poll(async () => {
-      const d = await (await request.get(`/api/annotation?year=${YEAR}&study=${STUDY}`)).json();
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
       const e = (d.overlay?.entries ?? []).find((x: { fieldPath: string }) => x.fieldPath === 'condition');
       return e?.value?.raw ?? '';
     }).toBe('E2E 测试值');
 
     await page.locator('[data-field="condition"] button:has-text("回滚")').click();
     await expect.poll(async () => {
-      const d = await (await request.get(`/api/annotation?year=${YEAR}&study=${STUDY}`)).json();
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
       return (d.overlay?.entries ?? []).some((x: { fieldPath: string }) => x.fieldPath === 'condition');
     }).toBe(false);
     expect(original.length).toBeGreaterThan(0);
@@ -177,22 +198,54 @@ test.describe('前端交互（真实浏览器）', () => {
     await waitForPdf(page);
     await page.locator('[data-tab="sheet3"]').click();
 
-    // 第一行展开后，逐个字段的 key 顺序应与布局里的列序一致
-    const keysInDom: string[] = await page.locator(`[data-field^="outcomes.0."]`).evaluateAll((els) =>
-      els.map((e) => (e as HTMLElement).dataset.field?.split('.').pop() ?? ''));
-    const expected = row.fields
-      .map((f: { fieldPath: string }) => f.fieldPath.split('.').pop())
-      .filter((k: string) => keysInDom.includes(k));
-    const posOf = (k: string) => order.indexOf(k);
-    const ordered = [...keysInDom].sort((a, b) => {
-      const pa = posOf(a); const pb = posOf(b);
-      if (pa >= 0 && pb >= 0) return pa - pb;
-      if (pa >= 0) return -1;
-      if (pb >= 0) return 1;
-      return 0;
-    });
-    expect(keysInDom).toEqual(ordered);
-    expect(expected.length).toBeGreaterThan(0);
+    /*
+     * 该行在界面上的字段顺序，按**规范键**取。
+     *
+     * ⚠️ 这条用例以前是**假通过**的：它用 fieldPath 的末段去和列序表比，
+     * 而列序表里存的是规范键（`outcomeName` vs `name`）——两边对不上，
+     * 比较器对所有键都返回 0，断言恒真。先用「契约路径当标题」那个 bug 就是这么漏过去的。
+     * 现在 data-key 给出规范键，并且断言的是**顺序本身**。
+     */
+    const domKeys: string[] = await page.locator('[data-field^="outcomes.0."]').evaluateAll((els) =>
+      els.map((e) => (e as HTMLElement).dataset.key ?? ''));
+
+    expect(domKeys.length).toBeGreaterThan(5);   // 空列表会让下面的断言失去意义
+
+    // 复刻界面 orderFields 的排序规则：列序表里有的按序排，没有的保持原相对次序
+    const pos = new Map(order.map((k, i) => [k, i]));
+    const expected = [...row.fields]
+      .map((f: { key?: string }) => f.key ?? '')
+      .sort((a: string, b: string) => {
+        const pa = pos.get(a); const pb = pos.get(b);
+        if (pa !== undefined && pb !== undefined) return pa - pb;
+        if (pa !== undefined) return -1;
+        if (pb !== undefined) return 1;
+        return 0;
+      });
+
+    expect(domKeys).toEqual(expected);
+    // 原表列序里排第一的字段应当真的排在前面（防止两边同时退化成原始顺序而"对上"）
+    expect(order.indexOf(domKeys[0]!)).toBeGreaterThanOrEqual(0);
+  });
+
+  test('Sheet3 字段标题用原表中文名，不是契约路径', async ({ page, request }) => {
+    const fields = await (await request.get(`/api/fields?year=${YEAR}&study=${STUDY}`)).json();
+    const row = fields.sheets.sheet3.rows[0];
+    test.skip(!row, '该篇没有结局行');
+
+    await page.goto('/');
+    await waitForPdf(page);
+    await page.locator('[data-tab="sheet3"]').click();
+
+    const labels: string[] = await page.locator('[data-field^="outcomes.0."]').evaluateAll((els) =>
+      els.map((e) => (e as HTMLElement).innerText.split('\n')[0]?.trim() ?? ''));
+
+    expect(labels.length).toBeGreaterThan(5);
+    // 契约路径的形态：驼峰且带点（如 outcome.name / timepoints.baseline.continuous.experimental.estimate）
+    const rawPaths = labels.filter((l) => /^[a-z][A-Za-z]*\.[a-zA-Z]/.test(l));
+    expect(rawPaths).toEqual([]);
+    // 原表里就叫 construct / subconstruct，这两个允许是英文
+    expect(labels.some((l) => /[\u4e00-\u9fa5]/.test(l))).toBe(true);
   });
 
   test('Sheet2 选项卡能切过去并显示结局分类', async ({ page }) => {
@@ -209,6 +262,7 @@ test.describe('前端交互（真实浏览器）', () => {
 
     await page.goto('/');
     await waitForPdf(page);
+    await signIn(page);
     await page.locator('[data-tab="sheet3"]').click();
     const before = fields.sheets.sheet3.rows.length;
 
@@ -220,6 +274,308 @@ test.describe('前端交互（真实浏览器）', () => {
     expect(after.sheets.sheet3.rows.length).toBe(before + 1);
     expect(after.sheets.sheet3.rows.at(-1).fields.some((f: { fieldPath: string }) =>
       f.fieldPath === `outcomes.${before}.outcome.name`)).toBe(true);
+  });
+
+  test('多人机核对：两人分歧时不生效（保留机器值），一致后才生效', async ({ page, request }) => {
+    const A = 'e2e-a';
+    const B = 'e2e-b';
+    const post = (reviewer: string, raw: string) => request.post(annUrl(YEAR, STUDY, reviewer), {
+      data: {
+        reviewer,
+        entry: { fieldPath: 'condition', action: 'override', value: { raw, provenance: 'human', confidence: 1 } },
+      },
+    });
+    const fieldsOf = async (): Promise<{ fieldPath: string; raw: string }[]> =>
+      (await (await request.get(`/api/fields?year=${YEAR}&study=${STUDY}`)).json())
+        .groups.flatMap((g: { fields?: { fieldPath: string; raw: string }[] }) => g.fields ?? []);
+    const condRaw = async () => (await fieldsOf()).find((f) => f.fieldPath === 'condition')?.raw ?? '';
+
+    try {
+      await page.goto('/');
+      const machine = await condRaw();
+      expect(machine.length).toBeGreaterThan(0);
+
+      // 两位核对人给出不同结论 → 分歧
+      await post(A, 'E2E-甲');
+      await post(B, 'E2E-乙');
+      const disputed = await (await request.get(annUrl(YEAR, STUDY, A))).json();
+      expect(disputed.consensus.stats.disputed).toBe(1);
+      expect(disputed.consensus.disputed[0].fieldPath).toBe('condition');
+      // 关键语义：分歧**不替人裁决**，字段视图仍是机器原值
+      expect(await condRaw()).toBe(machine);
+
+      // 界面上标出分歧
+      await page.reload();
+      await expect(page.locator('[data-testid="review-toggle"]')).toContainText('分歧 1');
+
+      // 两人改成同一结论 → 生效，且两两一致率为 1
+      await post(B, 'E2E-甲');
+      const agreed = await (await request.get(annUrl(YEAR, STUDY, A))).json();
+      expect(agreed.consensus.stats.agreed).toBe(1);
+      const pair = agreed.consensus.pairwise.find(
+        (p: { reviewerA: string; reviewerB: string }) => p.reviewerA === A && p.reviewerB === B,
+      );
+      expect(pair?.rate).toBe(1);
+      await expect.poll(condRaw).toBe('E2E-甲');
+    } finally {
+      await request.delete(annUrl(YEAR, STUDY, A));
+      await request.delete(annUrl(YEAR, STUDY, B));
+    }
+  });
+
+  test('导出人工结果：XLSX 与 CSV 都能下载且是合法文件', async ({ page }) => {
+    await page.goto('/');
+    // 导出必须署名（文件要带签名，导回时据此判归属）
+    await signIn(page);
+    await expect(page.locator('[data-testid="export-xlsx"]')).toBeEnabled();
+
+    /** 点按钮 → 等下载 → 读回字节。 */
+    const grab = async (testid: string, ext: string): Promise<Buffer> => {
+      const [dl] = await Promise.all([
+        page.waitForEvent('download'),
+        page.locator(`[data-testid="${testid}"]`).click(),
+      ]);
+      expect(dl.suggestedFilename()).toMatch(new RegExp(`\\.${ext}$`));
+      const p = await dl.path();
+      expect(p).toBeTruthy();
+      return readFileSync(p!);
+    };
+
+    const xlsx = await grab('export-xlsx', 'xlsx');
+    // xlsx 就是 ZIP：头两字节必须是 PK
+    expect(xlsx.subarray(0, 2).toString('hex')).toBe('504b');
+    expect(xlsx.length).toBeGreaterThan(1000);
+
+    const csv = await grab('export-csv', 'csv');
+    // 必须有 UTF-8 BOM，否则 Excel 打开中文乱码
+    expect([...csv.subarray(0, 3)]).toEqual([0xEF, 0xBB, 0xBF]);
+    const text = csv.toString('utf8');
+    expect(text).toContain('工作表,年份,研究,所在行,字段');
+    expect(text).toContain('核对状态');
+  });
+
+  test('批量导出：整年 XLSX 能下载，文件名标出范围', async ({ page }) => {
+    await page.goto('/');
+    await signIn(page);
+    await expect(page.locator('[data-testid="batch-menu"]')).toBeEnabled();
+
+    await page.locator('[data-testid="batch-menu"]').click();
+    await expect(page.locator('[data-testid="batch-popup"]')).toBeVisible();
+
+    const [dl] = await Promise.all([
+      page.waitForEvent('download'),
+      page.locator(`[data-testid="batch-year-xlsx"]`).click(),
+    ]);
+    expect(dl.suggestedFilename()).toContain(`${YEAR}_全部`);
+    expect(dl.suggestedFilename()).toMatch(/\.xlsx$/);
+    const buf = readFileSync((await dl.path())!);
+    expect(buf.subarray(0, 2).toString('hex')).toBe('504b');
+    // 整年（6 篇）明显大于单篇导出，用来区分「真批量」和「只导了一篇」
+    expect(buf.length).toBeGreaterThan(60_000);
+  });
+
+  test('导回：导出 → 改一格 → 预览差异 → 确认写入', async ({ page, request }) => {
+    // 先让该核对人有一条记录，导出的表里才会有他的列
+    await request.post(annUrl(YEAR, STUDY, REVIEWER), {
+      data: {
+        reviewer: REVIEWER,
+        entry: { fieldPath: 'condition', action: 'override', value: { raw: 'E2E-改前', provenance: 'human', confidence: 1 } },
+      },
+    });
+
+    await page.goto('/');
+    await waitForPdf(page);
+    await signIn(page);
+
+    // 导出 CSV（导出要署名），把那一格改掉（模拟医生在 Excel 里改）
+    const csv = (await (await request.get(
+      `/api/export?year=${YEAR}&study=${STUDY}&format=csv&reviewer=${encodeURIComponent(REVIEWER)}`,
+    )).body()).toString('utf8');
+    const edited = csv.replace('E2E-改前', 'E2E-改后');
+    expect(edited).not.toBe(csv);
+
+    await page.locator('[data-testid="open-import"]').click();
+    await expect(page.locator('[data-testid="review-tools"]')).toBeVisible();
+    await page.locator('[data-testid="import-file"]').setInputFiles({
+      name: 'edited.csv', mimeType: 'text/csv', buffer: Buffer.from(edited, 'utf8'),
+    });
+
+    // 预览：必须先把差异摊开给人看
+    await page.locator('[data-testid="import-preview"]').click();
+    await expect(page.locator('[data-testid="tools-status"]')).toContainText('预览完成');
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('E2E-改前');
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('E2E-改后');
+
+    // 预览阶段**不能**落盘
+    const before = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
+    expect((before.overlay?.entries ?? []).find((e: { fieldPath: string }) => e.fieldPath === 'condition')?.value?.raw)
+      .toBe('E2E-改前');
+
+    await page.locator('[data-testid="import-apply"]').click();
+    await expect(page.locator('[data-testid="tools-status"]')).toContainText('已写入 1 处');
+
+    await expect.poll(async () => {
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
+      return (d.overlay?.entries ?? []).find((e: { fieldPath: string }) => e.fieldPath === 'condition')?.value?.raw;
+    }).toBe('E2E-改后');
+  });
+
+  test('两组结果对比：机器 vs 核对人，列出不一致的字段', async ({ page, request }) => {
+    await request.post(annUrl(YEAR, STUDY, REVIEWER), {
+      data: {
+        reviewer: REVIEWER,
+        entry: { fieldPath: 'condition', action: 'override', value: { raw: 'E2E-人工值', provenance: 'human', confidence: 1 } },
+      },
+    });
+
+    await page.goto('/');
+    await waitForPdf(page);
+    await signIn(page);
+    await page.locator('[data-testid="open-compare"]').click();
+    await expect(page.locator('[data-testid="review-tools"]')).toBeVisible();
+
+    // B 组默认选中第一位核对人
+    await expect(page.locator('[data-testid="compare-b"]')).toHaveValue(`reviewer:${REVIEWER}`);
+    await page.locator('[data-testid="compare-run"]').click();
+
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('一致率');
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('condition');
+    await expect(page.locator('[data-testid="review-tools"]')).toContainText('E2E-人工值');
+  });
+
+  test('署名：导出必带签名，导回时署名不符就拒绝写入', async ({ page, request }) => {
+    const OTHER = 'e2e-signer';
+    const imp = (q: string, body: Buffer) => request.post(
+      `/api/import-review?year=${YEAR}&study=${STUDY}&reviewer=${encodeURIComponent(REVIEWER)}${q}`,
+      { headers: { 'content-type': 'text/csv' }, data: body },
+    );
+    let csv = Buffer.alloc(0);
+
+    try {
+      // 以「e2e-signer」名义导出一份（文件里带他的署名与他的列）
+      await request.post(annUrl(YEAR, STUDY, OTHER), {
+        data: {
+          reviewer: OTHER,
+          entry: { fieldPath: 'condition', action: 'override', value: { raw: 'SIGN-1', provenance: 'human', confidence: 1 } },
+        },
+      });
+      csv = await (await request.get(
+        `/api/export?year=${YEAR}&study=${STUDY}&format=csv&reviewer=${encodeURIComponent(OTHER)}`,
+      )).body();
+
+      // ① 不署名就导不出来：导出接口本身就要求 reviewer
+      const noSigner = await request.get(`/api/export?year=${YEAR}&study=${STUDY}&format=csv`);
+      expect(noSigner.status()).toBe(400);
+      expect((await noSigner.json()).error).toContain('签名');
+
+      // ② 以别人身份导回 → 拒绝，并把署名摆出来
+      const bad = await imp('', csv);
+      expect(bad.status()).toBe(400);
+      const bj = await bad.json();
+      expect(bj.error).toContain(OTHER);
+      expect(bj.signature.signer).toBe(OTHER);
+
+      // ③ 显式忽略署名异常 → 放行，且改动记到**署名者**名下（表里那列本来就是他的）
+      const ok = await imp('&apply=1&allowMismatch=1', csv);
+      expect(ok.status()).toBe(200);
+      const oj = await ok.json();
+      expect(oj.effectiveReviewer).toBe(OTHER);
+      expect(oj.stats.errors).toBe(0);
+    } finally {
+      await request.delete(annUrl(YEAR, STUDY, OTHER));
+    }
+
+    // ④ 界面上也能看见署名：勾上「忽略署名异常」后预览，署名横幅要显示导出人
+    await page.goto('/');
+    await waitForPdf(page);
+    await signIn(page);
+    await page.locator('[data-testid="open-import"]').click();
+    await page.locator('[data-testid="import-file"]').setInputFiles({
+      name: 'signed-by-other.csv', mimeType: 'text/csv', buffer: csv,
+    });
+    await page.locator('[data-testid="import-allow-mismatch"]').check();
+    await page.locator('[data-testid="import-preview"]').click();
+    await expect(page.locator('[data-testid="import-signature"]')).toContainText(OTHER);
+    await expect(page.locator('[data-testid="import-signature"]')).toContainText('校验和');
+  });
+
+  test('字体档位：小/中/大生效并持久化；放大后框选坐标仍与中档一致', async ({ page, request }) => {
+    await page.goto('/');
+    await waitForPdf(page);
+    await signIn(page);
+
+    /** 根容器的实际 CSS zoom。 */
+    const zoomOf = () => page.evaluate(() => {
+      const el = document.querySelector('[data-testid="app-root"]') as HTMLElement | null;
+      return el ? Number(getComputedStyle(el).zoom || '1') : -1;
+    });
+
+    const setScale = async (s: 'small' | 'medium' | 'large') => {
+      await page.locator('[data-testid="settings-btn"]').click();
+      await page.locator(`[data-testid="font-${s}"]`).click();
+      await page.locator('[data-testid="settings-dialog"] button:has-text("✕")').click();
+    };
+
+    /** 在标题上框选一次，取回写入的 canonical bbox，然后回滚。 */
+    const bboxOf = async (): Promise<number[]> => {
+      await page.locator('[data-field="title"] button:has-text("框选证据")').click();
+      await expect(page.getByText(/标注模式：.*拖拽框选/)).toBeVisible();
+      await dragOnPage(page, 1, { x: 0.15, y: 0.12 }, { x: 0.8, y: 0.30 });
+      await expect(page.getByText(/已为 title 写入证据/)).toBeVisible();
+
+      const d = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
+      const e = (d.overlay?.entries ?? []).find((x: { fieldPath: string }) => x.fieldPath === 'title');
+      const bbox = e?.value?.evidence?.[0]?.bbox as number[];
+
+      await page.locator('[data-field="title"] button:has-text("回滚")').click();
+      await expect.poll(async () => {
+        const dd = await (await request.get(annUrl(YEAR, STUDY, REVIEWER))).json();
+        return (dd.overlay?.entries ?? []).some((x: { fieldPath: string }) => x.fieldPath === 'title');
+      }).toBe(false);
+      return bbox;
+    };
+
+    // 默认中档
+    expect(await zoomOf()).toBe(1);
+    const atMedium = await bboxOf();
+
+    // 大档：界面确实被放大，**且仍然铺满视口**
+    await setScale('large');
+    await expect.poll(zoomOf).toBe(1.2);
+    await expect(page.locator('[data-testid="settings-btn"]')).toBeVisible();
+
+    // 这条盯的是 zoom 下 `%` 与 `vh` 解析方式不同这个坑：
+    // 宽度若也除以倍数，右侧会空出约 1/6 视口（实测 245/1470）。
+    const fill = await page.evaluate(() => {
+      const root = document.querySelector('[data-testid="app-root"]') as HTMLElement;
+      const aside = document.querySelector('aside') as HTMLElement;
+      return {
+        vw: window.innerWidth, vh: window.innerHeight,
+        rootW: Math.round(root.getBoundingClientRect().width),
+        rootH: Math.round(root.getBoundingClientRect().height),
+        asideRight: Math.round(aside.getBoundingClientRect().right),
+      };
+    });
+    expect(fill.asideRight).toBe(fill.vw);          // 右栏贴到视口右边，没有留白
+    expect(Math.abs(fill.rootH - fill.vh)).toBeLessThan(3);   // 也不溢出、不裁底
+
+    // 关键：同一**相对区域**的框选，放大前后应得到几乎相同的 canonical bbox。
+    // 这条专门盯 CSS zoom 把 getBoundingClientRect 一起放大的坑——
+    // 不修的话这里的坐标会整体大 1.2 倍。
+    const atLarge = await bboxOf();
+    expect(atLarge.length).toBe(4);
+    for (let i = 0; i < 4; i++) {
+      expect(Math.abs(atLarge[i]! - atMedium[i]!)).toBeLessThan(3);
+    }
+
+    // 刷新后仍是 1.2（本机记住）
+    await page.reload();
+    await waitForPdf(page);
+    expect(await zoomOf()).toBe(1.2);
+
+    // 小档
+    await setScale('small');
+    await expect.poll(zoomOf).toBe(0.9);
   });
 
   test('设置对话框：显示掩码密钥并可测试连通性', async ({ page }) => {
@@ -235,6 +591,72 @@ test.describe('前端交互（真实浏览器）', () => {
     await dlg.locator('button:has-text("测试连接")').click();
     // 联网结果可能是成功也可能的失败（离线环境），但**必须有结果文本**
     await expect(page.locator('[data-testid="settings-test-result"]')).toBeVisible({ timeout: 20_000 });
+  });
+
+  /**
+   * 结局行人工裁定（覆盖率口径的配套）。
+   *
+   * 覆盖率口径下"流水线抽了、金标准没要"的结局行**不判错**，改由人工决定留不留。
+   * 这里一次覆盖四件事：① 待裁行在界面上列出来（含"最接近的金标准行"）；
+   * ② 丢弃后落盘且状态归属正确；③ **丢弃的行不再进导出**（这才是裁定的实际意义）；
+   * ④ 撤销能回到"未裁定"。
+   *
+   * 用 `2015-06`：它是 2015 里唯一有待裁行的研究（`2015-01` 是 0 条）。
+   */
+  test('结局行裁定：金标准没要的行可保留/丢弃，丢弃的不进导出', async ({ page, request }) => {
+    const Y = '2015';
+    const ST = '2015-06';
+    const adjUrl = `/api/adjudication?year=${Y}&study=${ST}`;
+    const before = await (await request.get(adjUrl)).json();
+    test.skip(!(before.rows ?? []).length, '该篇没有待人工裁定的结局行');
+
+    const idx: number = before.rows[0].index;
+    const csvUrl = (r: string) => `/api/export?year=${Y}&study=${ST}&format=csv&reviewer=${r}`;
+
+    try {
+      const csvBefore = await (await request.get(csvUrl(REVIEWER))).text();
+      expect(csvBefore).toContain(`outcomes.${idx}.`);
+
+      await page.goto('/');
+      await waitForPdf(page);
+      await signIn(page);
+      await page.locator('[data-testid="study-select"]').selectOption(ST);
+      await page.locator('[data-tab="sheet3"]').click();
+
+      const card = page.locator(`[data-deferred="${idx}"]`);
+      await expect(card).toBeVisible();
+      // 必须摆出"最接近的金标准行"：候选边是窄的，可能把同一个结局也圈进来，
+      // 规则只负责缩小队列，判断交给人。
+      await expect(card).toContainText('最接近的金标准行');
+      await expect(card).toContainText('未裁定');
+
+      await card.locator('[data-action="adjudicate-drop"]').click();
+      await expect(page.locator('[data-testid="notice"]')).toContainText(/已丢弃/);
+
+      const afterDrop = await (await request.get(adjUrl)).json();
+      const row = afterDrop.rows.find((r: { index: number }) => r.index === idx);
+      expect(row.effective).toBe('drop');
+      expect(row.status).toBe('single');
+      expect(row.opinions[0].reviewer).toBe(REVIEWER);
+
+      // ③ 丢弃的行整行从导出里消失
+      const csvAfter = await (await request.get(csvUrl(REVIEWER))).text();
+      expect(csvAfter).not.toContain(`outcomes.${idx}.`);
+
+      // ④ 撤销 → 回到未裁定，且该行重新出现在导出里
+      await card.locator('[data-action="adjudicate-clear"]').click();
+      await expect(page.locator('[data-testid="notice"]')).toContainText(/已撤销裁定/);
+      const afterClear = await (await request.get(adjUrl)).json();
+      expect(afterClear.rows.find((r: { index: number }) => r.index === idx).status).toBe('none');
+      expect(await (await request.get(csvUrl(REVIEWER))).text()).toContain(`outcomes.${idx}.`);
+    } finally {
+      // 测试不留副作用：把 e2e 名下这几行的裁定全部撤销
+      for (const r of before.rows ?? []) {
+        await request.post('/api/adjudication', {
+          data: { year: Y, study: ST, reviewer: REVIEWER, rowIndex: r.index, decision: null },
+        });
+      }
+    }
   });
 
   test('导入文章：上传 PDF 后出现在研究列表并可打开', async ({ page, request }) => {

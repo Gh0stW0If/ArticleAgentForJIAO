@@ -7,15 +7,21 @@
  *   右 = 三张选项卡（Sheet1 / Sheet2 / Sheet3），字段按**原始表格列序**排布，可编辑/确认/回滚
  *
  * 数据流：
- *   GET  /api/fields                       → 字段视图（流水线值 + 人工覆盖层合并；含 sheets 布局）
- *   POST /api/annotation                   → 写入人工标注（confirm / override / add）
- *   DELETE /api/annotation?fieldPath=…     → 单字段回滚
+ *   GET  /api/fields                       → 字段视图（流水线值 + 多人核对合并；含 sheets 布局）
+ *   GET  /api/annotation?reviewer=…        → 某核对人的记录 + 全部核对人进度 + 分歧 + 两两一致率
+ *   POST /api/annotation {reviewer,…}      → 写入某核对人的标注（confirm / override / add）
+ *   DELETE /api/annotation?reviewer=…&fieldPath=… → 单字段回滚（按核对人）
+ *   GET  /api/export?format=xlsx|csv       → 导出人工核对结果（每个字段一行，每位核对人三列）
  *   POST /api/import                       → 导入 PDF（写入 build/imports，不动 Datas/）
  *   POST /api/parse | /api/extract         → 后台任务（MinerU 解析 / LLM 抽取）
  *   GET  /api/jobs                         → 任务状态与日志尾部
  *
  * 「人工修改」的存储原则：绝不改写流水线产物，只写独立的覆盖层
  * （见 packages/core/src/annotation.ts），因此随时可对比"原始 vs 人工"。
+ *
+ * 多人机核对（202609）：**一位核对人一份文件** —— `build/annotations/<year>/<study>.<reviewer>.json`。
+ * 各人独立盲评、互不覆盖；结论一致的字段才生效，**有分歧的字段不替人取值**（保留机器原值并标出），
+ * 等第三方仲裁。核对人身份存在 localStorage，提交时随请求带上。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -23,8 +29,13 @@ import * as pdfjs from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { PdfViewer, type Selection, type SelectMode } from './PdfViewer.tsx';
 import { ExtractionPanel } from './ExtractionPanel.tsx';
+import { WorkflowPanel, type WorkflowEvidence } from './WorkflowPanel.tsx';
 import { SettingsPanel } from './SettingsPanel.tsx';
-import { T, R, tint, ghostBtn, primaryBtn, input as inputS } from './theme.ts';
+import { ReviewToolsPanel } from './ReviewToolsPanel.tsx';
+import { T, R, SH, tint, ghostBtn, primaryBtn, input as inputS } from './theme.ts';
+import {
+  FONT_SCALE_KEY, FONT_ZOOM, readFontScale, type FontScale,
+} from './theme.ts';
 import type { Bbox } from './geometry.ts';
 import type { FieldView, JobInfo, MiniDoc, SheetsPayload, StudyEntry } from './types.ts';
 
@@ -45,7 +56,7 @@ const EMPTY_SHEETS: SheetsPayload = {
   order: { sheet1: { article: [], comparison: [] }, sheet2: [], sheet3: { top: [], timepoint: { baseline: [], endOfTreatment: [], followUpEnd: [] } } },
   sheet1: { title: 'Sheet1', article: [], comparisons: [], external: [] },
   sheet2: { title: 'Sheet2', fields: [] },
-  sheet3: { title: 'Sheet3', rows: [], candidates: [], nextOutcomeIndex: 0 },
+  sheet3: { title: 'Sheet3', rows: [], candidates: [], nextOutcomeIndex: 0, deferred: [], deferredCounts: { keep: 0, drop: 0, disputed: 0, none: 0 } },
 };
 
 /** MinerU 块类型 → 证据类型。 */
@@ -56,13 +67,81 @@ function evKindOf(blockType: string | undefined): EvKind {
   return 'text';
 }
 
+/** 一位核对人的工作量（`/api/annotation` 的 `reviewers`）。 */
+interface ReviewerSummary {
+  reviewer: string;
+  total: number;
+  added: number;
+  overridden: number;
+  confirmed: number;
+  updatedAt: string | null;
+}
+
+/** 多人机核对汇总（`/api/annotation` 的 `reviewers` + `consensus`）。 */
+interface ReviewSummary {
+  reviewers: ReviewerSummary[];
+  consensus: {
+    stats: {
+      total: number; agreed: number; disputed: number; single: number;
+      machineOnly: number; reviewed: number; changed: number;
+    };
+    disputed: {
+      fieldPath: string;
+      machineRaw: string | null;
+      opinions: { reviewer: string; raw: string; action: string }[];
+    }[];
+    pairwise: { reviewerA: string; reviewerB: string; common: number; same: number; disputed: number; rate: number | null }[];
+  };
+}
+
+const EMPTY_REVIEW: ReviewSummary = {
+  reviewers: [],
+  consensus: {
+    stats: { total: 0, agreed: 0, disputed: 0, single: 0, machineOnly: 0, reviewed: 0, changed: 0 },
+    disputed: [],
+    pairwise: [],
+  },
+};
+
+/**
+ * 核对人身份的本地存储键。
+ *
+ * 为什么必须持久化：多人核对是**按人留痕**的（服务端强制校验 reviewer）。
+ * 每次刷新都要重填姓名，人会干脆不填或随手填一个——两种都会污染"人机核对"数据。
+ */
+const REVIEWER_KEY = 'aa.reviewer';
+
 export default function App() {
-  const [year, setYear] = useState('2015');
+  const [year, setYear] = useState(() => {
+    try { const value = window.localStorage.getItem('aa.lastYear'); return value && /^20\d{2}$/.test(value) ? value : '2015'; }
+    catch { return '2015'; }
+  });
   const [studies, setStudies] = useState<StudyEntry[]>([]);
   const [study, setStudy] = useState('');
   const [doc, setDoc] = useState<MiniDoc | null>(null);
   const [sheets, setSheets] = useState<SheetsPayload>(EMPTY_SHEETS);
   const [annStats, setAnnStats] = useState({ total: 0, added: 0, overridden: 0, confirmed: 0 });
+  /*
+   * 多人机核对：核对人身份 + 汇总。
+   * 「草稿」与「生效」分开——输入框 onBlur / 回车才生效，否则每敲一个字就重新拉一遍汇总。
+   */
+  const [reviewer, setReviewer] = useState(() => {
+    try { return window.localStorage.getItem(REVIEWER_KEY) ?? ''; } catch { return ''; }
+  });
+  const [reviewerDraft, setReviewerDraft] = useState(reviewer);
+  const [review, setReview] = useState<ReviewSummary>(EMPTY_REVIEW);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  /** 人工核对工具面板：null = 关闭；否则是当前选项卡。 */
+  const [toolsTab, setToolsTab] = useState<'import' | 'compare' | null>(null);
+  /** 批量导出菜单是否展开。 */
+  const [batchOpen, setBatchOpen] = useState(false);
+  /** 界面字体档位（小/中/大）——纯前端偏好，存 localStorage，不走服务端。 */
+  const [fontScale, setFontScale] = useState<FontScale>(readFontScale);
+  const uiZoom = FONT_ZOOM[fontScale];
+
+  useEffect(() => {
+    try { window.localStorage.setItem(FONT_SCALE_KEY, fontScale); } catch { /* 隐私模式下不可用 */ }
+  }, [fontScale]);
   const [page, setPage] = useState(1);
   const [focusPage, setFocusPage] = useState<number | undefined>(undefined);
   const [focusToken, setFocusToken] = useState(0);
@@ -84,6 +163,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [jobs, setJobs] = useState<JobInfo[]>([]);
+  const [panelMode, setPanelMode] = useState<'workflow' | 'review'>('workflow');
+  const [workflowDocumentId, setWorkflowDocumentId] = useState('');
+  const [workflowDoc, setWorkflowDoc] = useState<MiniDoc | null>(null);
   const [showJobLog, setShowJobLog] = useState(false);
   const pdfRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
   const [pdf, setPdf] = useState<pdfjs.PDFDocumentProxy | null>(null);
@@ -96,8 +178,16 @@ export default function App() {
       const d = await (await fetch(`/api/studies?year=${y}`)).json();
       const list: StudyEntry[] = d.studies ?? [];
       setStudies(list);
-      const next = keep && list.some((s) => s.studyId === keep) ? keep : (list[0]?.studyId ?? '');
+      let remembered = keep;
+      if (!remembered) {
+        try { remembered = window.localStorage.getItem('aa.lastStudy.' + y) ?? undefined; } catch {}
+      }
+      const next = remembered && list.some((s) => s.studyId === remembered) ? remembered : (list[0]?.studyId ?? '');
       setStudy(next);
+      try {
+        window.localStorage.setItem('aa.lastYear', y);
+        window.localStorage.setItem('aa.lastStudy.' + y, next);
+      } catch {}
       setStatus(list.length ? `${y}: ${list.length} 篇` : `${y} 下没有 PDF`);
       return next;
     } catch (e) {
@@ -122,6 +212,92 @@ export default function App() {
       setStatus(`字段加载失败: ${(e as Error).message}`);
     }
   }, []);
+
+  /* --------------------------- 多人核对汇总 --------------------------- */
+  const loadReview = useCallback(async (y: string, s: string, r: string) => {
+    if (!s) { setReview(EMPTY_REVIEW); return; }
+    try {
+      const q = r ? `&reviewer=${encodeURIComponent(r)}` : '';
+      const d = await (await fetch(`/api/annotation?year=${y}&study=${encodeURIComponent(s)}${q}`)).json();
+      setReview({ reviewers: d.reviewers ?? [], consensus: d.consensus ?? EMPTY_REVIEW.consensus });
+    } catch {
+      // 汇总失败不该拖垮字段视图：静默保留上一次的汇总
+    }
+  }, []);
+
+  useEffect(() => { void loadReview(year, study, reviewer); }, [year, study, reviewer, loadReview]);
+
+  /**
+   * 导出人工核对结果。
+   *
+   * `scope`：单篇 / 整年 / 全部年份。服务端直接从**界面同一份数据**生成，
+   * 所以文件与屏幕必然一致。
+   *
+   * 用 fetch + blob 而不是 `<a download>`：出错时（比如该篇没有可导出的字段）
+   * 能拿到中文错误信息显示出来，而不是把浏览器导航到一个 JSON 页面。
+   */
+  const onExport = useCallback(async (
+    format: 'xlsx' | 'csv',
+    scope: 'study' | 'year' | 'all' = 'study',
+  ) => {
+    if (scope === 'study' && !study) { setStatus('请先选择一篇文章'); return; }
+    /*
+     * **导出必须署名**。文件是要拿去改、再导回来的；署名就是"这份表是谁的"。
+     * 没有署名，导回时改动该记到谁名下就只能靠输入框，而输入框可以随手填别人名字。
+     */
+    if (!reviewer) {
+      setStatus('请先在「核对人」里填名字再导出——导出的文件要带署名');
+      return;
+    }
+    setBatchOpen(false);
+    setBusy(true);
+    setStatus(scope === 'study' ? '导出中…' : '批量导出中（篇数多时需要几秒）…');
+    try {
+      const q = (scope === 'study'
+        ? `year=${year}&study=${encodeURIComponent(study)}&format=${format}`
+        : (scope === 'year' ? `year=${year}&format=${format}` : `scope=all&format=${format}`))
+        + `&reviewer=${encodeURIComponent(reviewer)}`;
+      const r = await fetch(`/api/export?${q}`);
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({} as { error?: string }));
+        setStatus(`导出失败：${d.error ?? r.status}`);
+        return;
+      }
+      // 文件名在 content-disposition 里（中文名走 RFC 5987 的 filename*）
+      const cd = r.headers.get('content-disposition') ?? '';
+      const m = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+      const fallback = scope === 'study' ? `人工核对_${year}_${study}.${format}`
+        : (scope === 'year' ? `人工核对_${year}_全部.${format}` : `人工核对_全部年份.${format}`);
+      const name = m?.[1] ? decodeURIComponent(m[1]) : fallback;
+
+      const url = URL.createObjectURL(await r.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setStatus(`已导出 ${name}`);
+    } catch (e) {
+      setStatus(`导出失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+    // ⚠️ 依赖里必须有 reviewer：onExport 现在要读它（导出必须署名）。
+    //    漏掉就是经典闭包陷阱——函数永远看到初始的空字符串，导出一律被拦。
+  }, [year, study, reviewer]);
+
+  /** 提交核对人改名（输入框失焦 / 回车）。 */
+  const commitReviewer = useCallback(() => {
+    const next = reviewerDraft.trim();
+    setReviewer(next);
+    try {
+      if (next) window.localStorage.setItem(REVIEWER_KEY, next);
+      else window.localStorage.removeItem(REVIEWER_KEY);
+    } catch { /* 隐私模式下 localStorage 不可用：不影响本次会话 */ }
+    if (next && next !== reviewer) setStatus(`核对人已切换为「${next}」，此前提交的记录仍归原核对人`);
+  }, [reviewerDraft, reviewer]);
 
   /* --------------------------- MiniDoc + 字段 --------------------------- */
   useEffect(() => {
@@ -150,6 +326,8 @@ export default function App() {
     return () => { cancelled = true; };
   }, [year, study, loadFields]);
 
+  useEffect(() => { setWorkflowDocumentId(''); setWorkflowDoc(null); }, [year, study]);
+
   /* ------------------------------ PDF ------------------------------ */
   useEffect(() => {
     if (!study) return;
@@ -158,9 +336,20 @@ export default function App() {
       try {
         const prev = pdfRef.current;
         const p = await pdfjs.getDocument({
-          url: `/api/pdf?year=${year}&study=${encodeURIComponent(study)}`,
+          url: workflowDocumentId
+            ? `/api/workflow/pdf?year=${year}&study=${encodeURIComponent(study)}&document=${encodeURIComponent(workflowDocumentId)}`
+            : `/api/pdf?year=${year}&study=${encodeURIComponent(study)}`,
         }).promise;
         if (cancelled) { void p.destroy(); return; }
+        {
+          const pages = await Promise.all(Array.from({ length: p.numPages }, async (_, index) => {
+            const pg = await p.getPage(index + 1);
+            const vp = pg.getViewport({ scale: 1 });
+            return { page: index + 1, width: vp.width, height: vp.height, rotate: pg.rotate };
+          }));
+          if (cancelled) { void p.destroy(); return; }
+          setWorkflowDoc({ year, studyId: study, sourcePdf: workflowDocumentId, pages, blocks: [], stats: { blocks: 0, pages: p.numPages } });
+        }
         pdfRef.current = p;
         setPdf(p);
         // 旧文档延后销毁：等 React 提交新文档后再释放，否则会打断旧页渲染，闪现"渲染失败"
@@ -170,7 +359,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [year, study]);
+  }, [year, study, workflowDocumentId]);
 
   /* ------------------------------ 后台任务 ------------------------------ */
   const refreshJobs = useCallback(async () => {
@@ -278,15 +467,28 @@ export default function App() {
       note?: string;
     },
   ): Promise<boolean> => {
+    /*
+     * 核对人必填（服务端也会校验一次）。这里先拦是为了给出**看得懂的话**，
+     * 而不是把 400 的错误原文抛给医生。
+     */
+    if (!reviewer) {
+      setStatus('请先填写「核对人」再提交——多人核对按人留痕，不接受匿名写入');
+      return false;
+    }
     setBusy(true);
     try {
-      const r = await fetch(`/api/annotation?year=${year}&study=${encodeURIComponent(study)}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ entry }),
-      });
+      const r = await fetch(
+        `/api/annotation?year=${year}&study=${encodeURIComponent(study)}&reviewer=${encodeURIComponent(reviewer)}`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ reviewer, entry }),
+        },
+      );
       const d = await r.json();
       if (!r.ok) { setStatus(`保存失败: ${d.error}`); return false; }
+      // POST 的响应已带回最新汇总，直接用，省一次往返
+      if (d.reviewers) setReview({ reviewers: d.reviewers, consensus: d.consensus ?? EMPTY_REVIEW.consensus });
       await loadFields(year, study);
       return true;
     } catch (e) {
@@ -295,7 +497,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [year, study, loadFields]);
+  }, [year, study, reviewer, loadFields]);
 
   /**
    * 人工改值。
@@ -348,23 +550,26 @@ export default function App() {
   }, [postAnnotation]);
 
   const onRevert = useCallback(async (fieldPath: string) => {
+    if (!reviewer) { setStatus('请先填写「核对人」'); return; }
     if (findField(fieldPath)?.decidedBy !== 'human') { setStatus('该字段没有人工标注'); return; }
     setBusy(true);
     try {
       const r = await fetch(
-        `/api/annotation?year=${year}&study=${encodeURIComponent(study)}&fieldPath=${encodeURIComponent(fieldPath)}`,
+        `/api/annotation?year=${year}&study=${encodeURIComponent(study)}`
+          + `&reviewer=${encodeURIComponent(reviewer)}&fieldPath=${encodeURIComponent(fieldPath)}`,
         { method: 'DELETE' },
       );
       const d = await r.json();
       if (!r.ok) { setStatus(`回滚失败: ${d.error}`); return; }
       await loadFields(year, study);
+      void loadReview(year, study, reviewer);
       setStatus(d.removed ? `已回滚 ${fieldPath}` : `${fieldPath} 无人工标注`);
     } catch (e) {
       setStatus(`回滚失败: ${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
-  }, [year, study, findField, loadFields]);
+  }, [year, study, reviewer, findField, loadFields, loadReview]);
 
   /**
    * 「纳入抽取」：把「待人工确认纳入」的候选结局提升为正式的 Sheet3 行。
@@ -376,31 +581,65 @@ export default function App() {
   const onInclude = useCallback(async (f: FieldView) => {
     const meta = f.candidate;
     if (!meta) { setStatus('该候选缺少名称/工具，无法纳入'); return; }
+    if (!reviewer) { setStatus('请先填写「核对人」再纳入——纳入也是一条人工记录'); return; }
     const idx = sheets.sheet3.nextOutcomeIndex;
     const ev = currentEvidence(f.fieldPath);
     const note = '从「待人工确认纳入」纳入抽取';
     setBusy(true);
     try {
-      const r = await fetch(`/api/annotation?year=${year}&study=${encodeURIComponent(study)}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          entries: [
-            { fieldPath: `outcomes.${idx}.outcome.name`, action: 'add', value: { raw: meta.name || '（未命名）', evidence: ev, provenance: 'human', confidence: 1 }, note },
-            { fieldPath: `outcomes.${idx}.outcome.instrument`, action: 'add', value: { raw: meta.instrument || 'NR', evidence: ev, provenance: 'human', confidence: 1 }, note },
-          ],
-        }),
-      });
+      const r = await fetch(
+        `/api/annotation?year=${year}&study=${encodeURIComponent(study)}&reviewer=${encodeURIComponent(reviewer)}`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            reviewer,
+            entries: [
+              { fieldPath: `outcomes.${idx}.outcome.name`, action: 'add', value: { raw: meta.name || '（未命名）', evidence: ev, provenance: 'human', confidence: 1 }, note },
+              { fieldPath: `outcomes.${idx}.outcome.instrument`, action: 'add', value: { raw: meta.instrument || 'NR', evidence: ev, provenance: 'human', confidence: 1 }, note },
+            ],
+          }),
+        },
+      );
       const d = await r.json();
       if (!r.ok) { setStatus(`纳入失败：${d.error}`); return; }
       await loadFields(year, study);
+      void loadReview(year, study, reviewer);
       setNotice(`已纳入为 Sheet3 结局 ${idx + 1}：${meta.name || meta.instrument}（可继续编辑/框选证据）`);
     } catch (e) {
       setStatus(`纳入失败：${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
-  }, [sheets.sheet3.nextOutcomeIndex, year, study, currentEvidence, loadFields]);
+  }, [sheets.sheet3.nextOutcomeIndex, year, study, reviewer, currentEvidence, loadFields, loadReview]);
+
+  /**
+   * 结局行裁定：保留 / 丢弃 / 撤销（`decision = null`）。
+   *
+   * 覆盖率口径下，"流水线抽了、金标准没要"的行**不判错**，留不留由人定。
+   * 记录按核对人分开存（`build/adjudications/`），多人分歧时**不替人裁决**——
+   * 服务端按"保留"处理并标出。删数据是不可逆的，宁可留着让人再裁一次。
+   */
+  const onAdjudicate = useCallback(async (rowIndex: number, decision: 'keep' | 'drop' | null) => {
+    if (!reviewer) { setStatus('请先填写「核对人」再裁定——裁定也是一条人工记录'); return; }
+    setBusy(true);
+    try {
+      const r = await fetch('/api/adjudication', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ year, study, reviewer, rowIndex, decision }),
+      });
+      const d = await r.json();
+      if (!r.ok) { setStatus(`裁定失败：${d.error}`); return; }
+      await loadFields(year, study);
+      const verb = decision === 'keep' ? '保留' : decision === 'drop' ? '丢弃' : '撤销裁定';
+      setNotice(`结局行 ${rowIndex + 1} 已${verb}（记在「${reviewer}」名下）`);
+    } catch (e) {
+      setStatus(`裁定失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [year, study, reviewer, loadFields]);
 
   /* ------------------------------ 框选 ------------------------------ */
 
@@ -478,11 +717,36 @@ export default function App() {
     }
   }, [year, study]);
 
-  const totalPages = doc?.pages.length ?? 0;
+  const onWorkflowSource = useCallback((source: WorkflowEvidence) => {
+    if (source.documentId) setWorkflowDocumentId(source.documentId);
+    else { setWorkflowDocumentId(''); setWorkflowDoc(null); }
+    setFocusPage(source.page);
+    setFocusToken(token => token + 1);
+    setHighlights(source.bbox ? [{ page: source.page, bbox: source.bbox, label: '证据', color: T.amber }] : []);
+    setPage(source.page);
+  }, []);
+  const totalPages = pdf?.numPages ?? doc?.pages.length ?? 0;
   const currentStudy = studies.find((s) => s.studyId === study);
 
   return (
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: T.canvas }}>
+    /*
+     * ⚠️ 宽高在 zoom 下**单位解析方式不同**，不能一起除以 uiZoom（实测踩到）：
+     *
+     *   · `%` 宽：按**缩放后的**包含块解析 —— 写 100% 就已铺满，
+     *     再除一次反而只剩 83%，大档下右侧空出 245px。
+     *   · `vh` 高：按**真实视口**解析，再整体乘 zoom —— 所以必须除，
+     *     否则大档下变成 120vh，底部被裁掉 180px。
+     *
+     * 结论：宽用 `100%`，高用 `100/uiZoom vh`。两种写法在中小大三个档位都实测过。
+     */
+    <div data-testid="app-root" style={{
+      display: 'flex',
+      width: '100%',
+      height: `${100 / uiZoom}vh`,
+      overflow: 'hidden',
+      background: T.canvas,
+      zoom: uiZoom,
+    }}>
       {/* ============ 左：PDF ============ */}
       <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {/* 顶栏第 1 行：品牌 + 文章选择 + 导入/解析/抽取（左上角菜单） */}
@@ -500,7 +764,10 @@ export default function App() {
             {YEARS.map((y) => <option key={y} value={y}>{y}</option>)}
           </select>
           <select
-            value={study} onChange={(e) => setStudy(e.target.value)}
+            value={study} onChange={(e) => {
+              setStudy(e.target.value);
+              try { window.localStorage.setItem('aa.lastStudy.' + year, e.target.value); } catch {}
+            }}
             style={inputS({ maxWidth: 240 })} data-testid="study-select"
           >
             {studies.map((s) => (
@@ -528,10 +795,11 @@ export default function App() {
             title="用 MinerU 解析该 PDF（写入 build/mineru）"
           >解析</button>
           <button
-            onClick={() => void startJob('extract')} style={ghostBtn(T.indigo)}
-            disabled={busy || Boolean(runningJob)} data-testid="extract-btn"
-            title="对该文章跑 LLM 抽取（tools/llm_run.mjs --only）"
-          >抽取</button>
+            onClick={() => setPanelMode('workflow')} style={ghostBtn(T.indigo)}
+            data-testid="extract-btn"
+            title="基础字段、候选结局、人工选择与结果汇总"
+          >提取工作流</button>
+          {workflowDocumentId && <button style={ghostBtn()} onClick={() => { setWorkflowDocumentId(''); setWorkflowDoc(null); }}>返回正文</button>}
 
           {/* 右上角：设置 */}
           <button
@@ -620,12 +888,13 @@ export default function App() {
         )}
 
         <main style={{ flex: 1, overflow: 'hidden', background: T.canvas }}>
-          {doc && pdf
+          {(doc || workflowDoc) && pdf
             ? (
               <PdfViewer
                 pdf={pdf}
-                doc={doc}
+                doc={(workflowDocumentId ? workflowDoc ?? doc : doc ?? workflowDoc)!}
                 scale={scale}
+                uiZoom={uiZoom}
                 highlights={highlights}
                 showBlocks={showBlocks}
                 mode={mode}
@@ -665,24 +934,160 @@ export default function App() {
 
       {/* ============ 右：字段详情（三张选项卡） ============ */}
       <aside style={{
-        width: 520, flexShrink: 0, borderLeft: `1px solid ${T.border}`,
+        width: 600, maxWidth: '50vw', flexShrink: 0, borderLeft: `1px solid ${T.border}`,
         background: T.panel, display: 'flex', flexDirection: 'column',
       }}>
         <div style={{
-          padding: '11px 14px', background: T.bg, borderBottom: `1px solid ${T.border}`,
-          display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8,
+          padding: '9px 14px', background: T.bg, borderBottom: `1px solid ${T.border}`,
+          display: 'flex', flexDirection: 'column', gap: 7,
         }}>
-          <span style={{ color: T.ink, fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            抽取字段{currentStudy?.imported ? '（导入件）' : ''}
-          </span>
-          <span style={{ fontSize: 11, color: T.faint, whiteSpace: 'nowrap' }}>
-            人工 {annStats.total}
-            {annStats.overridden > 0 && <span style={{ color: T.amber }}> · 修改 {annStats.overridden}</span>}
-            {annStats.confirmed > 0 && <span style={{ color: T.emerald }}> · 确认 {annStats.confirmed}</span>}
-          </span>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
+            <span style={{ color: T.ink, fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {panelMode === 'workflow' ? '单篇提取工作流' : '历史字段核对'}{currentStudy?.imported ? '（导入件）' : ''}
+            </span>
+            {panelMode === 'review' && <span style={{ fontSize: 11, color: T.faint, whiteSpace: 'nowrap' }}>
+              人工 {annStats.total}
+              {annStats.overridden > 0 && <span style={{ color: T.amber }}> · 修改 {annStats.overridden}</span>}
+              {annStats.confirmed > 0 && <span style={{ color: T.emerald }}> · 确认 {annStats.confirmed}</span>}
+            </span>}
+          </div>
+
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button style={ghostBtn(panelMode === 'workflow' ? T.amber : T.muted)} onClick={() => setPanelMode('workflow')}>四步提取</button>
+            <button style={ghostBtn(panelMode === 'review' ? T.amber : T.muted)} onClick={() => setPanelMode('review')}>历史字段核对</button>
+          </div>
+          {/* 多人机核对：核对人身份 + 汇总入口 + 导出（202609） */}
+          <div style={{ display: 'flex', gap: 7, alignItems: 'center', fontSize: 11, flexWrap: 'wrap' }}>
+            <span style={{ color: T.faint }}>核对人</span>
+            <input
+              value={reviewerDraft}
+              onChange={(e) => setReviewerDraft(e.target.value)}
+              onBlur={commitReviewer}
+              onKeyDown={(e) => { if (e.key === 'Enter') commitReviewer(); }}
+              placeholder="填姓名后才能提交"
+              data-testid="reviewer-input"
+              style={{ ...inputS(), width: 116, padding: '3px 8px', fontSize: 11 }}
+            />
+            {!reviewer && <span style={{ color: T.red }}>未设置，暂不能提交</span>}
+            {panelMode === 'review' && <>
+            <button
+              onClick={() => void onExport('xlsx')}
+              style={{ ...ghostBtn(T.emerald), marginLeft: 'auto' }}
+              disabled={busy || !study}
+              data-testid="export-xlsx"
+              title="导出人工核对结果（4 个工作表：核对汇总 + Sheet1/2/3）"
+            >导出 XLSX</button>
+            <button
+              onClick={() => void onExport('csv')}
+              style={ghostBtn(T.cyan)}
+              disabled={busy || !study}
+              data-testid="export-csv"
+              title="导出人工核对结果（CSV，三表拼成一张，带 UTF-8 BOM）"
+            >导出 CSV</button>
+
+            {/* 批量导出：整年 / 全部年份 */}
+            <span style={{ position: 'relative' }}>
+              <button
+                onClick={() => setBatchOpen((v) => !v)}
+                style={ghostBtn(T.amberBright)}
+                disabled={busy}
+                data-testid="batch-menu"
+                title="整年或全部年份一起导出（每行多带「年份/研究」两列）"
+              >批量 ▾</button>
+              {batchOpen && (
+                <div
+                  data-testid="batch-popup"
+                  style={{
+                    position: 'absolute', right: 0, top: '100%', marginTop: 4, zIndex: 40,
+                    background: T.bg, border: `1px solid ${T.border}`, borderRadius: R.btn,
+                    boxShadow: SH.pop, padding: 6, display: 'flex', flexDirection: 'column', gap: 4, minWidth: 156,
+                  }}
+                >
+                  <button onClick={() => void onExport('xlsx', 'year')} style={ghostBtn(T.emerald)} data-testid="batch-year-xlsx">{year} 年 XLSX</button>
+                  <button onClick={() => void onExport('csv', 'year')} style={ghostBtn(T.cyan)} data-testid="batch-year-csv">{year} 年 CSV</button>
+                  <button onClick={() => void onExport('xlsx', 'all')} style={ghostBtn(T.emerald)} data-testid="batch-all-xlsx">全部年份 XLSX</button>
+                  <button onClick={() => void onExport('csv', 'all')} style={ghostBtn(T.cyan)} data-testid="batch-all-csv">全部年份 CSV</button>
+                </div>
+              )}
+            </span>
+
+            <button
+              onClick={() => setToolsTab('import')}
+              style={ghostBtn(T.indigo)}
+              disabled={!study}
+              data-testid="open-import"
+              title="把医生改过的表格导回成人工标注（先预览差异，再确认写入）"
+            >导回…</button>
+            <button
+              onClick={() => setToolsTab('compare')}
+              style={ghostBtn(T.blue)}
+              disabled={!study}
+              data-testid="open-compare"
+              title="任选两组结果并排对比（机器 / 各位核对人 / 导入批次）"
+            >对比…</button>
+            <button
+              onClick={() => setReviewOpen((v) => !v)}
+              style={ghostBtn(review.consensus.stats.disputed > 0 ? T.red : T.indigo)}
+              data-testid="review-toggle"
+            >
+              核对 {review.consensus.stats.reviewed}/{review.consensus.stats.total}
+              {review.consensus.stats.disputed > 0 ? ` · 分歧 ${review.consensus.stats.disputed}` : ''}
+            </button>
+            </>}
+          </div>
+
+          {panelMode === 'review' && reviewOpen && (
+            <div
+              data-testid="review-panel"
+              style={{
+                border: `1px solid ${T.border}`, borderRadius: R.btn, padding: '7px 9px',
+                background: T.panel, fontSize: 11, color: T.muted, maxHeight: 200, overflow: 'auto',
+              }}
+            >
+              <div style={{ marginBottom: 4 }}>
+                {review.reviewers.length
+                  ? review.reviewers.map((r) => `${r.reviewer}（${r.total} 条）`).join('、')
+                  : '尚无人核对本篇'}
+              </div>
+              <div style={{ marginBottom: 4, color: T.faint }}>
+                一致 {review.consensus.stats.agreed} · 仅一人 {review.consensus.stats.single}
+                {' · '}分歧 {review.consensus.stats.disputed} · 未核对 {review.consensus.stats.machineOnly}
+              </div>
+              {review.consensus.pairwise.filter((p) => p.rate !== null).map((p) => (
+                <div key={`${p.reviewerA}-${p.reviewerB}`} style={{ color: T.faint }}>
+                  {p.reviewerA} ↔ {p.reviewerB}：一致 {p.same}/{p.common}（{Math.round((p.rate ?? 0) * 100)}%）
+                </div>
+              ))}
+              {review.consensus.disputed.length > 0 && (
+                <div style={{ marginTop: 6, color: T.amber }}>
+                  <div style={{ fontWeight: 600, marginBottom: 3 }}>待第三方仲裁：</div>
+                  {review.consensus.disputed.map((d) => (
+                    <div key={d.fieldPath} style={{ marginBottom: 4 }}>
+                      <code style={{ fontSize: 10.5 }}>{d.fieldPath}</code>
+                      <div style={{ color: T.faint }}>
+                        {/*
+                          机器值优先用汇总里的；汇总里没有就退回字段视图的当前值。
+                          汇总是在"没有机器值"的前提下算的（machineRaw 恒为 null），
+                          而分歧字段的当前值恰好就是机器原值（分歧不生效），所以这样回退是准确的。
+                        */}
+                        机器「{d.machineRaw ?? findField(d.fieldPath)?.raw ?? '（无）'}」／
+                        {d.opinions.map((o) => `${o.reviewer}「${o.raw}」`).join('，')}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button
+                onClick={() => void loadReview(year, study, reviewer)}
+                style={{ ...ghostBtn(), marginTop: 6 }}
+              >刷新汇总</button>
+            </div>
+          )}
         </div>
         <div style={{ flex: 1, overflow: 'hidden' }}>
-          <ExtractionPanel
+          {panelMode === 'workflow'
+            ? <WorkflowPanel year={year} study={study} reviewer={reviewer} onSource={onWorkflowSource} />
+            : <ExtractionPanel
             sheets={sheets}
             markingFieldPath={markingField}
             hasSelection={Boolean(selection)}
@@ -696,11 +1101,31 @@ export default function App() {
             onAdd={onAdd}
             onLocate={onLocate}
             onInclude={onInclude}
-          />
+            onAdjudicate={onAdjudicate}
+          />}
         </div>
       </aside>
 
-      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsPanel
+          onClose={() => setSettingsOpen(false)}
+          fontScale={fontScale}
+          onFontScale={setFontScale}
+        />
+      )}
+
+      {toolsTab && (
+        <ReviewToolsPanel
+          year={year}
+          study={study}
+          reviewer={reviewer}
+          tab={toolsTab}
+          onTab={setToolsTab}
+          onClose={() => setToolsTab(null)}
+          onChanged={() => { void loadFields(year, study); void loadReview(year, study, reviewer); }}
+          notify={setNotice}
+        />
+      )}
     </div>
   );
 }
